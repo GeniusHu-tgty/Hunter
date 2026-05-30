@@ -171,5 +171,40 @@ def dir_enum(url: str, wordlist: str = "default", extensions: list[str] = [],
     return result
 
 
+from tools.tech import tech_impl
+
+
+@mcp.tool()
+def tech(url: str) -> dict:
+    """Identify technologies used by target web application.
+
+    Detects: framework, language, server, CMS, WAF.
+    Returns evidence for each detection and known vulnerabilities.
+    """
+    result = tech_impl(url=url)
+    kg = get_kg()
+    techs = result.get("technologies", {})
+    if techs.get("framework"):
+        kg.add_finding(
+            type="technology",
+            severity="info",
+            title=f"Framework: {techs['framework']}",
+            detail=f"Server: {techs['server']}, Language: {techs['language']}",
+            evidence=result.get("evidence", {}),
+            tool="tech"
+        )
+    if result.get("known_vulns"):
+        for vuln in result["known_vulns"]:
+            kg.add_finding(
+                type="potential_vuln",
+                severity="high",
+                title=vuln,
+                detail=f"Detected from technology fingerprint at {url}",
+                evidence={"url": url},
+                tool="tech"
+            )
+    return result
+
+
 if __name__ == "__main__":
     mcp.run()
