@@ -109,5 +109,29 @@ def probe(url: str, method: str = "GET", headers: dict = {}, body: str = "",
     return result
 
 
+from tools.port_scan import port_scan_impl
+
+
+@mcp.tool()
+def port_scan(host: str, ports: str = "top100", timeout: int = 3) -> dict:
+    """Scan ports on target host.
+
+    ports: "top100", "top1000", "22,80,443", "1-1024"
+    Returns only open ports with service/version info.
+    """
+    result = port_scan_impl(host=host, ports=ports, timeout=timeout)
+    kg = get_kg()
+    for p in result["open"]:
+        kg.add_finding(
+            type="open_port",
+            severity="info",
+            title=f"Port {p['port']} ({p['service']}) open on {host}",
+            detail=f"Service: {p['service']}, Version: {p['version']}",
+            evidence={"host": host, "port": p["port"], "service": p["service"]},
+            tool="port_scan"
+        )
+    return result
+
+
 if __name__ == "__main__":
     mcp.run()
