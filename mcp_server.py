@@ -109,6 +109,7 @@ def probe(url: str, method: str = "GET", headers: dict = {}, body: str = "",
     return result
 
 
+from tools.dns_tool import dns_impl
 from tools.port_scan import port_scan_impl
 
 
@@ -131,6 +132,16 @@ def port_scan(host: str, ports: str = "top100", timeout: int = 3) -> dict:
             tool="port_scan"
         )
     return result
+
+
+@mcp.tool()
+def dns(domain: str, type: str = "ANY") -> dict:
+    """Resolve DNS records for a domain.
+
+    type: A, AAAA, MX, TXT, NS, CNAME, SOA, SRV, or ANY
+    Returns all discovered records with type, value, and TTL.
+    """
+    return dns_impl(domain=domain, record_type=type)
 
 
 if __name__ == "__main__":
