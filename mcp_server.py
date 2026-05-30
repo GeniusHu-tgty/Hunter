@@ -144,5 +144,32 @@ def dns(domain: str, type: str = "ANY") -> dict:
     return dns_impl(domain=domain, record_type=type)
 
 
+from tools.dir_enum import dir_enum_impl
+
+
+@mcp.tool()
+def dir_enum(url: str, wordlist: str = "default", extensions: list[str] = [],
+             max_results: int = 50, timeout: int = 5) -> dict:
+    """Enumerate directories and files on target web server.
+
+    Returns only interesting paths (non-404, non-baseline).
+    Uses threaded Python scanner with intelligent filtering.
+    """
+    result = dir_enum_impl(url=url, wordlist=wordlist, extensions=extensions,
+                           max_results=max_results, timeout=timeout)
+    kg = get_kg()
+    for f in result.get("found", []):
+        if f.get("interesting"):
+            kg.add_finding(
+                type="directory",
+                severity="medium" if any(s in f["path"].lower() for s in [".git", ".env", "backup", "config"]) else "low",
+                title=f"Interesting path: {f['path']}",
+                detail=f"Status: {f['status']}, Size: {f['size']}",
+                evidence={"url": f"{url}{f['path']}", "status": f["status"]},
+                tool="dir_enum"
+            )
+    return result
+
+
 if __name__ == "__main__":
     mcp.run()
