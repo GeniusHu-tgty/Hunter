@@ -206,5 +206,126 @@ def tech(url: str) -> dict:
     return result
 
 
+from tools.inject import inject_impl
+
+
+@mcp.tool()
+def inject(url: str, method: str = "POST", param: str = "",
+           payloads: list[str] = [], base_payload: str = "test",
+           compare_field: str = "body_length", headers: dict = {},
+           body_template: str = "", timeout: int = 10) -> dict:
+    """Test injection vulnerabilities with custom payloads.
+
+    Claude provides payloads, tool sends them and compares responses.
+    Supports: SQLi, XSS, SSTI, XXE, and any custom injection type.
+    Returns differential analysis showing which payloads produce different responses.
+    """
+    result = inject_impl(url=url, method=method, param=param, payloads=payloads,
+                         base_payload=base_payload, compare_field=compare_field,
+                         headers=headers, body_template=body_template, timeout=timeout)
+    kg = get_kg()
+    if result.get("analysis", {}).get("likely_vuln"):
+        kg.add_finding(type="injection", severity="high", title=f"Possible injection at {param}",
+                       detail=result["analysis"]["evidence"],
+                       evidence={"url": url, "param": param, "type": result["analysis"]["type"]}, tool="inject")
+    for r in result.get("results", []):
+        kg.add_attempt(action=f"inject_{param}", target=url, payload=r["payload"],
+                       result=r.get("diff_from_base", ""), success=r.get("interesting", False))
+    return result
+
+
+from tools.exec_tool import exec_impl
+
+
+@mcp.tool()
+def exec(code: str, timeout: int = 30) -> dict:
+    """Execute Python code for custom exploits and tool integration.
+
+    Safety valve: when predefined tools aren't enough, write code directly.
+    Use for: custom payloads, external tool calls (sqlmap/nuclei/hydra),
+    data parsing, protocol operations.
+    Returns stdout, stderr, exit code, and execution time.
+    """
+    return exec_impl(code=code, timeout=timeout)
+
+
+from tools.shell_tool import shell_impl
+
+
+@mcp.tool()
+def shell(action: str = "list", session_id: str = "", type: str = "reverse",
+          lhost: str = "", lport: int = 4444, shell_type: str = "bash",
+          command: str = "") -> dict:
+    """Manage shell sessions.
+
+    Actions:
+    - generate: Generate reverse/bind/webshell payload
+    - start: Start reverse shell listener (returns session_id)
+    - list: List active shell sessions
+    - exec: Execute command on active shell
+    - close: Close shell session
+    """
+    result = shell_impl(action=action, session_id=session_id, type=type,
+                        lhost=lhost, lport=lport, shell_type=shell_type, command=command)
+    kg = get_kg()
+    if action == "start" and "session_id" in result:
+        kg.add_shell(session_id=result["session_id"], type="reverse", info=f"{lhost}:{lport}")
+    return result
+
+
+from tools.js_analyze import js_analyze_impl
+
+
+@mcp.tool()
+def js_analyze(url: str) -> dict:
+    """Analyze JavaScript file for endpoints, secrets, and internal URLs.
+
+    Returns: endpoints, secrets (AWS keys, API keys, JWTs), internal URLs,
+    interesting patterns (hardcoded passwords, debug flags, eval usage).
+    """
+    result = js_analyze_impl(url=url)
+    kg = get_kg()
+    for secret in result.get("secrets", []):
+        kg.add_finding(type="secret", severity="high", title=f"{secret['type']} found in JS",
+                       detail=f"Line {secret['line']}: {secret['value'][:50]}",
+                       evidence={"url": url, "type": secret["type"]}, tool="js_analyze")
+    return result
+
+
+from tools.src_read import src_read_impl
+
+
+@mcp.tool()
+def src_read(url: str, param: str = "", technique: str = "lfi",
+             paths: list[str] = [], method: str = "GET") -> dict:
+    """Read files from target via LFI, directory traversal, or source disclosure.
+
+    technique: lfi, git, traversal
+    paths: list of file paths to read (e.g., ["/etc/passwd", "/var/www/config.php"])
+    Returns full file content for each successfully read file.
+    """
+    result = src_read_impl(url=url, param=param, technique=technique, paths=paths, method=method)
+    kg = get_kg()
+    for r in result.get("results", []):
+        if r.get("success"):
+            kg.add_finding(type="file_read", severity="critical", title=f"File read: {r['path']}",
+                           detail=f"Technique: {r.get('technique', 'unknown')}, Size: {r.get('size', 0)}",
+                           evidence={"path": r["path"], "technique": r.get("technique")}, tool="src_read")
+    return result
+
+
+from tools.subdomain import subdomain_impl
+
+
+@mcp.tool()
+def subdomain(domain: str, methods: list[str] = ["crtsh", "dns_brute"]) -> dict:
+    """Discover subdomains for a domain.
+
+    methods: crtsh (certificate transparency), dns_brute (DNS brute force), subfinder
+    Returns subdomains with source and resolved IP.
+    """
+    return subdomain_impl(domain=domain, methods=methods)
+
+
 if __name__ == "__main__":
     mcp.run()
