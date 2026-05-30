@@ -82,5 +82,32 @@ def session(action: str = "summary", filter_type: str = "", filter_severity: str
         return {"error": f"Unknown action: {action}"}
 
 
+from tools.probe import probe_impl
+
+
+@mcp.tool()
+def probe(url: str, method: str = "GET", headers: dict = {}, body: str = "",
+          follow_redirects: bool = True, timeout: int = 10) -> dict:
+    """Send HTTP request to target and analyze response.
+
+    Returns full response (headers, body, cookies, timing) plus
+    auto-detected interesting content (forms, comments, leaks, errors).
+    Use this for all HTTP operations: GET, POST, PUT, DELETE, etc.
+    """
+    result = probe_impl(url=url, method=method, headers=headers, body=body,
+                        follow_redirects=follow_redirects, timeout=timeout)
+    kg = get_kg()
+    if result.get("interesting"):
+        kg.add_finding(
+            type="observation",
+            severity="info",
+            title=f"Interesting content at {url}",
+            detail="; ".join(result["interesting"][:3]),
+            evidence={"url": url, "status": result["status"]},
+            tool="probe"
+        )
+    return result
+
+
 if __name__ == "__main__":
     mcp.run()
