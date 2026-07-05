@@ -1,219 +1,269 @@
-# Hunter
+﻿# Hunter v7 - AI-Driven Penetration Testing Framework
 
-<div align="center">
+## Overview
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![MCP](https://img.shields.io/badge/MCP-Protocol-FF6B35?style=for-the-badge)
-![License](https://img.shields.io/badge/License-MIT-00B8D4?style=for-the-badge)
+Hunter is an AI-driven penetration testing framework that combines automated tools with intelligent analysis. Claude is the brain, and the tools are the hands.
 
-**AI-Driven Penetration Testing Framework v4**
+## Tool Inventory
 
-不是扫描器 — 是让 Claude 思考的渗透框架。
+### Go-based Tools (28 tools)
+| Tool | Purpose | Version |
+|------|---------|---------|
+| nuclei | Vulnerability scanner | v3.8.0 |
+| subfinder | Subdomain discovery | Latest |
+| naabu | Port scanner | Latest |
+| httpx | HTTP toolkit | Latest |
+| katana | Web crawler | Latest |
+| gau | URL fetcher | Latest |
+| uncover | Host discovery | Latest |
+| tlsx | TLS toolkit | Latest |
+| cdncheck | CDN detection | Latest |
+| mapcidr | CIDR toolkit | Latest |
+| ffuf | Web fuzzer | v2.1.0 |
+| gobuster | Directory brute-forcer | Latest |
+| dnsx | DNS toolkit | Latest |
+| dalfox | XSS scanner | Latest |
+| notify | Notification tool | Latest |
+| amass | Attack surface mapping | Latest |
+| waybackurls | Wayback URL fetcher | Latest |
+| assetfinder | Asset discovery | Latest |
+| httprobe | HTTP prober | Latest |
+| unfurl | URL parser | Latest |
+| meg | Request sender | Latest |
+| anew | Line appender | Latest |
+| qsreplace | Query string replacer | Latest |
+| subjack | Subdomain takeover | Latest |
+| hakrevdns | Reverse DNS | Latest |
+| hakrawler | Web crawler | Latest |
+| getjs | JS file discovery | Latest |
+| subjs | JS file discovery | Latest |
 
-*12 原子工具 + 知识图谱 + 1M 上下文支持。*
+### Python Tools (8 tools)
+| Tool | Purpose |
+|------|---------|
+| sqlmap | SQL injection |
+| wafw00f | WAF detection |
+| dirsearch | Directory scanner |
+| whatweb | Web technology identifier |
+| wpscan | WordPress scanner |
+| droopescan | CMS scanner |
+| hashid | Hash identifier |
+| arjun | Hidden parameter discovery |
 
-</div>
+### System Tools (3 tools)
+| Tool | Purpose | Version |
+|------|---------|---------|
+| nmap | Network scanner | 7.80 |
+| nikto | Web server scanner | Latest |
+| curl | HTTP client | Latest |
 
----
+### Special Tools (4 tools)
+| Tool | Purpose |
+|------|---------|
+| impacket | Network protocols library |
+| jwt_tool | JWT testing |
+| perl | Scripting runtime |
+| Python 3.14 | Scripting runtime |
 
-## 设计哲学
+## Wordlists
 
-传统渗透工具：人写规则 → 工具执行 → 人看结果。
+Location: `C:\Tools\wordlists\`
 
-Hunter：**Claude 是大脑，MCP 工具是手脚。**
+| File | Size | Description |
+|------|------|-------------|
+| common.txt | 367 B | Common web paths |
+| big.txt | 162.5 KB | Large web paths |
+| raft-small-directories.txt | 159.4 KB | Small directory list |
+| raft-small-files.txt | 144.9 KB | Small file list |
+| raft-medium-directories.txt | 244.6 KB | Medium directory list |
+| raft-medium-files.txt | 219.1 KB | Medium file list |
+| raft-large-directories.txt | 529.3 KB | Large directory list |
+| raft-large-files.txt | 482 KB | Large file list |
+| quickhits.txt | 39.2 KB | Quick hits |
+| logins.txt | 1.1 KB | Login paths |
+| wordpress.txt | 57.6 KB | WordPress paths |
+| api-endpoints.txt | 4.3 KB | API endpoints |
+| subdomains-top1million-5000.txt | 29.4 KB | Top 5K subdomains |
+| subdomains-top1million-110000.txt | 1.3 MB | Top 110K subdomains |
+| dns-Jhaddix.txt | 25.3 MB | DNS wordlist |
+| usernames.txt | 112 B | Common usernames |
 
+## Quick Scan Scripts
+
+### Reconnaissance
+```powershell
+.\quick_recon.ps1 -Target example.com
 ```
-你（下达目标）
-    ↓
-Claude（分析、决策、推理攻击链）
-    ↓
-12 个原子 MCP 工具（侦察、扫描、漏洞利用、后渗透）
-    ↓
-知识图谱（记录发现，构建攻击拓扑）
-    ↓
-自动生成报告 + CVSS 评级
+
+### Vulnerability Scanning
+```powershell
+.\quick_vuln.ps1 -Target https://example.com
 ```
 
-Claude 不是在执行脚本 — 它在**思考**下一步该做什么。
+### Web Application Testing
+```powershell
+.\quick_web.ps1 -Target https://example.com
+```
 
-## 12 原子工具
+## Core Scanner
 
-### 侦察阶段
+```bash
+python hunter_core.py recon example.com
+python hunter_core.py vuln https://example.com
+python hunter_core.py web https://example.com
+```
 
-| 工具 | 能力 |
-|------|------|
-| `probe` | HTTP 探测 + 自动 Body 分析 + 技术栈识别 |
-| `dns_tool` | DNS 解析 + 子域枚举 + 记录类型全支持 |
-| `subdomain` | 子域名爆破 + 字典攻击 + DNS 验证 |
-| `tech` | Web 技术栈指纹识别（CMS/框架/服务器/语言） |
-| `port_scan` | TCP 端口扫描 + 服务识别 + Banner 抓取 |
+## MCP Server
 
-### 扫描阶段
+```python
+from mcp_server import get_hunter
 
-| 工具 | 能力 |
-|------|------|
-| `dir_enum` | 目录/路径枚举 + 字典爆破 + 状态码分析 |
-| `js_analyze` | JavaScript 静态分析 + API 端点提取 + Secret 扫描 |
-| `src_read` | 源码读取 + 敏感信息提取 + 配置文件发现 |
+hunter = get_hunter()
 
-### 漏洞利用阶段
+# Subdomain enumeration
+result = hunter.subfinder_enum("example.com")
 
-| 工具 | 能力 |
-|------|------|
-| `inject` | SQL 注入检测 + WAF 绕过 + 数据提取 |
-| `exec` | 命令执行 + Shell 交互 + 输出捕获 |
-| `shell` | 反弹 Shell + 交互式终端 |
+# Vulnerability scanning
+result = hunter.nuclei_scan("https://example.com", severity="critical,high")
 
-### 后渗透阶段
+# Port scanning
+result = hunter.naabu_scan("example.com", "top-1000")
 
-| 工具 | 能力 |
-|------|------|
-| `inject` | 横向移动 + 权限提升 + 持久化 |
+# XSS testing
+result = hunter.dalfox_xss("https://example.com/?id=1")
 
-## 架构
+# SQL injection
+result = hunter.sqlmap_test("https://example.com/?id=1", level=3, risk=2)
+```
+
+## Environment Variables
+
+```powershell
+$env:GOPROXY = "https://goproxy.cn,direct"
+$env:all_proxy = "http://127.0.0.1:7890"
+```
+
+## Directory Structure
 
 ```
 hunter/
-├── core/                    # 核心引擎
-│   ├── hunter.py            #   主控制器
-│   ├── knowledge.py         #   知识图谱（发现存储 + 关系推理）
-│   ├── config.py            #   配置管理
-│   ├── severity.py          #   CVSS 严重性评级
-│   ├── stealth.py           #   隐蔽模式（限速/代理/指纹伪装）
-│   └── report_gen.py        #   报告生成
-├── engines/                 # 扫描引擎
-│   ├── recon.py             #   侦察引擎
-│   ├── scan.py              #   扫描引擎
-│   ├── discover.py          #   发现引擎
-│   └── brute.py             #   爆破引擎
-├── tools/                   # 12 个原子 MCP 工具
-│   ├── probe.py             #   HTTP 探测
-│   ├── dns_tool.py          #   DNS 工具
-│   ├── subdomain.py         #   子域名枚举
-│   ├── tech.py              #   技术栈识别
-│   ├── port_scan.py         #   端口扫描
-│   ├── dir_enum.py          #   目录枚举
-│   ├── js_analyze.py        #   JS 分析
-│   ├── src_read.py          #   源码读取
-│   ├── inject.py            #   注入检测
-│   ├── exec_tool.py         #   命令执行
-│   └── shell_tool.py        #   Shell 交互
-├── mcp_server.py            # MCP 服务器入口
-├── hunt.py                  # CLI 入口
-└── tests/                   # 单元测试
+├── SKILL.md                 # Skill definition
+├── TOOLS.md                 # Tools inventory
+├── README.md                # This file
+└── core/
+    ├── hunter_core.py       # Core scanner
+    ├── mcp_server.py        # MCP integration
+    ├── tools_config.ps1     # Tools configuration
+    └── scripts/
+        ├── quick_recon.ps1  # Quick reconnaissance
+        ├── quick_vuln.ps1   # Quick vulnerability scan
+        └── quick_web.ps1    # Quick web scan
 ```
 
-## 工作流程
+## Usage Examples
 
-### 侦察模式
-
+### Full Reconnaissance
 ```bash
-# 目标侦察
-python hunt.py recon https://target.com
+# 1. Subdomain enumeration
+subfinder -d example.com -o subdomains.txt
 
-# 输出：子域名、开放端口、技术栈、API端点、敏感文件
+# 2. DNS resolution
+cat subdomains.txt | dnsx -o resolved.txt
+
+# 3. HTTP probing
+cat resolved.txt | httpx -o live.txt
+
+# 4. Port scanning
+cat live.txt | naabu -top-ports 1000 -o ports.txt
+
+# 5. URL discovery
+gau example.com > urls.txt
+katana -u https://example.com -d 3 -jc >> urls.txt
+
+# 6. Vulnerability scanning
+nuclei -l live.txt -severity critical,high,medium
 ```
 
-### 渗透模式
-
+### Web Application Testing
 ```bash
-# 完整渗透测试
-python hunt.py pentest https://target.com --mode standard
+# 1. Technology detection
+httpx -u https://example.com -tech-detect
 
-# 快速扫描（5分钟）
-python hunt.py pentest https://target.com --mode quick
+# 2. Directory enumeration
+gobuster dir -u https://example.com -w C:\Tools\wordlists\common.txt
 
-# 深度扫描（60分钟+）
-python hunt.py pentest https://target.com --mode aggressive
+# 3. XSS testing
+dalfox url "https://example.com/?id=1"
+
+# 4. SQL injection
+sqlmap -u "https://example.com/?id=1" --batch --level=3
+
+# 5. Parameter discovery
+arjun -u https://example.com
 ```
 
-### MCP 集成
-
-Hunter 作为 MCP 服务器运行，Claude 直接调用工具：
-
-```python
-# Claude 决策 → 调用工具 → 分析结果 → 决定下一步
-probe("https://target.com")  # → 发现 PHP 后端
-tech("https://target.com")   # → ThinkPHP 5.1.37
-inject("https://target.com/login", payload="' OR 1=1--")  # → SQL 注入确认
-```
-
-## 知识图谱
-
-每次发现自动存入知识图谱，构建攻击拓扑：
-
-```
-target.com
-├── 子域名: api.target.com, admin.target.com
-├── 端口: 80(nginx), 443(nginx), 3306(mysql)
-├── 技术栈: PHP 7.4, ThinkPHP 5.1.37, MySQL 5.7
-├── 漏洞:
-│   ├── SQL注入 (login endpoint) - CVSS 9.8
-│   ├── 目录遍历 (/upload/) - CVSS 7.5
-│   └── 信息泄露 (/api/debug) - CVSS 5.3
-└── 攻击链: SQL注入 → 数据库访问 → 凭据提取 → 后台登录
-```
-
-## 三种模式
-
-| 模式 | 时间 | 深度 | 适用场景 |
-|------|------|------|---------|
-| Quick | 5 分钟 | 表面 | 快速评估攻击面 |
-| Standard | 30 分钟 | 中等 | 常规渗透测试 |
-| Aggressive | 60 分钟+ | 深度 | 全面安全审计 |
-
-## 隐蔽模式
-
-内置反检测机制：
-
-- **请求限速** — 可配置 QPS，避免触发 WAF
-- **代理支持** — SOCKS5/HTTP 代理链
-- **指纹伪装** — 随机 User-Agent + 请求头
-- **Tor 集成** — 自动路由流量
-
-## 快速开始
-
+### Network Scanning
 ```bash
-# 克隆
-git clone https://github.com/GeniusHu-666/Hunter.git
-cd Hunter
+# 1. Port scanning
+nmap -sV -sC -oA scan example.com
 
-# 安装依赖
-pip install -r requirements.txt
+# 2. Service enumeration
+nmap -sV -p 80,443,8080 example.com
 
-# 运行侦察
-python hunt.py recon https://target.com
-
-# 运行渗透
-python hunt.py pentest https://target.com --mode standard
+# 3. Vulnerability scanning
+nmap --script vuln example.com
 ```
 
-## MCP 配置
+## Tool Installation
 
-在 Claude Desktop 或 Claude Code 中配置：
-
-```json
-{
-  "mcpServers": {
-    "hunter": {
-      "command": "python",
-      "args": ["/path/to/hunter/mcp_server.py"]
-    }
-  }
-}
+### Go Tools
+```powershell
+$env:GOPROXY = "https://goproxy.cn,direct"
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+# ... etc
 ```
 
-## 技术栈
-
-```
-Python 3.10+  ·  MCP Protocol  ·  知识图谱  ·  CVSS 评分
-DNS解析  ·  TCP扫描  ·  HTTP指纹  ·  JS静态分析  ·  SQL注入检测
+### Python Tools
+```powershell
+pip install sqlmap wafw00f dirsearch whatweb wpscan droopescan hashid arjun
 ```
 
-## 免责声明
+### System Tools
+```powershell
+winget install Nmap.Nmap
+# nikto - git clone https://github.com/sullo/nikto.git
+```
 
-本工具仅供**授权安全测试和教育目的**使用。未经授权对他人系统进行渗透测试是违法行为。使用者需自行承担法律责任。
+## Contributing
+
+1. Add new tools to the inventory
+2. Update TOOLS.md
+3. Create wrapper scripts in core/scripts/
+4. Update MCP server integration
 
 ## License
 
-MIT
+For authorized penetration testing only. Always obtain proper authorization before testing.
+
+
+## Burp Evidence Workflow
+
+1. Export your request, response, screenshots, and any JSON notes from Burp into one folder.
+2. Use `core.burp_adapter.suggest_hunter_prefix(target, vuln_slug)` to get a Hunter-friendly prefix.
+3. Use `core.burp_import.import_burp_evidence(source_dir, target, vuln_slug, destination_dir)` to copy and rename the files into Hunter's evidence directory.
+4. Let Hunter pick them up automatically in the final report appendix.
+
+
+### One-click Burp import
+
+```powershell
+.\core\scripts\quick_burp_import.ps1 -SourceDir "C:\BurpExports\gnnu" -Target "https://jwgl.gnnu.edu.cn" -VulnSlug "idor"
+```
+
+This copies Burp-exported request/response/screenshots/evidence files into Hunter's evidence directory using Hunter-friendly naming.
+
+
+## Related Projects
+
+- [Open-tgtylab](https://github.com/GeniusHu-tgty/Open-tgtylab) — 安全研究工作台，集成逆向工程、CTF、移动安全、Web安全于一体
