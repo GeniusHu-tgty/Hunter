@@ -247,6 +247,13 @@ winget install Nmap.Nmap
 For authorized penetration testing only. Always obtain proper authorization before testing.
 
 
+## Disclaimer
+
+本项目仅用于教育和授权安全研究目的。用户必须确保在合法授权范围内操作。使用本项目产生的任何后果由用户自行承担。
+
+See [DISCLAIMER.md](DISCLAIMER.md) for the full disclaimer.
+
+
 ## Burp Evidence Workflow
 
 1. Export your request, response, screenshots, and any JSON notes from Burp into one folder.
