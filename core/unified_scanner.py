@@ -165,7 +165,11 @@ class UnifiedScanner:
 
     def _phase_sqli(self) -> dict:
         """Phase 2: SQL Injection detection."""
-        from core.auto_sqli import AutoSQLi
+        try:
+            from core.auto_sqli import AutoSQLi
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_sqli not available", "suggestion": "pip install requests"}
+
         results = []
 
         # Test each parameter discovered in recon
@@ -204,7 +208,10 @@ class UnifiedScanner:
 
     def _phase_xss(self) -> dict:
         """Phase 3: XSS detection."""
-        from core.auto_xss import AutoXSS
+        try:
+            from core.auto_xss import AutoXSS
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_xss not available", "suggestion": "pip install requests"}
         results = []
 
         for param in self.ctx.params:
@@ -230,7 +237,10 @@ class UnifiedScanner:
 
     def _phase_ssti(self) -> dict:
         """Phase 4: SSTI detection."""
-        from core.auto_ssti import AutoSSTI
+        try:
+            from core.auto_ssti import AutoSSTI
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_ssti not available", "suggestion": "pip install requests"}
         results = []
 
         for param in self.ctx.params:
@@ -247,7 +257,10 @@ class UnifiedScanner:
 
     def _phase_ssrf(self) -> dict:
         """Phase 5: SSRF detection."""
-        from core.auto_ssrf import AutoSSRF
+        try:
+            from core.auto_ssrf import AutoSSRF
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_ssrf not available", "suggestion": "pip install requests"}
         results = []
 
         for param in self.ctx.params:
@@ -272,7 +285,10 @@ class UnifiedScanner:
 
     def _phase_xxe(self) -> dict:
         """Phase 6: XXE detection."""
-        from core.auto_xxe import AutoXXE
+        try:
+            from core.auto_xxe import AutoXXE
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_xxe not available", "suggestion": "pip install requests"}
         results = []
 
         for param in self.ctx.params:
@@ -288,7 +304,10 @@ class UnifiedScanner:
 
     def _phase_cmd(self) -> dict:
         """Phase 7: Command Injection detection."""
-        from core.auto_cmd import AutoCMD
+        try:
+            from core.auto_cmd import AutoCMD
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_cmd not available", "suggestion": "pip install requests"}
         results = []
 
         for param in self.ctx.params:
@@ -305,7 +324,10 @@ class UnifiedScanner:
 
     def _phase_idor(self) -> dict:
         """Phase 8: IDOR detection."""
-        from core.auto_idor import AutoIDOR
+        try:
+            from core.auto_idor import AutoIDOR
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_idor not available", "suggestion": "pip install requests"}
         results = []
 
         for endpoint in self.ctx.endpoints:
