@@ -1,0 +1,131 @@
+{
+  "target": "http://10.10.90.2",
+  "profile": "quick",
+  "timestamp": "2026-05-29T23:01:25.378279",
+  "duration_seconds": 27,
+  "recon": {
+    "target": "10.10.90.2",
+    "base": "http://10.10.90.2",
+    "ips": [
+      "10.10.90.2"
+    ],
+    "subdomains": [],
+    "live_hosts": [],
+    "ports": [
+      {
+        "port": 80,
+        "service": "http"
+      },
+      {
+        "port": 443,
+        "service": "https"
+      },
+      {
+        "port": 22,
+        "service": "ssh"
+      }
+    ],
+    "tech": {
+      "server": [
+        "DrcomServer1.0"
+      ],
+      "language": [],
+      "framework": [],
+      "cms": [],
+      "other": []
+    },
+    "paths": [],
+    "js_secrets": []
+  },
+  "findings": [
+    {
+      "type": "Clickjacking",
+      "severity": "medium",
+      "url": "http://10.10.90.2",
+      "detail": "No X-Frame-Options or frame-ancestors",
+      "poc": "<iframe src=\"http://10.10.90.2\"></iframe>",
+      "evidence": "",
+      "timestamp": "2026-05-29T23:01:52.545922",
+      "cvss": 6.1
+    },
+    {
+      "type": "Version Disclosure",
+      "severity": "medium",
+      "url": "http://10.10.90.2",
+      "detail": "Server: DrcomServer1.0",
+      "poc": "",
+      "evidence": "",
+      "timestamp": "2026-05-29T23:01:48.281547",
+      "cvss": 5.3
+    },
+    {
+      "type": "Missing Header",
+      "severity": "low",
+      "url": "http://10.10.90.2",
+      "detail": "Missing HSTS",
+      "poc": "",
+      "evidence": "",
+      "timestamp": "2026-05-29T23:01:48.281439",
+      "cvss": 3.1
+    },
+    {
+      "type": "Missing Header",
+      "severity": "low",
+      "url": "http://10.10.90.2",
+      "detail": "Missing CSP",
+      "poc": "",
+      "evidence": "",
+      "timestamp": "2026-05-29T23:01:48.281460",
+      "cvss": 3.1
+    },
+    {
+      "type": "Missing Header",
+      "severity": "low",
+      "url": "http://10.10.90.2",
+      "detail": "Missing X-Content-Type-Options",
+      "poc": "",
+      "evidence": "",
+      "timestamp": "2026-05-29T23:01:48.281464",
+      "cvss": 3.1
+    },
+    {
+      "type": "Missing Header",
+      "severity": "low",
+      "url": "http://10.10.90.2",
+      "detail": "Missing X-Frame-Options",
+      "poc": "",
+      "evidence": "",
+      "timestamp": "2026-05-29T23:01:48.281467",
+      "cvss": 3.1
+    },
+    {
+      "type": "Missing Header",
+      "severity": "low",
+      "url": "http://10.10.90.2",
+      "detail": "Missing Referrer-Policy",
+      "poc": "",
+      "evidence": "",
+      "timestamp": "2026-05-29T23:01:48.281470",
+      "cvss": 3.1
+    },
+    {
+      "type": "Missing Header",
+      "severity": "low",
+      "url": "http://10.10.90.2",
+      "detail": "Missing Permissions-Policy",
+      "poc": "",
+      "evidence": "",
+      "timestamp": "2026-05-29T23:01:48.281473",
+      "cvss": 3.1
+    }
+  ],
+  "chains": [],
+  "summary": {
+    "total": 8,
+    "by_severity": {
+      "medium": 2,
+      "low": 6
+    },
+    "chains": 0
+  }
+}
