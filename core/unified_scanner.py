@@ -128,29 +128,67 @@ class UnifiedScanner:
         """Phase 1: Reconnaissance — discover attack surface."""
         import requests
         import re
+        from urllib.parse import urlparse, parse_qs
 
-        # Simple recon: GET the target and extract forms/params/endpoints
+        # Disable proxy for direct connection
+        session = requests.Session()
+        session.trust_env = False
+        session.verify = False
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+
         try:
-            resp = requests.get(self.ctx.target, timeout=10, verify=False)
+            resp = session.get(self.ctx.target, timeout=10)
             html = resp.text
+            status = resp.status_code
 
-            # Extract forms
-            forms = re.findall(r'<form[^>]*action="([^"]*)"[^>]*method="([^"]*)"', html, re.I)
-            self.ctx.forms = [{"action": f[0], "method": f[1]} for f in forms]
+            if status >= 400:
+                return {"error": f"HTTP {status}", "target": self.ctx.target}
 
-            # Extract input parameters
-            inputs = re.findall(r'<input[^>]*name="([^"]*)"', html, re.I)
-            self.ctx.params = list(set(inputs))
+            # 1. Extract forms with all attributes
+            form_pattern = r'<form[^>]*>(.*?)</form>'
+            forms_raw = re.findall(form_pattern, html, re.S | re.I)
+            for form_html in forms_raw:
+                action = re.search(r'action="([^"]*)"', form_html, re.I)
+                method = re.search(r'method="([^"]*)"', form_html, re.I)
+                inputs = re.findall(r'<input[^>]*name="([^"]*)"', form_html, re.I)
+                self.ctx.forms.append({
+                    "action": action.group(1) if action else "",
+                    "method": method.group(1) if method else "GET",
+                    "inputs": inputs,
+                })
 
-            # Extract endpoints/links
-            links = re.findall(r'href="(/[^"]*)"', html)
-            self.ctx.endpoints = list(set(links))
+            # 2. Extract ALL input parameters (inside and outside forms)
+            all_inputs = re.findall(r'<input[^>]*name="([^"]*)"', html, re.I)
+            self.ctx.params = list(set(all_inputs))
 
-            # Extract hidden fields (CSRF tokens etc)
+            # 3. Extract endpoints with query parameters
+            links = re.findall(r'href="([^"]*)"', html, re.I)
+            for link in links:
+                if '?' in link:
+                    parsed = urlparse(link)
+                    qs = parse_qs(parsed.query)
+                    for param_name in qs.keys():
+                        if param_name not in self.ctx.params:
+                            self.ctx.params.append(param_name)
+                if link.startswith('/') and not link.startswith('//'):
+                    self.ctx.endpoints.append(link)
+
+            # 4. Extract CSRF tokens
             hidden = re.findall(r'<input[^>]*type="hidden"[^>]*name="([^"]*)"[^>]*value="([^"]*)"', html, re.I)
             for name, value in hidden:
                 if 'csrf' in name.lower() or 'token' in name.lower():
                     self.ctx.csrf_token = value
+
+            # 5. Find product/blog endpoints
+            product_links = re.findall(r'href="(/product\?productId=\d+)"', html, re.I)
+            post_links = re.findall(r'href="(/post\?postId=\d+)"', html, re.I)
+            self.ctx.endpoints.extend(product_links[:5])
+            self.ctx.endpoints.extend(post_links[:5])
+
+            # 6. Find category/filter parameters
+            filter_links = re.findall(r'href="(/filter\?category=[^"]*)"', html, re.I)
+            if filter_links:
+                self.ctx.params.append("category")
 
             return {
                 "forms_found": len(self.ctx.forms),
@@ -159,6 +197,7 @@ class UnifiedScanner:
                 "csrf_token": self.ctx.csrf_token,
                 "params": self.ctx.params[:20],
                 "endpoints": self.ctx.endpoints[:20],
+                "http_status": status,
             }
         except Exception as e:
             return {"error": str(e)}
@@ -370,12 +409,28 @@ class UnifiedScanner:
         - Collaborator: OOB callbacks (blind vulns)
         - Proxy history: interesting patterns in traffic
         """
+        burp_findings = []
+
         # This would integrate with Burp MCP tools
         # For now, return the aggregation structure
         return {
             "scanner_issues": "Use burp(action='scanner_issues') to get",
             "collaborator": "Use burp(action='collaborator_check') to get OOB callbacks",
             "proxy_patterns": "Use burp(action='proxy_search', regex='token|key|password') to find",
+            "burp_findings": burp_findings,
+        }
+
+    def aggregate_burp_scanner(self) -> dict:
+        """Aggregate Burp Scanner issues into Hunter findings.
+
+        This calls Burp MCP to get scanner issues and converts them
+        to Hunter's finding format.
+        """
+        # This would call burp(action="scanner_issues")
+        # For now, return placeholder
+        return {
+            "note": "Use burp(action='scanner_issues') to get Burp Scanner findings",
+            "integration": "Scanner issues will be merged into Hunter findings",
         }
 
     def get_recommendations(self) -> List[str]:
