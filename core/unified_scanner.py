@@ -319,6 +319,46 @@ class UnifiedScanner:
             "medium": len([f for f in findings if f.get("severity") == "medium"]),
         }
 
+    def aggregate_burp_results(self) -> dict:
+        """Aggregate results from Burp Scanner, Collaborator, and Proxy.
+
+        This enhances findings with Burp's own analysis:
+        - Scanner issues: passive/active scan findings
+        - Collaborator: OOB callbacks (blind vulns)
+        - Proxy history: interesting patterns in traffic
+        """
+        # This would integrate with Burp MCP tools
+        # For now, return the aggregation structure
+        return {
+            "scanner_issues": "Use burp(action='scanner_issues') to get",
+            "collaborator": "Use burp(action='collaborator_check') to get OOB callbacks",
+            "proxy_patterns": "Use burp(action='proxy_search', regex='token|key|password') to find",
+        }
+
+    def get_recommendations(self) -> List[str]:
+        """Get next-step recommendations based on findings."""
+        recs = []
+
+        if not self.ctx.findings:
+            recs.append("No vulnerabilities found. Try manual testing or different parameters.")
+
+        if self.ctx.has_finding("sqli"):
+            recs.append("SQLi found! Try extracting data: tables → columns → credentials")
+            recs.append("Use Burp Collaborator for blind OOB exfiltration")
+
+        if self.ctx.has_finding("xss"):
+            recs.append("XSS found! Try stealing cookies or escalating to account takeover")
+            recs.append("Use exploit server for DOM/Stored XSS delivery")
+
+        if self.ctx.has_finding("ssrf"):
+            recs.append("SSRF found! Try accessing internal services, cloud metadata, or admin panels")
+            recs.append("Chain with open redirect if host filter exists")
+
+        if self.ctx.has_finding("ssti"):
+            recs.append("SSTI found! Try RCE payload for the identified template engine")
+
+        return recs
+
 
 def unified_scan_impl(target: str, session_cookie: str = "",
                        collaborator_domain: str = "",
