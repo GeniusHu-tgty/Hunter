@@ -29,7 +29,25 @@ def measure_login_time(host, username, password):
 4. Username with consistently longer response time = valid
 5. Brute force password for that username
 
-## Race Condition - Coupon Abuse (Verified)
+## CRITICAL LESSON: Rate Limiting (Verified)
+
+### PortSwigger Rate Limit Rules
+- ~3 failed attempts per 30-minute window per IP
+- IP-based across ALL lab instances (spans labs)
+- 30-minute cooldown after hitting limit
+
+### Correct Timing Attack Approach
+```
+1. One request per fresh session
+2. 5+ second delay between attempts
+3. Never exceed 2-3 attempts per 30-minute window
+4. NEVER fire parallel requests for timing attacks
+```
+
+### Burp MCP Limitation
+- Burp MCP does NOT expose response timing
+- Must use Python `time.time()` for timing measurements
+- Use Burp MCP for requests, Python for timing analysis
 
 ### Technique
 ```
