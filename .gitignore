@@ -1,0 +1,9 @@
+
+# Cache files
+D\*/
+__pycache__/
+*.pyc
+*.pyo
+pip-cache/
+npm-cache/
+*.body
