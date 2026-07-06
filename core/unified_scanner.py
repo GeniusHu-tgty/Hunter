@@ -126,21 +126,42 @@ class UnifiedScanner:
 
     def _phase_recon(self) -> dict:
         """Phase 1: Reconnaissance — discover attack surface."""
-        from core.probe import Probe
-        p = Probe(self.ctx.target)
-        result = p.run()
+        import requests
+        import re
 
-        # Extract forms and parameters
-        self.ctx.forms = result.get("forms", [])
-        self.ctx.params = result.get("params", [])
-        self.ctx.endpoints = result.get("endpoints", [])
+        # Simple recon: GET the target and extract forms/params/endpoints
+        try:
+            resp = requests.get(self.ctx.target, timeout=10, verify=False)
+            html = resp.text
 
-        return {
-            "forms_found": len(self.ctx.forms),
-            "params_found": len(self.ctx.params),
-            "endpoints_found": len(self.ctx.endpoints),
-            "details": result,
-        }
+            # Extract forms
+            forms = re.findall(r'<form[^>]*action="([^"]*)"[^>]*method="([^"]*)"', html, re.I)
+            self.ctx.forms = [{"action": f[0], "method": f[1]} for f in forms]
+
+            # Extract input parameters
+            inputs = re.findall(r'<input[^>]*name="([^"]*)"', html, re.I)
+            self.ctx.params = list(set(inputs))
+
+            # Extract endpoints/links
+            links = re.findall(r'href="(/[^"]*)"', html)
+            self.ctx.endpoints = list(set(links))
+
+            # Extract hidden fields (CSRF tokens etc)
+            hidden = re.findall(r'<input[^>]*type="hidden"[^>]*name="([^"]*)"[^>]*value="([^"]*)"', html, re.I)
+            for name, value in hidden:
+                if 'csrf' in name.lower() or 'token' in name.lower():
+                    self.ctx.csrf_token = value
+
+            return {
+                "forms_found": len(self.ctx.forms),
+                "params_found": len(self.ctx.params),
+                "endpoints_found": len(self.ctx.endpoints),
+                "csrf_token": self.ctx.csrf_token,
+                "params": self.ctx.params[:20],
+                "endpoints": self.ctx.endpoints[:20],
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
     def _phase_sqli(self) -> dict:
         """Phase 2: SQL Injection detection."""

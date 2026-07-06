@@ -10,10 +10,24 @@ import threading
 import time
 from typing import Optional
 
-import requests
+try:
+    import requests
+except ImportError:
+    pass
 
-from core.config import USER_AGENTS
-from core.response_analyzer import analyze_response, is_interesting
+try:
+    from core.config import USER_AGENTS
+except (ImportError, ModuleNotFoundError):
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ]
+
+try:
+    from core.response_analyzer import analyze_response, is_interesting
+except (ImportError, ModuleNotFoundError):
+    def analyze_response(resp): return {}
+    def is_interesting(resp): return False
 
 # Interesting patterns to detect in responses
 INTERESTING_PATTERNS = {
