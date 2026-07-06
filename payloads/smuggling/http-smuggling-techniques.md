@@ -88,6 +88,29 @@ Transfer-Encoding: chunKed
 # Front-end thinks it's the same connection
 ```
 
+## CRITICAL LESSON: Burp MCP HTTP/2 Problem (Verified)
+
+### Issue
+Burp's `send_http1_request` MCP tool auto-upgrades to HTTP/2, which:
+- Has its own framing (no Content-Length/Transfer-Encoding conflict)
+- Breaks CL/TE ambiguity completely
+- Makes smuggling impossible via Burp MCP
+
+### Solution
+Use raw Python sockets with `ssl.wrap_socket` for HTTP/1.1 smuggling:
+```python
+import socket, ssl
+s = socket.socket()
+s = ssl.wrap_socket(s)
+s.connect(('target.com', 443))
+s.send(smuggling_payload.encode())
+```
+
+### Key Detail
+- Must send both smuggle and trigger request on same keep-alive connection
+- Front-end reuses same back-end connection for the trigger request
+- Back-end sees smuggled bytes + trigger request as one continuous stream
+
 ## PortSwigger Lab Approach
 1. Send CL.TE request to / endpoint
 2. Check if response indicates smuggling
