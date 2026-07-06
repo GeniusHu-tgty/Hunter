@@ -2,8 +2,47 @@
 
 ## PortSwigger Progress
 - **Total Labs:** 274
-- **Solved:** ~65 (24%)
+- **Solved:** 34 (12%)
 - **Target:** 100%
+- **Last Updated:** 2026-07-06
+
+## By Category
+
+### Completed (100% or high)
+- SQL Injection: 14/18 ✅
+- XSS: 3+ solved
+- SSTI: 1 solved
+- Path Traversal: 1+ solved
+- SSRF: 3+ solved
+- XXE: 2+ solved
+- Command Injection: 1+ solved
+- Access Control: 1+ solved
+- Information Disclosure: 1+ solved
+- Authentication: 7+ solved
+- Business Logic: 1+ solved
+- Race Condition: 1+ solved
+- NoSQL Injection: 1+ solved
+- CORS: 1+ solved
+
+### In Progress
+- SQLi remaining: 4 labs
+- XSS remaining: 4+ labs
+- Path Traversal: 5 remaining
+- SSRF: 4 remaining
+- XXE: 7 remaining
+- Auth: 7 remaining
+- Business Logic: 10 remaining
+- Race Condition: 5 remaining
+- API Testing: 5 labs (0 solved)
+- Web Cache Poisoning: 5 labs (0 solved)
+- HTTP Request Smuggling: 5 labs (0 solved)
+- Clickjacking: 4 labs (0 solved)
+
+### Not Started
+- Prototype Pollution: 2 labs
+- GraphQL: 5 labs
+- WebSockets: 3 labs
+- DOM XSS: 7 labs
 
 ## By Category
 
