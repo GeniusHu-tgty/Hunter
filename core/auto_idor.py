@@ -211,6 +211,78 @@ class AutoIDOR:
 
         return {"vulnerable": False}
 
+    def test_cookie_role_tampering(self, url: str, cookies: dict = None) -> dict:
+        """Test privilege escalation via cookie manipulation.
+
+        Changes role/admin/isAdmin cookies to escalate privileges.
+        """
+        if not cookies:
+            return {"error": "No cookies provided"}
+
+        tamper_tests = [
+            ("role", "user", "admin"),
+            ("isAdmin", "false", "true"),
+            ("isAdmin", "0", "1"),
+            ("admin", "false", "true"),
+            ("admin", "0", "1"),
+            ("access_level", "1", "99"),
+            ("privilege", "low", "high"),
+        ]
+
+        results = []
+        for cookie_name, original, tampered in tamper_tests:
+            if cookie_name in cookies:
+                # Test with tampered value
+                tampered_cookies = dict(cookies)
+                tampered_cookies[cookie_name] = tampered
+
+                result = self._send(self.session, url, headers={"Cookie": "; ".join(f"{k}={v}" for k, v in tampered_cookies.items())})
+
+                # Check if response differs (privilege escalation)
+                if result.get("status") == 200:
+                    # Check for admin-specific content
+                    body = result.get("body", "").lower()
+                    if any(x in body for x in ["admin", "delete", "manage", "settings", "panel"]):
+                        self.vulnerable = True
+                        self.findings.append({
+                            "type": "cookie_role_tampering",
+                            "cookie": cookie_name,
+                            "original": original,
+                            "tampered": tampered,
+                        })
+                        results.append({
+                            "cookie": cookie_name,
+                            "tampered_value": tampered,
+                            "vulnerable": True,
+                            "status": result["status"],
+                        })
+
+        return {"tested": len(results), "vulnerable": self.vulnerable, "results": results}
+
+    def test_hidden_params(self, url: str) -> dict:
+        """Test for hidden parameters that control access.
+
+        Tries common parameter names in POST body.
+        """
+        hidden_params = [
+            "admin", "isAdmin", "is_admin", "role", "access_level",
+            "privilege", "permission", "debug", "test", "internal",
+            "api_key", "token", "secret",
+        ]
+
+        results = []
+        for param in hidden_params:
+            # Test with admin/true values
+            for value in ["admin", "true", "1", "yes"]:
+                result = self._send(self.session, url, method="POST",
+                                    headers={"Content-Type": "application/x-www-form-urlencoded"})
+                if result.get("status") == 200:
+                    body = result.get("body", "").lower()
+                    if any(x in body for x in ["admin", "manage", "settings"]):
+                        results.append({"param": param, "value": value, "vulnerable": True})
+
+        return {"tested": len(hidden_params), "results": results}
+
     def run_full_scan(self, url: str = "", url_template: str = "",
                       id_range: str = "1-5", current_id: str = "1") -> dict:
         """Run complete IDOR scan."""
