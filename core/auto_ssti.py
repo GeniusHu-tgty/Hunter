@@ -10,7 +10,15 @@ Automates Server-Side Template Injection detection:
 
 import re
 import time
-from tools.probe import _get_session
+try:
+    from tools.probe import _get_session
+except (ImportError, ModuleNotFoundError):
+    import requests
+    def _get_session():
+        s = requests.Session()
+        s.verify = False
+        s.headers.update({'User-Agent': 'Mozilla/5.0'})
+        return s
 
 
 class AutoSSTI:
