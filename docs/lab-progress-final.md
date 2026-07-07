@@ -292,3 +292,12 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Discovered: getUser(id), deleteOrganizationUser(input)
     - Deleted carlos via mutation{deleteOrganizationUser(input:{id:3})}
     - Key bypass: __schema#\n{ bypasses __schema{ regex
+
+### SSTI (2)
+61. Basic server-side template injection (code context)
+    - Tornado template engine
+    - Injection point: "Preferred name" dropdown value
+    - Value placed inside {{user_input}} template expression
+    - RCE payload: __import__('os').popen('rm /home/carlos/morale.txt').read()
+    - No delimiter breakout needed - direct code context
+    - Triggered by posting blog comment
