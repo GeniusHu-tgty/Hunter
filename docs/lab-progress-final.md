@@ -318,3 +318,13 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Concatenation: username||':'||password FROM users
     - Extracted: administrator / mg7a101dtki7mj4do3iw
     - Key: || operator to squeeze multiple columns into one
+
+### SQLi (19)
+64. Blind SQL injection with conditional responses
+    - TrackingId cookie injectable
+    - Boolean oracle: "Welcome back" = true, no message = false
+    - Confirm: AND '1'='1 vs AND '1'='2
+    - Password length: 20 chars via LENGTH(password)=N
+    - Extract: SUBSTR(password,N,1) = 'X' char by char
+    - Extracted: rdlczw8vy4r6zsrmdags
+    - ~420 total requests for 20-char password
