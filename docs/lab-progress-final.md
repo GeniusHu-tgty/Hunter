@@ -98,3 +98,40 @@ websocket, dom-xss, cache-poisoning, clickjacking
 - capability-matrix.md
 - progress-tracker.md
 - timing-attack-techniques.md
+
+### GraphQL (1)
+37. Accidental exposure of private GraphQL fields
+    - Endpoint: /graphql/v1 (found via JS source)
+    - Introspection enabled, User type exposed password field
+    - getUser(id) query returned plaintext passwords for all accounts
+    - Extracted administrator credentials, logged in, deleted carlos
+
+### Business Logic (2)
+38. Excessive trust in client-side controls
+    - Hidden price field in cart form: price=133700 (cents)
+    - Modified to price=1 ($0.01) in POST request
+    - Server had no server-side price validation
+    - $1337 jacket purchased for $0.01
+
+### Access Control (2)
+39. Unprotected admin functionality
+    - robots.txt leaked: Disallow: /administrator-panel
+    - Admin panel accessible without authentication
+    - Deleted carlos via /administrator-panel/delete?username=carlos
+
+### XXE (3)
+40. Exploiting XXE via image file upload
+    - Uploaded malicious SVG as avatar
+    - SVG contained XXE: <!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/hostname"> ]>
+    - Server parsed SVG, expanded XXE, converted to PNG
+    - Used OCR (easyocr) to read hostname from PNG: 154846213d25
+    - Submitted answer to /submitSolution
+
+### Race Condition (2)
+41. Bypassing rate limits via race conditions
+    - Rate limiter: 2 attempts per 120s lockout
+    - Used HTTP/2 single-packet attack (httpx http2=True)
+    - asyncio.gather() sent 30 requests simultaneously on single TCP connection
+    - All 30 passed the rate limit check before counter incremented
+    - Found carlos password: 123123
+    - Key: HTTP/2 multiplexing = requests arrive simultaneously
