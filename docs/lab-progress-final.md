@@ -158,3 +158,29 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Server escaped ' to \' but not &apos; HTML entity
     - Payload: http://x.com&apos;-alert(document.domain)-&apos;
     - Browser decodes &apos; to ' at render time, bypassing server filter
+
+### Web Cache Poisoning (1)
+45. Web cache poisoning with an unkeyed header
+    - X-Forwarded-Host header not included in cache key
+    - Server uses it to generate script src: //evil.com/resources/js/tracking.js
+    - Hosted alert(document.cookie) on exploit server
+    - Cached response served malicious script to all users
+    - http_probe worked when Burp timed out
+
+### Web Cache Poisoning (2)
+46. [PENDING] HTTP request smuggling CL.TE
+
+### NoSQL Injection (1)
+46. Exploiting NoSQL operator injection to bypass authentication
+    - MongoDB operator injection in JSON login body
+    - Admin username had random suffix (admin510uqku8)
+    - Payload: {"username":{"$regex":"^administrator"},"password":{"$ne":"invalid"}}
+    - $regex matched partial username, $ne bypassed password check
+
+### Prototype Pollution (1)
+47. DOM XSS via client-side prototype pollution
+    - deparam.js vulnerable to __proto__ bracket notation
+    - searchLogger.js reads config.transport_url (inherited from polluted prototype)
+    - Sink: document.createElement('script').src = config.transport_url
+    - Payload: ?__proto__[transport_url]=data:,alert(document.cookie)//
+    - data: URL embeds JS directly, // comments out suffix
