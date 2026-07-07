@@ -224,3 +224,18 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Cleared signature (empty string)
     - Modified JWT accepted by server, accessed /admin
     - Deleted carlos via /admin/delete?username=carlos
+
+### WebSocket (1)
+53. Manipulating WebSocket messages to exploit vulnerabilities
+    - Chat application uses WebSocket for messaging
+    - Payload: <img src=x onerror=alert(document.cookie)>
+    - Server echoes message to agent without sanitization
+    - Agent's browser renders HTML, onerror fires, executes XSS
+
+### Clickjacking (1)
+54. Basic clickjacking with CSRF token protection
+    - Target: /my-account page with Delete account button
+    - Exploit: transparent iframe (opacity:0.0001) + decoy button
+    - Button at (479, 16) inside iframe, iframe offset (8, 8)
+    - Decoy positioned at top:487px, left:24px to align
+    - Key: account for iframe body margin (8px default)
