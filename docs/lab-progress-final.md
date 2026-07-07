@@ -257,3 +257,11 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Full payload: &#49;&#32;&#85;&#78;&#73;&#79;&#78;&#32;&#83;&#69;&#76;&#69;&#67;&#84; = "1 UNION SELECT"
     - Extracted admin password: qfq7k4hac92rkhi73ywo
     - Helper: ''.join(f'&#{ord(c)};' for c in payload)
+
+### CORS (3)
+57. CORS vulnerability with trusted null origin
+    - Server trusts Origin: null
+    - Sandboxed iframe without allow-same-origin sends Origin: null
+    - /accountDetails returns admin API key with credentials
+    - Exploit: srcdoc iframe + XMLHttpRequest with withCredentials=true
+    - Admin API key: pGaVOclyKuQeEY6CTr7zYGrse6NnsE3G
