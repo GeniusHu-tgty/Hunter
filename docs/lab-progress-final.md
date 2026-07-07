@@ -208,3 +208,19 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - PHP loose comparison: true == "any_string" → true
     - Bypassed access_token validation, accessed admin panel
     - Deleted carlos via /admin/delete?username=carlos
+
+### OAuth (1)
+51. OAuth authentication bypass via implicit grant
+    - /authenticate endpoint trusts client-provided email
+    - No verification that email matches OAuth token
+    - Enumerate admin email by trying different formats (302=success)
+    - Set email to admin's email in callback, bypass token verification
+    - Python requests can run full OAuth flow (authorize→login→consent→callback)
+
+### JWT (1)
+52. JWT authentication bypass via unverified signature
+    - JWT uses RS256 but server doesn't verify signature at all
+    - Changed "sub": "wiener" → "sub": "administrator"
+    - Cleared signature (empty string)
+    - Modified JWT accepted by server, accessed /admin
+    - Deleted carlos via /admin/delete?username=carlos
