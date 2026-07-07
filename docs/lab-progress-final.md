@@ -135,3 +135,26 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - All 30 passed the rate limit check before counter incremented
     - Found carlos password: 123123
     - Key: HTTP/2 multiplexing = requests arrive simultaneously
+
+### CORS (2)
+42. CORS vulnerability with trusted insecure protocols
+    - CORS trusted all subdomains regardless of HTTP/HTTPS
+    - stock subdomain had reflected XSS in productId param
+    - Chain: XSS on http://stock.SUB → CORS request to /accountDetails
+    - Exfiltrated admin API key via exploit server
+    - Key: HTTP subdomain + CORS trust = credential theft
+
+### XXE (4)
+43. Blind XXE with out-of-band interaction
+    - POST /product/stock accepts XML
+    - Injected: <!ENTITY xxe SYSTEM "http://COLLABORATOR">
+    - Burp Collaborator recorded DNS + HTTP callbacks
+    - file:// protocol confirmed working
+    - oastify.com domain reached successfully
+
+### XSS (4)
+44. Stored XSS into onclick event handler
+    - Website field reflected in onclick: tracker.track('VALUE')
+    - Server escaped ' to \' but not &apos; HTML entity
+    - Payload: http://x.com&apos;-alert(document.domain)-&apos;
+    - Browser decodes &apos; to ' at render time, bypassing server filter

