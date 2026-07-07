@@ -336,3 +336,9 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Payload: /feedback?returnPath=javascript:alert(document.cookie)
     - jQuery code: $('#backLink').attr("href", params.get('returnPath'))
     - Click back link triggers DOM XSS
+
+### XSS (7)
+66. Stored XSS into HTML context with nothing encoded
+    - Blog comment field with zero encoding
+    - Payload: <script>alert(document.cookie)</script>
+    - Script executes on page load for any viewer
