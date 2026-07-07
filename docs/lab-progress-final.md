@@ -184,3 +184,27 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Sink: document.createElement('script').src = config.transport_url
     - Payload: ?__proto__[transport_url]=data:,alert(document.cookie)//
     - data: URL embeds JS directly, // comments out suffix
+
+### HTTP Request Smuggling (2)
+48. HTTP request smuggling, basic CL.TE
+    - Front-end: Content-Length (90 bytes)
+    - Back-end: Transfer-Encoding: chunked
+    - "0\r\n\r\n" = chunk end for back-end, but CL reads more
+    - Residual "GPOST /" pollutes next request
+    - Must use raw TCP socket (Python socket), HTTP libs normalize headers
+
+### SSRF (4)
+49. Blind SSRF with out-of-band detection
+    - Referer header triggers server-side fetch
+    - Set Referer to Collaborator URL: http://COLLABORATOR
+    - Analytics software fetches Referer, triggers DNS interaction
+    - Lab auto-detects OOB interaction
+
+### Insecure Deserialization (1)
+50. Modifying serialized data types (PHP type juggling)
+    - PHP session cookie contains serialized User object
+    - Original: O:4:"User":2:{...s:12:"access_token";s:32:"TOKEN";}
+    - Modified: O:4:"User":2:{...s:12:"access_token";b:1;}
+    - PHP loose comparison: true == "any_string" → true
+    - Bypassed access_token validation, accessed admin panel
+    - Deleted carlos via /admin/delete?username=carlos

