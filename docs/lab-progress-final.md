@@ -342,3 +342,10 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Blog comment field with zero encoding
     - Payload: <script>alert(document.cookie)</script>
     - Script executes on page load for any viewer
+
+### XXE (6)
+67. Exploiting XXE to perform SSRF attacks
+    - XXE to access AWS metadata: http://169.254.169.254/latest/meta-data/
+    - Traversed: meta-data → iam → security-credentials → admin
+    - Extracted IAM credentials (AccessKeyId, SecretAccessKey)
+    - Classic XXE → SSRF → cloud metadata chain

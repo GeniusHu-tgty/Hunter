@@ -4,6 +4,8 @@ auto_graphql.py - Automated GraphQL vulnerability detection and exploitation
 
 import re
 import json
+import asyncio
+import concurrent.futures
 from typing import Optional
 
 
