@@ -281,3 +281,14 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Sink: document.write() - no HTML encoding
     - Payload: /?search="><img src=x onerror=alert(document.cookie)>
     - Closes existing input tag, injects new img tag with onerror
+
+### GraphQL (3)
+60. Finding a hidden GraphQL endpoint
+    - Hidden endpoint at /api (not /graphql)
+    - GET + query={__typename} confirmed GraphQL
+    - Introspection blocked: "GraphQL introspection is not allowed"
+    - Bypass: Insert comment after __schema: %23 (hash) + %0a (newline)
+    - Regex matches __schema{ but parser ignores comments
+    - Discovered: getUser(id), deleteOrganizationUser(input)
+    - Deleted carlos via mutation{deleteOrganizationUser(input:{id:3})}
+    - Key bypass: __schema#\n{ bypasses __schema{ regex

