@@ -274,3 +274,10 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Must use FROM dual for standalone SELECT in Oracle
     - Extracted: administrator / zfc6opka8uiwb7fnp2ll
     - ~20 requests/second extraction speed
+
+### XSS (5)
+59. DOM XSS in document.write sink using source location.search
+    - Source: location.search (URL query parameter)
+    - Sink: document.write() - no HTML encoding
+    - Payload: /?search="><img src=x onerror=alert(document.cookie)>
+    - Closes existing input tag, injects new img tag with onerror
