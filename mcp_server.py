@@ -934,6 +934,48 @@ async def hunter_auto_race(target: str, cookie: str = "") -> str:
 
 
 @mcp.tool()
+async def hunter_auto_cors(target: str, cookie: str = "") -> str:
+    """
+    Automated CORS misconfiguration scanner.
+
+    Args:
+        target: Target URL
+        cookie: Optional session cookie
+
+    Returns:
+        JSON with origin reflection, null origin, subdomain trust, and exploit HTML.
+    """
+    try:
+        from core.auto_cors import scan
+        result = scan(target, cookie)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def hunter_auto_jwt(target: str, token: str = "", cookie: str = "") -> str:
+    """
+    Automated JWT vulnerability scanner.
+
+    Args:
+        target: Target URL (endpoint that accepts JWT)
+        token: JWT token to test
+        cookie: Optional session cookie
+
+    Returns:
+        JSON with signature verification, none algorithm, algorithm confusion, weak key tests.
+    """
+    try:
+        from core.auto_jwt import AutoJWT
+        jwt = AutoJWT(target, token, cookie)
+        result = jwt.scan()
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 async def hunter_unified_scan(target: str, cookie: str = "", collaborator: str = "",
                                phases: Optional[List[str]] = None) -> str:
     """
