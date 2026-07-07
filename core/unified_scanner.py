@@ -76,7 +76,7 @@ class UnifiedScanner:
                     Options: ['recon', 'sqli', 'xss', 'ssti', 'ssrf', 'xxe', 'cmd', 'idor']
         """
         if phases is None:
-            phases = ["recon", "sqli", "xss", "ssti", "ssrf", "xxe", "cmd", "idor"]
+            phases = ["recon", "sqli", "xss", "ssti", "ssrf", "xxe", "cmd", "idor", "csrf", "graphql", "websocket"]
 
         results = {
             "target": self.ctx.target,
@@ -121,6 +121,12 @@ class UnifiedScanner:
             return self._phase_cmd()
         elif phase == "idor":
             return self._phase_idor()
+        elif phase == "csrf":
+            return self._phase_csrf()
+        elif phase == "graphql":
+            return self._phase_graphql()
+        elif phase == "websocket":
+            return self._phase_websocket()
         else:
             return {"error": f"Unknown phase: {phase}"}
 
@@ -380,6 +386,65 @@ class UnifiedScanner:
                     results.append({"endpoint": endpoint, "vulnerable": True})
 
         return {"endpoints_tested": len(self.ctx.endpoints), "findings": results}
+
+    def _phase_csrf(self) -> dict:
+        """Phase 9: CSRF detection."""
+        try:
+            from core.auto_csrf import scan as csrf_scan
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_csrf not available"}
+
+        result = csrf_scan(self.ctx.target, self.ctx.session_cookie)
+
+        if result.get("findings"):
+            for finding in result["findings"]:
+                self.ctx.add_finding("csrf", finding.get("type", "csrf"),
+                                     f"{finding.get('details', '')}", finding.get("severity", "medium"))
+
+        return {
+            "forms_found": len(result.get("forms", [])),
+            "findings": result.get("findings", []),
+            "exploit_html": result.get("exploit_html", "")[:500]
+        }
+
+    def _phase_graphql(self) -> dict:
+        """Phase 10: GraphQL detection."""
+        try:
+            from core.auto_graphql import full_scan as graphql_scan
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_graphql not available"}
+
+        result = graphql_scan(self.ctx.target)
+
+        if result.get("findings_count", 0) > 0:
+            self.ctx.add_finding("graphql", "GraphQL vulnerabilities found",
+                                 f"Findings: {result.get('findings_count')}", result.get("severity", "medium"))
+
+        return {
+            "endpoint_found": result.get("endpoint_discovery", {}).get("found", False),
+            "findings_count": result.get("findings_count", 0),
+            "severity": result.get("severity", "info")
+        }
+
+    def _phase_websocket(self) -> dict:
+        """Phase 11: WebSocket detection."""
+        try:
+            from core.auto_websocket import full_scan as ws_scan
+        except (ImportError, ModuleNotFoundError):
+            return {"error": "auto_websocket not available"}
+
+        result = ws_scan(self.ctx.target)
+
+        if result.get("findings"):
+            for finding in result["findings"]:
+                self.ctx.add_finding("websocket", finding.get("type", "websocket"),
+                                     f"{finding.get('details', '')}", finding.get("severity", "medium"))
+
+        return {
+            "endpoints_found": len(result.get("discovery", {}).get("endpoints", [])),
+            "findings_count": result.get("findings_count", 0),
+            "severity": result.get("severity", "info")
+        }
 
     def _generate_summary(self) -> dict:
         """Generate scan summary."""

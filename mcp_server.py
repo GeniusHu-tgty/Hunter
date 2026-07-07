@@ -788,6 +788,162 @@ async def hunter_js_analyze(target: str) -> str:
 
 
 # ============================================================
+# Auto-* Direct Tools (New in v8)
+# ============================================================
+
+@mcp.tool()
+async def hunter_auto_csrf(target: str, cookie: str = "") -> str:
+    """
+    Automated CSRF vulnerability detection and exploit generation.
+
+    Args:
+        target: Target URL to scan
+        cookie: Optional session cookie
+
+    Returns:
+        JSON with forms analyzed, CSRF weaknesses found, and exploit HTML.
+    """
+    try:
+        from core.auto_csrf import scan
+        result = scan(target, cookie)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def hunter_auto_graphql(target: str) -> str:
+    """
+    Automated GraphQL vulnerability scanner.
+
+    Args:
+        target: Target base URL
+
+    Returns:
+        JSON with endpoint discovery, introspection results, private data access, and security checks.
+    """
+    try:
+        from core.auto_graphql import full_scan
+        result = full_scan(target)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def hunter_auto_websocket(target: str) -> str:
+    """
+    Automated WebSocket vulnerability scanner.
+
+    Args:
+        target: Target URL (will discover WebSocket endpoints)
+
+    Returns:
+        JSON with WebSocket endpoint discovery, origin bypass tests, XSS injection tests, CSWSH tests.
+    """
+    try:
+        from core.auto_websocket import full_scan
+        result = full_scan(target)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def hunter_auto_ssti(target: str, param: str = "q", method: str = "GET") -> str:
+    """
+    Automated SSTI vulnerability scanner with engine detection.
+
+    Args:
+        target: Target URL with injectable parameter
+        param: Parameter name to inject
+        method: HTTP method (GET/POST)
+
+    Returns:
+        JSON with SSTI detection, engine identification, and RCE payloads.
+    """
+    try:
+        from core.auto_ssti import scan
+        result = scan(target, param=param, method=method)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def hunter_auto_cmd(target: str, param: str = "cmd", method: str = "GET") -> str:
+    """
+    Automated Command Injection scanner.
+
+    Args:
+        target: Target URL with injectable parameter
+        param: Parameter name to inject
+        method: HTTP method (GET/POST)
+
+    Returns:
+        JSON with command injection detection and payloads.
+    """
+    try:
+        from core.auto_cmd import scan
+        result = scan(target, param=param, method=method)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def hunter_auto_idor(target: str, endpoint: str = "", cookie: str = "") -> str:
+    """
+    Automated IDOR vulnerability scanner.
+
+    Args:
+        target: Target base URL
+        endpoint: API endpoint to test
+        cookie: Optional session cookie
+
+    Returns:
+        JSON with IDOR detection results.
+    """
+    try:
+        from core.auto_idor import AutoIDOR
+        idor = AutoIDOR(base_url=target, endpoint=endpoint)
+        result = idor.run_full_scan()
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def hunter_unified_scan(target: str, cookie: str = "", collaborator: str = "",
+                               phases: Optional[List[str]] = None) -> str:
+    """
+    Unified scan engine - runs all 11 phases automatically.
+
+    Phases: recon, sqli, xss, ssti, ssrf, xxe, cmd, idor, csrf, graphql, websocket
+
+    Args:
+        target: Target URL
+        cookie: Optional session cookie
+        collaborator: Optional Burp Collaborator domain for OOB testing
+        phases: Optional list of specific phases to run
+
+    Returns:
+        JSON with comprehensive scan results across all phases.
+    """
+    try:
+        from core.unified_scanner import UnifiedScanner
+        scanner = UnifiedScanner(
+            target=target,
+            session_cookie=cookie,
+            collaborator_domain=collaborator,
+        )
+        result = scanner.run_full_scan(phases=phases)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ============================================================
 # Payload Tools
 # ============================================================
 
