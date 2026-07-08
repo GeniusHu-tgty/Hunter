@@ -349,3 +349,10 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Traversed: meta-data → iam → security-credentials → admin
     - Extracted IAM credentials (AccessKeyId, SecretAccessKey)
     - Classic XXE → SSRF → cloud metadata chain
+
+### SQLi (20)
+69. Blind SQL injection with time delays (PostgreSQL)
+    - TrackingId cookie injectable
+    - Payload: TrackingId=x'||pg_sleep(10)--
+    - Response time: ~21 seconds (10s sleep + overhead)
+    - DBMS: PostgreSQL (pg_sleep function)
