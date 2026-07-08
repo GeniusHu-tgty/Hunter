@@ -410,3 +410,11 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - RCE via: string.sub.constructor → Function → require('child_process').exec()
     - Payload: Handlebars object chain exploit
     - Key: wrtz triggers error for engine identification
+
+### XSS (9)
+78. Stored XSS into anchor href attribute with double quotes HTML-encoded
+    - Website field → <a> href attribute
+    - Double quotes encoded, can't break out
+    - But javascript: protocol works in href without breaking quotes
+    - Payload: javascript:alert(document.cookie)
+    - Click author name link → XSS fires
