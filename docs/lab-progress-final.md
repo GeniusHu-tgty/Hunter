@@ -371,3 +371,10 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Payload: <productId xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include parse="text" href="file:///etc/passwd"/></productId>
     - parse="text" ensures plain text inclusion (not parsed as XML)
     - Extracted: peter, carlos, user, elmer, academy
+
+### Access Control (5)
+72. Multi-step process with no access control on one step
+    - Admin function requires multiple steps (select user → confirm)
+    - Only step 1 checks authorization
+    - As non-admin, POST directly to step 2
+    - Bypass: Skip authorization check by calling confirmation step directly
