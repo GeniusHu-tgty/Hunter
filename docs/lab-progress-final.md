@@ -378,3 +378,10 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Only step 1 checks authorization
     - As non-admin, POST directly to step 2
     - Bypass: Skip authorization check by calling confirmation step directly
+
+### Access Control (6)
+73. User role can be modified in user profile
+    - /my-account/change-email accepts JSON, filters extra fields
+    - Mass assignment: {"email":"test@test.com","roleid":2}
+    - roleid=2 = admin, grants /admin access
+74. Multi-step process with no access control on one step (duplicate check)

