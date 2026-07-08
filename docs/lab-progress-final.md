@@ -363,3 +363,11 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Non-admin user can forge Referer: /admin to access admin endpoints
     - Promoted wiener to ADMIN via /admin-roles?username=wiener&action=upgrade
     - Fix: Use server-side session-based authorization, not Referer
+
+### XXE (7)
+71. Exploiting XInclude to retrieve files
+    - App doesn't allow full XML document control
+    - Inject XInclude in productId value
+    - Payload: <productId xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include parse="text" href="file:///etc/passwd"/></productId>
+    - parse="text" ensures plain text inclusion (not parsed as XML)
+    - Extracted: peter, carlos, user, elmer, academy
