@@ -385,3 +385,12 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Mass assignment: {"email":"test@test.com","roleid":2}
     - roleid=2 = admin, grants /admin access
 74. Multi-step process with no access control on one step (duplicate check)
+
+### XSS (8)
+75. Reflected DOM XSS
+    - Server reflects search parameter into JSON response
+    - JSON passed to eval() - dangerous!
+    - Server escapes " to \" but does NOT escape backslash
+    - Payload: test\\\"};alert(1);//
+    - Triple backslash + quote breaks out of JSON string context
+    - Key insight: \\\" becomes \\\" in JSON, eval parses as escaped backslash + unescaped quote
