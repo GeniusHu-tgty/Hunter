@@ -356,3 +356,10 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Payload: TrackingId=x'||pg_sleep(10)--
     - Response time: ~21 seconds (10s sleep + overhead)
     - DBMS: PostgreSQL (pg_sleep function)
+
+### Access Control (4)
+70. Referer-based access control
+    - Server only checks Referer header for admin authorization
+    - Non-admin user can forge Referer: /admin to access admin endpoints
+    - Promoted wiener to ADMIN via /admin-roles?username=wiener&action=upgrade
+    - Fix: Use server-side session-based authorization, not Referer
