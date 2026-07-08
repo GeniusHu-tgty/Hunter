@@ -135,3 +135,28 @@ GET /my-account
 3. **Implicit trust in user input** → Change roles/prices
 4. **Missing negative checks** → Use negative quantities
 5. **Race conditions** → Concurrent requests
+
+## Verified Finding: Integer Overflow in Cart Calculation
+
+**Lab**: Low-level logic flaw (PRACTITIONER)
+
+### Vulnerability
+- Cart total uses 32-bit signed integer (cents)
+- Overflow at 2^31 cents (~$21.47M)
+- Need ~4.8M items of $4.45 to overflow
+
+### Attack Approach
+1. Add 99 items per request (server validates 0-99)
+2. Repeat ~48,745 times to reach 4.8M items
+3. Total wraps negative → add expensive item to offset
+4. Checkout with negative total
+
+### Key Findings
+- Server validates quantity 0-99 per request
+- Cart accumulates quantities across requests
+- Negative quantities clamped to 0 (can't use)
+- Server crashes at high concurrency (>500 workers)
+- Recommended: 50-100 workers, run for 30+ minutes
+
+### Lesson
+Integer overflow attacks need patience, not speed. Moderate concurrency.
