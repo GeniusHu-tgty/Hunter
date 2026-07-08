@@ -418,3 +418,11 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - But javascript: protocol works in href without breaking quotes
     - Payload: javascript:alert(document.cookie)
     - Click author name link → XSS fires
+
+### Clickjacking (1)
+79. Basic clickjacking with CSRF token protection
+    - iframe loads /my-account with opacity:0.0001
+    - Decoy button positioned at (24, 487) over Delete account button
+    - Button at (16, 479) in iframe + 8px body margin = (24, 487)
+    - CSRF token irrelevant - iframe loads with valid session
+    - First attempt success via Playwright bounding boxes
