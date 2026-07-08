@@ -394,3 +394,11 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - Payload: test\\\"};alert(1);//
     - Triple backslash + quote breaks out of JSON string context
     - Key insight: \\\" becomes \\\" in JSON, eval parses as escaped backslash + unescaped quote
+
+### Path Traversal (2)
+76. File path traversal, traversal sequences stripped non-recursively
+    - Server strips ../ but only once (not recursive)
+    - Payload: ....//....//....//....//etc/passwd
+    - After stripping embedded ../, remaining chars form new ../
+    - 4x nesting = ../../../etc/passwd
+    - http_probe one-shot success (2316 bytes)
