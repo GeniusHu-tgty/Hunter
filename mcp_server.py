@@ -976,6 +976,26 @@ async def hunter_auto_jwt(target: str, token: str = "", cookie: str = "") -> str
 
 
 @mcp.tool()
+async def hunter_auto_access_control(target: str, cookie: str = "") -> str:
+    """
+    Automated Access Control vulnerability scanner.
+
+    Args:
+        target: Target URL
+        cookie: Optional session cookie
+
+    Returns:
+        JSON with Referer bypass, multi-step bypass, role tampering, unprotected admin tests.
+    """
+    try:
+        from core.auto_access_control import scan
+        result = scan(target, cookie)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 async def hunter_unified_scan(target: str, cookie: str = "", collaborator: str = "",
                                phases: Optional[List[str]] = None) -> str:
     """
