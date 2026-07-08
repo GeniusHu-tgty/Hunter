@@ -402,3 +402,11 @@ websocket, dom-xss, cache-poisoning, clickjacking
     - After stripping embedded ../, remaining chars form new ../
     - 4x nesting = ../../../etc/passwd
     - http_probe one-shot success (2316 bytes)
+
+### SSTI (3)
+77. SSTI in unknown language with documented exploit
+    - Template engine: Handlebars (Node.js)
+    - Injection: ?message= GET parameter
+    - RCE via: string.sub.constructor → Function → require('child_process').exec()
+    - Payload: Handlebars object chain exploit
+    - Key: wrtz triggers error for engine identification
