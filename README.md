@@ -1,8 +1,36 @@
-﻿# Hunter v7 - AI-Driven Penetration Testing Framework
+# Hunter v8 - AI-Driven Penetration Testing Framework
 
 ## Overview
 
 Hunter is an AI-driven penetration testing framework that combines automated tools with intelligent analysis. Claude is the brain, and the tools are the hands.
+
+
+## MCP v8 Hardening
+
+Hunter v8 exposes **36 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
+
+### Local-first meta tools
+
+```python
+# Check runtime health without touching targets
+await hunter_healthcheck()
+
+# Get actual tool matrix for agent routing
+await hunter_capabilities()
+
+# Recommend next proof step from observed signals
+await hunter_recommend_next(
+    target="https://example.com",
+    signals=["idor", "jwt", "cors"],
+    finding="API uses userId and X-Id-Token"
+)
+```
+
+### v8 auto tools
+
+`hunter_auto_sqli`, `hunter_auto_xss`, `hunter_auto_ssrf`, `hunter_auto_ssti`, `hunter_auto_cmd`, `hunter_auto_xxe`, `hunter_auto_idor`, `hunter_auto_csrf`, `hunter_auto_cors`, `hunter_auto_jwt`, `hunter_auto_graphql`, `hunter_auto_websocket`, `hunter_auto_race`, `hunter_auto_access_control`, and `hunter_unified_scan` are registered through the root MCP server.
+
+All v8 wrappers return bounded JSON with `status`, `tool`, `elapsed_seconds`, and either scanner results or structured error/timeout details.
 
 ## Tool Inventory
 

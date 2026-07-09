@@ -7,16 +7,11 @@ import sys
 import os
 import io
 
-# Fix Windows encoding
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def test_import(module_path, class_name):
+def import_tool(module_path, class_name):
     """Generic import test."""
     mod = __import__(module_path, fromlist=[class_name])
     cls = getattr(mod, class_name)
@@ -25,28 +20,34 @@ def test_import(module_path, class_name):
 
 
 def test_auto_sqli():
-    return test_import('core.auto_sqli', 'AutoSQLi')
+    assert import_tool('core.auto_sqli', 'AutoSQLi') is not None
 
 def test_auto_xss():
-    return test_import('core.auto_xss', 'AutoXSS')
+    assert import_tool('core.auto_xss', 'AutoXSS') is not None
 
 def test_auto_ssti():
-    return test_import('core.auto_ssti', 'AutoSSTI')
+    assert import_tool('core.auto_ssti', 'AutoSSTI') is not None
 
 def test_auto_ssrf():
-    return test_import('core.auto_ssrf', 'AutoSSRF')
+    assert import_tool('core.auto_ssrf', 'AutoSSRF') is not None
 
 def test_auto_xxe():
-    return test_import('core.auto_xxe', 'AutoXXE')
+    assert import_tool('core.auto_xxe', 'AutoXXE') is not None
 
 def test_auto_cmd():
-    return test_import('core.auto_cmd', 'AutoCMD')
+    assert import_tool('core.auto_cmd', 'AutoCMD') is not None
 
 def test_auto_idor():
-    return test_import('core.auto_idor', 'AutoIDOR')
+    assert import_tool('core.auto_idor', 'AutoIDOR') is not None
 
 
 if __name__ == '__main__':
+    # Fix Windows encoding only for direct script execution.
+    # Rewrapping stdout/stderr at import time breaks pytest capture.
+    if sys.platform == 'win32':
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
     tests = [
         test_auto_sqli,
         test_auto_xss,

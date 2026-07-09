@@ -1,5 +1,17 @@
-﻿# Hunter Pentest Framework - Tools Inventory
+# Hunter Pentest Framework - Tools Inventory
 # Generated: 2026-06-05 23:50:33
+
+
+## MCP v8 Tool Surface
+
+- Total MCP tools: 36
+- Meta/orchestration: `hunter_healthcheck`, `hunter_capabilities`, `hunter_recommend_next`, `hunter_agents_list`, `hunter_phases_list`
+- Pipelines: `hunter_scan`, `hunter_recon`, `hunter_vuln_scan`
+- Recon atomics: `hunter_subdomain`, `hunter_port_scan`, `hunter_tech_detect`, `hunter_dir_enum`, `hunter_js_analyze`
+- Auto verification: `hunter_auto_sqli`, `hunter_auto_xss`, `hunter_auto_ssrf`, `hunter_auto_ssti`, `hunter_auto_cmd`, `hunter_auto_xxe`, `hunter_auto_idor`, `hunter_auto_csrf`, `hunter_auto_cors`, `hunter_auto_jwt`, `hunter_auto_graphql`, `hunter_auto_websocket`, `hunter_auto_race`, `hunter_auto_access_control`, `hunter_unified_scan`
+- Payload/evidence/report: `hunter_payload_list`, `hunter_payload_search`, `hunter_payload_get`, `hunter_payload_generate`, `hunter_burp_import`, `hunter_session_list`, `hunter_session_status`, `hunter_report`
+
+Run `hunter_healthcheck` first. If external CLIs are degraded, use payload/meta/report tools plus Burp/http_probe for proof collection.
 
 ## Go-based Tools (23 tools)
 

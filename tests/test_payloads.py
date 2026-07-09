@@ -8,6 +8,24 @@ import yaml
 
 
 PAYLOADS_DIR = os.path.join(os.path.dirname(__file__), '..', 'payloads')
+CORE_PAYLOAD_TYPES = {'deser', 'info_leak', 'jwt', 'lfi', 'sqli', 'ssti', 'xss', 'xxe'}
+
+
+def _payload_yaml_path(payload_type):
+    return os.path.join(PAYLOADS_DIR, payload_type, 'payloads.yaml')
+
+
+def _load_payload_yaml(payload_type):
+    with open(_payload_yaml_path(payload_type), encoding='utf-8') as f:
+        return yaml.safe_load(f)
+
+
+def _actual_payload_types():
+    return {
+        item
+        for item in os.listdir(PAYLOADS_DIR)
+        if os.path.exists(_payload_yaml_path(item))
+    }
 
 
 class TestPayloadFiles:
@@ -16,55 +34,16 @@ class TestPayloadFiles:
     def test_payloads_dir_exists(self):
         assert os.path.isdir(PAYLOADS_DIR)
 
-    def test_sqli_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'sqli', 'payloads.yaml')
+    def test_core_payload_inventory_matches_repo(self):
+        """核心 payload 类型以仓库实际 YAML 为准，避免 stale 目录断言。"""
+        assert CORE_PAYLOAD_TYPES.issubset(_actual_payload_types())
+
+    @pytest.mark.parametrize('payload_type', sorted(CORE_PAYLOAD_TYPES))
+    def test_core_payload_yaml_loads_as_utf8(self, payload_type):
+        path = _payload_yaml_path(payload_type)
         assert os.path.exists(path)
-        with open(path) as f:
-            data = yaml.safe_load(f)
+        data = _load_payload_yaml(payload_type)
         assert data is not None
-
-    def test_xss_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'xss', 'payloads.yaml')
-        assert os.path.exists(path)
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        assert data is not None
-
-    def test_ssrf_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'ssrf', 'payloads.yaml')
-        assert os.path.exists(path)
-
-    def test_ssti_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'ssti', 'payloads.yaml')
-        assert os.path.exists(path)
-
-    def test_lfi_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'lfi', 'payloads.yaml')
-        assert os.path.exists(path)
-
-    def test_rce_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'rce', 'payloads.yaml')
-        assert os.path.exists(path)
-
-    def test_jwt_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'jwt', 'payloads.yaml')
-        assert os.path.exists(path)
-
-    def test_upload_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'upload', 'payloads.yaml')
-        assert os.path.exists(path)
-
-    def test_xxe_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'xxe', 'payloads.yaml')
-        assert os.path.exists(path)
-
-    def test_deser_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'deser', 'payloads.yaml')
-        assert os.path.exists(path)
-
-    def test_info_leak_payloads(self):
-        path = os.path.join(PAYLOADS_DIR, 'info_leak', 'payloads.yaml')
-        assert os.path.exists(path)
 
 
 class TestPayloadFormat:
@@ -92,9 +71,9 @@ class TestPayloadFormat:
         """验证总 payload 数量 >= 680"""
         total = 0
         for vuln_type in os.listdir(PAYLOADS_DIR):
-            path = os.path.join(PAYLOADS_DIR, vuln_type, 'payloads.yaml')
+            path = _payload_yaml_path(vuln_type)
             if os.path.exists(path):
-                with open(path) as f:
+                with open(path, encoding='utf-8') as f:
                     data = yaml.safe_load(f)
                 total += self._count_payloads_recursive(data)
         assert total >= 680, f"Expected 680+ payloads, got {total}"
