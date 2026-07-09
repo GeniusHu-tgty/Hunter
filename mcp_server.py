@@ -40,6 +40,7 @@ from core.vuln_classification import VulnClassification
 from core.mcp_server import get_hunter
 from core.burp_import import import_burp_evidence
 from payloads.loader import PayloadLoader
+from core.hunter_tools_facade import HunterToolsFacade
 
 # ============================================================
 # MCP Server
@@ -56,6 +57,7 @@ mcp = FastMCP(
 _sessions: Dict[str, AuditSession] = {}
 _payload_loader = PayloadLoader(str(HUNTER_DIR / "payloads"))
 _hunter = get_hunter()
+_hunter_tools = HunterToolsFacade(HUNTER_DIR)
 _WORDLIST_ALIASES = {
     "default": "common.txt",
     "common": "common.txt",
@@ -1052,6 +1054,9 @@ async def hunter_healthcheck() -> str:
         "hunter_auto_cors", "hunter_auto_jwt", "hunter_auto_graphql", "hunter_auto_websocket",
         "hunter_auto_race", "hunter_auto_access_control", "hunter_unified_scan",
         "hunter_healthcheck", "hunter_capabilities", "hunter_recommend_next",
+        "hunter_kb_list", "hunter_kb_search", "hunter_kb_read", "hunter_kb_recommend",
+        "hunter_burp_bridge", "hunter_burp_repeater", "hunter_burp_proxy_search",
+        "hunter_burp_scanner_issues", "hunter_burp_collaborator_workflow",
     ]
     registered = _registered_hunter_tools()
     missing_mcp = [name for name in required_mcp if name not in registered]
@@ -1083,6 +1088,7 @@ async def hunter_healthcheck() -> str:
         "external_tools": external,
         "wordlists": wordlists,
         "payloads": payloads,
+        "hunter_tools": _hunter_tools.health().get("data", {}),
         "notes": [
             "网络型扫描依赖外部 CLI；缺失时仍可使用 payload/meta/report 工具。",
             "所有 auto 工具经 safe wrapper 返回 JSON，不应把异常泄漏到 MCP 层。",
@@ -1131,6 +1137,15 @@ async def hunter_capabilities() -> str:
         "hunter_healthcheck": ("meta", "Runtime health check"),
         "hunter_capabilities": ("meta", "Capability matrix"),
         "hunter_recommend_next": ("meta", "Evidence-driven next-step routing"),
+        "hunter_kb_list": ("kb", "List Hunter technique markdown and payload YAML inventory"),
+        "hunter_kb_search": ("kb", "Search Hunter KB by signal/query"),
+        "hunter_kb_read": ("kb", "Read exact Hunter KB file under payloads/"),
+        "hunter_kb_recommend": ("kb", "Recommend KB, payload, Hunter tools and Burp proof actions"),
+        "hunter_burp_bridge": ("burp-bridge", "Generic Burp MCP action descriptor builder"),
+        "hunter_burp_repeater": ("burp-bridge", "Build a Burp Repeater action descriptor"),
+        "hunter_burp_proxy_search": ("burp-bridge", "Build a Proxy history regex search action"),
+        "hunter_burp_scanner_issues": ("burp-bridge", "Build a Scanner issues retrieval action"),
+        "hunter_burp_collaborator_workflow": ("burp-bridge", "Build SSRF/XXE/CMDI Collaborator workflow plan"),
     }
     tools = {
         name: {
@@ -1145,6 +1160,7 @@ async def hunter_capabilities() -> str:
         "version": "v8-hardening",
         "tools": tools,
         "payloads": _payload_inventory(),
+        "hunter_tools": _hunter_tools.capabilities().get("data", {}),
         "recommended_workflow": [
             "hunter_healthcheck",
             "hunter_capabilities",
@@ -1207,14 +1223,90 @@ async def hunter_recommend_next(target: str = "", signals: Optional[List[str]] =
         add("hunter_recon", "缺少明确漏洞信号，先做低噪侦察建立资产/端点基线。", "获得存活服务、技术栈、JS/API 端点后再选择 auto_*。", 1)
 
     recommendations.sort(key=lambda item: item["priority"], reverse=True)
+    hunter_tools_rec = _hunter_tools.kb_recommend(signals=signals or [], finding=finding, target=target, limit=5)
     return _json_dumps({
         "target": target,
         "signals": signals or [],
         "finding": finding,
         "recommendations": recommendations,
         "proof_goals": [item["proof_goal"] for item in recommendations[:5]],
+        "hunter_tools": hunter_tools_rec.get("data", {}),
         "routing_rule": "逻辑漏洞/认证边界优先；每个结论必须有可重复请求、响应差异和影响数据。",
     })
+
+
+# ============================================================
+# Hunter Tools v8.1: KB + Burp Bridge Tools
+# ============================================================
+
+@mcp.tool()
+async def hunter_kb_list() -> str:
+    """List Hunter technique markdown files and payload YAML inventory."""
+    return _json_dumps(_hunter_tools.kb_list())
+
+
+@mcp.tool()
+async def hunter_kb_search(query: str, limit: int = 20) -> str:
+    """Search Hunter KB by signal/query."""
+    return _json_dumps(_hunter_tools.kb_search(query, limit=limit))
+
+
+@mcp.tool()
+async def hunter_kb_read(technique_path: str, max_chars: int = 12000) -> str:
+    """Read exact Hunter KB file under payloads/."""
+    return _json_dumps(_hunter_tools.kb_read(technique_path, max_chars=max_chars))
+
+
+@mcp.tool()
+async def hunter_kb_recommend(signals: Optional[List[str]] = None, finding: str = "", target: str = "", limit: int = 8) -> str:
+    """Recommend Hunter KB files, payloads, tools and Burp proof actions."""
+    return _json_dumps(_hunter_tools.kb_recommend(signals=signals or [], finding=finding, target=target, limit=limit))
+
+
+@mcp.tool()
+async def hunter_burp_bridge(action: str, url: str = "", method: str = "GET", headers: Optional[Dict[str, str]] = None,
+                             body: str = "", http2: bool = True, regex: str = "", count: int = 50,
+                             offset: int = 0, severity_filter: str = "", tab_name: str = "") -> str:
+    """Generic Burp bridge action descriptor builder."""
+    kwargs = {
+        "url": url or None,
+        "method": method,
+        "headers": headers or {},
+        "body": body,
+        "http2": http2,
+        "regex": regex or None,
+        "count": count,
+        "offset": offset,
+        "severity_filter": severity_filter,
+        "tab_name": tab_name,
+    }
+    return _json_dumps(_hunter_tools.burp_bridge(action, **kwargs))
+
+
+@mcp.tool()
+async def hunter_burp_repeater(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None,
+                               body: str = "", tab_name: str = "", http2: bool = True) -> str:
+    """Build a Burp Repeater action descriptor."""
+    return _json_dumps(_hunter_tools.burp_repeater(url, method=method, headers=headers or {}, body=body, tab_name=tab_name, http2=http2))
+
+
+@mcp.tool()
+async def hunter_burp_proxy_search(regex: str, count: int = 50, offset: int = 0) -> str:
+    """Build a Burp proxy history regex-search action descriptor."""
+    return _json_dumps(_hunter_tools.burp_proxy_search(regex, count=count, offset=offset))
+
+
+@mcp.tool()
+async def hunter_burp_scanner_issues(count: int = 50, offset: int = 0, severity_filter: str = "") -> str:
+    """Build a Burp scanner issues retrieval action descriptor."""
+    return _json_dumps(_hunter_tools.burp_scanner_issues(count=count, offset=offset, severity_filter=severity_filter))
+
+
+@mcp.tool()
+async def hunter_burp_collaborator_workflow(workflow: str, url: str, param: str = "", method: str = "GET", template: str = "") -> str:
+    """Build blind SSRF/XXE/CMDI Burp Collaborator workflow plan."""
+    return _json_dumps(_hunter_tools.burp_collaborator_workflow(workflow=workflow, url=url, param=param, method=method, template=template))
+
 
 # ============================================================
 # Payload Tools

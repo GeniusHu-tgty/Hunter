@@ -32,6 +32,57 @@ await hunter_recommend_next(
 
 All v8 wrappers return bounded JSON with `status`, `tool`, `elapsed_seconds`, and either scanner results or structured error/timeout details.
 
+
+
+## MCP v8.1 `hunter_tools` Facade
+
+Hunter v8.1 adds a reverse_lab_tools-style unified facade for Hunter's own knowledge base and Burp bridge.
+
+- Legacy server: `mcp_server.py` / server name `hunter` keeps JSON-string compatibility and now exposes **45 MCP tools**.
+- New server: `hunter_tools_mcp.py` / server name `hunter_tools` returns Python dicts directly, matching the reverse_lab_tools thin-wrapper style.
+- Core implementation: `core/hunter_tools_facade.py`.
+- Design/plan: `docs/hunter-tools-v81-design.md` and `docs/hunter-tools-v81-plan.md`.
+
+### New KB tools
+
+```python
+await hunter_kb_list()
+await hunter_kb_search("jwt alg none weak signing key", limit=5)
+await hunter_kb_read("jwt/jwt-attack-techniques.md")
+await hunter_kb_recommend(
+    signals=["jwt", "idor", "cors"],
+    finding="API exposes userId and Authorization bearer token",
+    target="https://example.test/api/user/1"
+)
+```
+
+These tools index both:
+
+- `payloads/**/*.md` technique notes.
+- `payloads/*/payloads.yaml` payload inventories.
+
+### New Burp bridge plan tools
+
+```python
+await hunter_burp_repeater("https://example.test/api/user/1")
+await hunter_burp_proxy_search("Authorization|/api/")
+await hunter_burp_scanner_issues(severity_filter="high,medium")
+await hunter_burp_collaborator_workflow("blind_ssrf", "https://example.test/fetch?url=x", param="url")
+await hunter_burp_bridge("repeater", url="https://example.test/", method="GET")
+```
+
+These return explicit Burp MCP action descriptors. Execute the returned action with the matching Burp tool, then import proof artifacts with `hunter_burp_import`.
+
+### Compatibility rule
+
+HTTP execution still follows the project protocol:
+
+```text
+Burp send_http2_request > http_probe > curl/wget
+```
+
+Hunter's Burp bridge builds action plans and evidence packaging; it does not bypass Burp/http_probe priority.
+
 ## Tool Inventory
 
 ### Go-based Tools (28 tools)
