@@ -1,6 +1,6 @@
 ---
 name: hunter
-description: AI 驱动渗透测试框架 v7。12 个原子 MCP 工具 + 知识图谱 + 自动报告。Claude 是大脑，MCP 工具是手脚。
+description: AI 驱动渗透测试框架 v7。27 个 MCP 工具（侦察/扫描/11个自动漏洞检测/报告）。Claude 是大脑，MCP 工具是手脚。
 ---
 
 # Hunter — AI 渗透测试框架
@@ -59,49 +59,98 @@ cd /root/hunter && python mcp_server.py
 
 如果 MCP 未连接，提示用户先启动。
 
-## 工具清单（12 原子工具）
+## 工具清单（27 个工具）
 
-### 侦察阶段
+### 侦察阶段（5个）
 | 工具 | 用途 |
 |------|------|
-| `hunter_recon` | 一键侦察（DNS + 子域 + 端口 + 技术栈） |
-| `hunter_subdomain` | 子域名爆破 + DNS 验证 |
-| `hunter_port_scan` | TCP 端口扫描 + 服务识别 + Banner |
+| `hunter_recon` | 一键侦察（pre-recon + recon 阶段，DNS/子域/端口/技术栈） |
+| `hunter_subdomain` | 子域名爆破（crt.sh + DNS brute） |
+| `hunter_port_scan` | TCP 端口扫描 + 服务识别 |
 | `hunter_tech_detect` | Web 技术栈指纹（CMS/框架/服务器/语言） |
+| `hunter_dir_enum` | 目录/路径枚举 + 字典爆破 |
 
-### 扫描阶段
+### 扫描阶段（3个）
 | 工具 | 用途 |
 |------|------|
-| `hunter_vuln_scan` | 漏洞扫描（注入 + XSS + SSRF + 命令执行） |
-| `hunter_dir_enum` | 目录/路径枚举 + 字典爆破 |
+| `hunter_scan` | 全流程扫描入口（pre-recon → recon → vuln-analysis） |
+| `hunter_vuln_scan` | 漏洞分析（pre-recon + recon + vuln-analysis 三阶段） |
 | `hunter_js_analyze` | JS 静态分析 + API 端点提取 + Secret 扫描 |
 
-### 漏洞利用阶段
+### 自动漏洞检测（11个）
 | 工具 | 用途 |
 |------|------|
-| `hunter_inject` | SQL 注入检测 + WAF 绕过 + 数据提取 |
-| `hunter_exec` | 命令执行检测 + Shell 交互 |
+| `hunter_auto_sqli` | SQL 注入自动检测（WAF识别 → 列数检测 → 数据库识别 → 数据提取） |
+| `hunter_auto_xss` | XSS 自动检测（上下文识别 → WAF绕过 → payload选择） |
+| `hunter_auto_ssrf` | SSRF 自动检测（内网IP → 云元数据 → 协议走私） |
+| `hunter_auto_ssti` | SSTI 自动检测 + 模板引擎识别 |
+| `hunter_auto_cmd` | 命令注入自动检测 |
+| `hunter_auto_idor` | IDOR 越权自动扫描 |
+| `hunter_auto_csrf` | CSRF 漏洞自动检测 + exploit 生成 |
+| `hunter_auto_cors` | CORS 配置错误扫描 |
+| `hunter_auto_jwt` | JWT 漏洞扫描（none algorithm / 密钥爆破 / 注入） |
+| `hunter_auto_graphql` | GraphQL 漏洞扫描（introspection / 注入 / DoS） |
+| `hunter_auto_websocket` | WebSocket 漏洞扫描 |
+| `hunter_auto_race` | 竞态条件扫描（HTTP/2 单包攻击） |
+| `hunter_auto_access_control` | 访问控制漏洞扫描 |
 
-### 辅助
+### Burp 集成（1个）
 | 工具 | 用途 |
 |------|------|
-| `hunter_payload_list` | 列出可用 payload 类型 |
-| `hunter_payload_search` | 搜索 payload 知识库 |
-| `hunter_report` | 生成渗透报告（HTML格式）+ CVSS 评级 |
+| `hunter_burp_import` | 导入 Burp 导出的请求/响应/截图到 Hunter 证据库 |
+
+### Payload 知识库（4个）
+| 工具 | 用途 |
+|------|------|
+| `hunter_payload_list` | 列出所有可用 payload 类型 |
+| `hunter_payload_search` | 按关键词搜索 payload 知识库 |
+| `hunter_payload_get` | 按类型和章节获取 payload |
+| `hunter_payload_generate` | 生成定制 payload |
+
+### 会话管理（3个）
+| 工具 | 用途 |
+|------|------|
+| `hunter_session_list` | 列出所有扫描会话 |
+| `hunter_session_status` | 查看会话详细状态 |
+| `hunter_report` | 生成渗透报告（markdown/HTML，支持 SRC 风格） |
+
+### 辅助（2个）
+| 工具 | 用途 |
+|------|------|
+| `hunter_agents_list` | 列出所有可用 Hunter agent（可按阶段过滤） |
+| `hunter_phases_list` | 列出所有流水线阶段及其 agent |
 
 ## 标准工作流
 
 ```
 1. 侦察    → hunter_recon（获取目标全貌）
 2. 扫描    → hunter_vuln_scan + hunter_dir_enum + hunter_js_analyze
-3. 分析    → Claude 推理攻击链，识别高价值目标
-4. 深挖    → 逻辑漏洞优先：越权、参数篡改、认证绕过、业务逻辑
-5. 验证    → hunter_inject / hunter_exec 验证漏洞，拿到真实数据证明危害
-6. 扩大    → 继续深挖，能走多远走多远
-7. 报告    → hunter_report 生成HTML报告
+3. 自动化  → 并行调用 auto_* 系列（11个自动漏洞检测）
+4. 分析    → Claude 推理攻击链，识别高价值目标
+5. 深挖    → 逻辑漏洞优先：越权、参数篡改、认证绕过、业务逻辑
+6. 验证    → 拿到真实数据证明危害
+7. 报告    → hunter_report 生成报告
 ```
 
 **关键：每步结果喂给 Claude 分析，决定下一步。不是盲扫。**
+
+## 自动漏洞检测使用策略
+
+### 优先级
+1. **先跑通用扫描**：`hunter_vuln_scan` + `hunter_dir_enum` 获取攻击面
+2. **针对性自动化**：根据发现选择 `auto_*` 工具
+3. **并行加速**：多个 `auto_*` 可同时对同一目标运行
+
+### 工具选择
+| 发现 | 调用 |
+|------|------|
+| 有参数的接口 | `auto_sqli` + `auto_xss` + `auto_ssti` + `auto_cmd` |
+| API / REST 端点 | `auto_idor` + `auto_jwt` + `auto_access_control` |
+| GraphQL 端点 | `auto_graphql` |
+| WebSocket 端点 | `auto_websocket` |
+| 有表单的页面 | `auto_csrf` |
+| Token / Cookie 认证 | `auto_jwt` + `auto_cors` |
+| 需要并发测试 | `auto_race` |
 
 ## 逻辑漏洞挖掘清单
 
