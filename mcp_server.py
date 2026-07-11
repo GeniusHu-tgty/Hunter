@@ -1,7 +1,7 @@
 """
-Hunter v8 MCP Server
+Hunter Tools v8.2 Complete MCP Server
 
-Exposes Hunter pentest framework as MCP tools for Claude Code.
+Exposes the complete Hunter pentest framework under the single hunter_tools MCP server.
 Claude is the brain, MCP tools are the hands.
 
 Tools:
@@ -47,7 +47,7 @@ from core.hunter_tools_facade import HunterToolsFacade
 # ============================================================
 
 mcp = FastMCP(
-    "hunter",
+    "hunter_tools",
     instructions="Hunter v8 AI-driven pentest framework. Claude is the brain, MCP tools are the hands. "
     "Use hunter_scan for full pipeline, hunter_recon for recon, individual agents for specific tasks, "
     "and hunter_payload_* for payload knowledge base access.",

@@ -4,7 +4,7 @@
 
 ## MCP v8.1 Tool Surface
 
-- Total legacy `hunter` MCP tools: 45
+- Total complete `hunter_tools` MCP tools: 45
 - Meta/orchestration: `hunter_healthcheck`, `hunter_capabilities`, `hunter_recommend_next`, `hunter_agents_list`, `hunter_phases_list`
 - Pipelines: `hunter_scan`, `hunter_recon`, `hunter_vuln_scan`
 - Recon atomics: `hunter_subdomain`, `hunter_port_scan`, `hunter_tech_detect`, `hunter_dir_enum`, `hunter_js_analyze`
@@ -12,7 +12,7 @@
 - Payload/evidence/report: `hunter_payload_list`, `hunter_payload_search`, `hunter_payload_get`, `hunter_payload_generate`, `hunter_burp_import`, `hunter_session_list`, `hunter_session_status`, `hunter_report`
 - Hunter KB facade: `hunter_kb_list`, `hunter_kb_search`, `hunter_kb_read`, `hunter_kb_recommend`
 - Burp bridge plan facade: `hunter_burp_bridge`, `hunter_burp_repeater`, `hunter_burp_proxy_search`, `hunter_burp_scanner_issues`, `hunter_burp_collaborator_workflow`
-- Standalone reverse_lab_tools-style server: `hunter_tools_mcp.py` returns dicts directly under server name `hunter_tools`
+- Single server: `mcp_server.py` runs as `hunter_tools`; `hunter_tools_mcp.py` is only a compatibility launcher
 
 Run `hunter_healthcheck` first. If external CLIs are degraded, use payload/meta/report tools plus Burp/http_probe for proof collection.
 
@@ -186,7 +186,7 @@ All tools are installed and verified. The Hunter framework is ready for penetrat
 
 ## Hunter v8.1 Facade Notes
 
-`core/hunter_tools_facade.py` is now the shared backend for Hunter KB, payload routing and Burp action descriptors. The root `mcp_server.py` wraps it for backward-compatible JSON-string output; `hunter_tools_mcp.py` wraps it in the reverse_lab_tools style and returns dicts directly.
+`core/hunter_tools_facade.py` is now the shared backend for Hunter KB, payload routing and Burp action descriptors. The root `mcp_server.py` is the one complete `hunter_tools` server. `hunter_tools_mcp.py` delegates to it and does not register a second server.
 
 Recommended flow:
 

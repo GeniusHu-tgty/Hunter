@@ -60,17 +60,18 @@ def test_root_healthcheck_and_capabilities_include_v81_tools():
     assert caps["hunter_tools"]["server_name"] == "hunter_tools"
 
 
-def test_standalone_hunter_tools_mcp_module_exposes_same_wrappers_as_dicts():
+def test_hunter_tools_compat_launcher_delegates_to_complete_server():
     import hunter_tools_mcp
 
+    assert hunter_tools_mcp.mcp.name == "hunter_tools"
+    assert hasattr(hunter_tools_mcp, "hunter_scan")
     assert hasattr(hunter_tools_mcp, "hunter_kb_search")
-    result = run(hunter_tools_mcp.hunter_kb_search("jwt", 2))
-    assert isinstance(result, dict)
+
+    result = load(run(hunter_tools_mcp.hunter_kb_search("jwt", 2)))
     assert result["status"] == "ok"
     assert result["data"]["returned"] <= 2
 
-    bridge = run(hunter_tools_mcp.hunter_burp_proxy_search("token|authorization", 10, 0))
-    assert isinstance(bridge, dict)
+    bridge = load(run(hunter_tools_mcp.hunter_burp_proxy_search("token|authorization", 10, 0)))
     assert bridge["status"] == "ok"
     assert bridge["data"]["action"]["tool"] == "get_proxy_http_history_regex"
 

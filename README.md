@@ -7,7 +7,7 @@ Hunter is an AI-driven penetration testing framework that combines automated too
 
 ## MCP v8 Hardening
 
-Hunter v8 exposes **36 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
+Hunter Tools exposes **45 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
 
 ### Local-first meta tools
 
@@ -36,11 +36,11 @@ All v8 wrappers return bounded JSON with `status`, `tool`, `elapsed_seconds`, an
 
 ## MCP v8.1 `hunter_tools` Facade
 
-Hunter v8.1 adds a reverse_lab_tools-style unified facade for Hunter's own knowledge base and Burp bridge.
+Hunter v8.2 consolidates every Hunter capability into one complete `hunter_tools` MCP server, including scanners, orchestration, sessions, reports, KB and Burp bridge.
 
-- Legacy server: `mcp_server.py` / server name `hunter` keeps JSON-string compatibility and now exposes **45 MCP tools**.
-- New server: `hunter_tools_mcp.py` / server name `hunter_tools` returns Python dicts directly, matching the reverse_lab_tools thin-wrapper style.
-- Core implementation: `core/hunter_tools_facade.py`.
+- Single complete server: `mcp_server.py` / server name `hunter_tools`, exposing **45 MCP tools**.
+- `hunter_tools_mcp.py` is only a compatibility launcher that delegates to the complete server; it does not create a second MCP registry.
+- Core KB/Burp implementation: `core/hunter_tools_facade.py`.
 - Design/plan: `docs/hunter-tools-v81-design.md` and `docs/hunter-tools-v81-plan.md`.
 
 ### New KB tools
