@@ -80,9 +80,15 @@ class StealthHTTPClient:
  def _solve_page_captcha(self,response,transport,state,request_headers,options,request_proxy,timeline):
   image_url=self._captcha_image_url(response)
   if not image_url: return self.captcha.handle(response,state['target'],options.get('captcha_engine','pytesseract'))
+  image_origin=self._key(image_url); allowed_origins=set(options.get('allowed_origins') or [state['target']])
+  if image_origin not in allowed_origins: return {'solved':False,'text':'','type':'image','status':'blocked','reason':'captcha image origin is outside authorized scope','url':image_url}
+  image_headers=dict(request_headers)
+  if image_origin!=self._key(state['target']):
+   safe_headers={'accept','accept-encoding','accept-language','cache-control','pragma','user-agent'}
+   image_headers={name:value for name,value in image_headers.items() if name.lower() in safe_headers}
   attempts=[]
   for number in range(1,4):
-   kwargs={'headers':request_headers,'allow_redirects':True,'timeout':options.get('timeout',15),'verify':options.get('verify_tls',True)}
+   kwargs={'headers':image_headers,'allow_redirects':False,'timeout':options.get('timeout',15),'verify':options.get('verify_tls',True)}
    if request_proxy: kwargs['proxies']={'http':request_proxy,'https':request_proxy}
    image_response=transport.request('GET',image_url,**kwargs); result=self.captcha.solve_image(getattr(image_response,'content',b''),state['target'],options.get('captcha_engine','pytesseract')); attempts.append(result); timeline.append({'event':'captcha-image-fetch','attempt':number,'url':image_url,'status_code':image_response.status_code,'proxy':request_proxy,'ocr':result})
    if result['solved']: return {'solved':True,'text':result['text'],'type':'image','attempts':attempts}

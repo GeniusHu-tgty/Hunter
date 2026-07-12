@@ -6,6 +6,8 @@ import pytest
 
 import mcp_server
 from core.session import AttackSession
+from core.session.attack_chain import AttackChain
+from core.js_analysis.signature_extractor import extract_signature
 from core.stealth.stealth_http_client import StealthHTTPClient
 
 
@@ -75,3 +77,98 @@ def test_attack_request_executor_disables_redirects(monkeypatch, tmp_path):
         {"method": "GET", "url": "https://example.test/path", "headers": {}, "data": None, "options": {}},
     )
     assert captured["follow_redirects"] is False
+
+
+def test_captcha_image_outside_authorized_origin_is_not_requested(tmp_path):
+    client = StealthHTTPClient(tmp_path)
+    calls = []
+
+    class Response:
+        url = "https://example.test/login"
+        text = '<img src="https://outside.test/captcha.png">'
+
+    class Transport:
+        def request(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    result = client._solve_page_captcha(
+        Response(),
+        Transport(),
+        {"target": "https://example.test:443"},
+        {"Authorization": "Bearer secret", "Cookie": "sid=secret"},
+        {"allowed_origins": ["https://example.test:443"]},
+        None,
+        [],
+    )
+    assert result["status"] == "blocked"
+    assert calls == []
+
+
+def test_cross_origin_captcha_uses_only_safe_headers(tmp_path):
+    client = StealthHTTPClient(tmp_path)
+    captured = {}
+    client.captcha.solve_image = lambda *args, **kwargs: {"solved": True, "text": "1234"}
+
+    class Response:
+        url = "https://example.test/login"
+        text = '<img src="https://cdn.example.test/captcha.png">'
+
+    class ImageResponse:
+        content = b"image"
+        status_code = 200
+
+    class Transport:
+        def request(self, method, url, **kwargs):
+            captured.update(kwargs)
+            return ImageResponse()
+
+    result = client._solve_page_captcha(
+        Response(),
+        Transport(),
+        {"target": "https://example.test:443"},
+        {
+            "User-Agent": "Browser",
+            "Accept": "image/*",
+            "Authorization": "Bearer secret",
+            "X-API-Key": "secret-key",
+            "X-CSRF-Token": "secret-csrf",
+        },
+        {"allowed_origins": ["https://example.test:443", "https://cdn.example.test:443"]},
+        None,
+        [],
+    )
+    assert result["solved"] is True
+    assert captured["allow_redirects"] is False
+    assert captured["headers"] == {"User-Agent": "Browser", "Accept": "image/*"}
+
+
+def test_transport_replay_disables_redirects():
+    result = extract_signature(
+        "function sign(p){return md5(Object.keys(p).sort().join('&')+'salt');}",
+        parameter_name="sign",
+        observations=[{
+            "request_context": {
+                "method": "POST",
+                "url": "https://example.test/api",
+                "headers": {"Authorization": "Bearer captured"},
+                "placement": "json",
+            }
+        }],
+    )
+    assert "class NoRedirect" in result["replay_code"]
+    assert "urllib.request.urlopen" not in result["replay_code"]
+
+
+def test_response_summary_strips_query_fragment_and_secret_error():
+    summary = AttackChain._response_summary({
+        "status": "error",
+        "status_code": 400,
+        "url": "https://example.test/reset?token=secret#fragment",
+        "headers": {"Location": "https://example.test/next?code=secret"},
+        "body": "token=secret",
+        "error": "reset token secret",
+    })
+    serialized = json.dumps(summary)
+    assert "secret" not in serialized
+    assert summary["url"] == "https://example.test/reset"
+    assert summary["location"] == "https://example.test/next"

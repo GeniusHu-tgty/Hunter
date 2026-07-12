@@ -173,14 +173,15 @@ def test_replay_transport_requires_and_preserves_observed_request_context(
         def read(self):
             return b"ok"
 
-    def fake_urlopen(request, timeout):
-        captured["request"] = request
-        captured["timeout"] = timeout
-        return Response()
+    class Opener:
+        def open(self, request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return Response()
 
     namespace = {}
     exec(compile(result["replay_code"], "<generated-replay>", "exec"), namespace)
-    namespace["urllib"].request.urlopen = fake_urlopen
+    namespace["urllib"].request.build_opener = lambda *handlers: Opener()
 
     assert namespace["send"]({"alpha": "one"}) == "ok"
     request = captured["request"]

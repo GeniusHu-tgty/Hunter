@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -858,6 +859,165 @@ def test_checkpoint_restore_resumes_failed_chain_step_without_replaying_success(
     assert [item["step_id"] for item in resumed["steps"]] == ["second"]
     assert calls == ["first", "second", "second"]
     assert session.chain_cursors["resume-chain"]["status"] == "complete"
+
+
+def test_mutating_request_persists_in_flight_and_requires_manual_recovery(tmp_path):
+    observed = []
+    session = AttackSession(
+        "https://example.test",
+        storage_dir=tmp_path,
+        session_id="in-flight-post",
+        authorization={"allowed_methods": ["POST"]},
+    )
+
+    def crash_after_dispatch(current_session, request):
+        persisted = AttackSession.load("in-flight-post", storage_dir=tmp_path)
+        marker = persisted.chain_cursors["mutation"]["in_flight"]
+        observed.append((marker["step_id"], marker["method"], marker["url"]))
+        raise KeyboardInterrupt("simulated process crash")
+
+    definition = {
+        "name": "mutation",
+        "steps": [
+            {
+                "step_id": "change",
+                "name": "Change",
+                "action": "request",
+                "request": {"method": "POST", "path": "/change"},
+            }
+        ],
+    }
+    with pytest.raises(KeyboardInterrupt, match="simulated process crash"):
+        AttackChain(definition, request_executor=crash_after_dispatch).execute(session)
+
+    restored = AttackSession.load("in-flight-post", storage_dir=tmp_path)
+    replayed = []
+    result = AttackChain(
+        definition,
+        request_executor=lambda current_session, request: replayed.append(request)
+        or {"status": "ok", "status_code": 200},
+    ).execute(restored)
+
+    assert observed == [("change", "POST", "https://example.test/change")]
+    assert result["status"] == "recovery-required"
+    assert result["pending"]["step_id"] == "change"
+    assert result["pending"]["method"] == "POST"
+    assert replayed == []
+    assert restored.chain_cursors["mutation"]["status"] == "recovery-required"
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_safe_request_recovers_after_in_flight_crash(tmp_path, method):
+    calls = []
+    session = AttackSession(
+        "https://example.test",
+        storage_dir=tmp_path,
+        session_id=f"in-flight-{method.lower()}",
+        authorization={"allowed_methods": [method]},
+    )
+    definition = {
+        "name": f"safe-{method.lower()}",
+        "steps": [
+            {
+                "step_id": "read",
+                "name": "Read",
+                "action": "request",
+                "request": {"method": method, "path": "/status"},
+            }
+        ],
+    }
+
+    def crash_once(current_session, request):
+        calls.append(request["method"])
+        raise KeyboardInterrupt("simulated process crash")
+
+    with pytest.raises(KeyboardInterrupt, match="simulated process crash"):
+        AttackChain(definition, request_executor=crash_once).execute(session)
+
+    restored = AttackSession.load(
+        f"in-flight-{method.lower()}", storage_dir=tmp_path
+    )
+    result = AttackChain(
+        definition,
+        request_executor=lambda current_session, request: calls.append(request["method"])
+        or {
+            "status": "ok",
+            "status_code": 200,
+            "url": request["url"],
+            "headers": {},
+            "body": "safe",
+        },
+    ).execute(restored)
+
+    assert result["status"] == "complete"
+    assert calls == [method, method]
+
+
+def test_chain_public_results_summarize_response_but_internal_extract_keeps_body(
+    tmp_path,
+):
+    body = "token=internal-secret"
+    authorization = "Bearer response-secret"
+    cookie = "sid=cookie-secret; Path=/"
+    session = AttackSession(
+        "https://example.test",
+        storage_dir=tmp_path,
+        authorization={"allowed_methods": ["GET"]},
+    )
+    chain = AttackChain(
+        {
+            "name": "response-summary",
+            "steps": [
+                {
+                    "step_id": "fetch",
+                    "name": "Fetch",
+                    "action": "request",
+                    "request": {"method": "GET", "path": "/source"},
+                    "on_success": "extract",
+                },
+                {
+                    "step_id": "extract",
+                    "name": "Extract",
+                    "action": "extract",
+                    "extract_rules": [
+                        {
+                            "store_as": "internal_token",
+                            "pattern": r"regex:token=(.+)",
+                        }
+                    ],
+                },
+            ],
+        },
+        request_executor=lambda current_session, request: {
+            "status": "ok",
+            "status_code": 200,
+            "url": request["url"],
+            "headers": {
+                "Authorization": authorization,
+                "Set-Cookie": cookie,
+                "Location": "/next",
+            },
+            "body": body,
+        },
+    )
+
+    result = chain.execute(session)
+    public_response = result["steps"][0]["results"][0]
+    public_text = json.dumps(result, ensure_ascii=False)
+
+    assert result["status"] == "complete"
+    assert session.extracted_data["internal_token"] == "internal-secret"
+    assert session.chain_cursors["response-summary"]["last_response"]["body"] == body
+    assert body not in public_text
+    assert authorization not in public_text
+    assert cookie not in public_text
+    assert "body" not in public_response
+    assert "headers" not in public_response
+    assert public_response["body_hash"] == hashlib.sha256(body.encode()).hexdigest()
+    assert public_response["body_size"] == len(body.encode())
+    assert public_response["status"] == "ok"
+    assert public_response["status_code"] == 200
+    assert public_response["location"] == "/next"
 
 
 def test_execute_and_history_redact_all_sensitive_input_parameter_values(tmp_path):

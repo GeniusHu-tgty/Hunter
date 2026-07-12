@@ -331,6 +331,10 @@ def _replay_script(
         placement = request_context["placement"]
         lines.extend([
             "",
+            "class NoRedirect(urllib.request.HTTPRedirectHandler):",
+            "    def redirect_request(self, req, fp, code, msg, headers, newurl):",
+            "        return None",
+            "",
             "def send(params):",
             "    signed_params = dict(params)",
             f"    signed_params[{parameter_name!r}] = calculate_signature(params)",
@@ -364,7 +368,8 @@ def _replay_script(
             "        headers=headers,",
             "        method=REQUEST_METHOD,",
             "    )",
-            "    with urllib.request.urlopen(request, timeout=15) as response:",
+            "    opener = urllib.request.build_opener(NoRedirect())",
+            "    with opener.open(request, timeout=15) as response:",
             "        return response.read().decode('utf-8')",
         ])
     lines.append("")

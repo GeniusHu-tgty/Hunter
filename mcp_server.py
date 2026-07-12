@@ -171,6 +171,7 @@ def _attack_request_executor(session, request):
     client = _sync_attack_http_client(session)
     options = dict(request.get("options") or {})
     options["follow_redirects"] = False
+    options["allowed_origins"] = list(session.authorization.get("allowed_origins") or [])
     return client.stealth_request(
         request["method"],
         request["url"],
@@ -963,6 +964,20 @@ _JS_ANALYSIS_METADATA_HOSTS = {
 }
 
 
+def _validate_js_analysis_ip(address: str, allow_private: bool = False) -> str:
+    ip = ipaddress.ip_address(address.split("%", 1)[0])
+    if not allow_private and (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+        or ip.is_multicast
+    ):
+        raise ValueError(f"JS analysis URL uses blocked address: {ip}")
+    return str(ip)
+
+
 def _validate_js_analysis_url(url: str, allow_private: bool = False, resolve_host: bool = True) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
@@ -989,25 +1004,16 @@ def _validate_js_analysis_url(url: str, allow_private: bool = False, resolve_hos
             except socket.gaierror as exc:
                 raise ValueError(f"unable to resolve JS analysis host: {hostname}") from exc
     for address in addresses:
-        ip = ipaddress.ip_address(address.split("%", 1)[0])
-        if (
-            ip.is_loopback
-            or ip.is_private
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_unspecified
-            or ip.is_multicast
-        ):
-            raise ValueError(f"JS analysis URL uses blocked address: {ip}")
+        _validate_js_analysis_ip(address, allow_private=allow_private)
 
 
 def _resolve_js_analysis_endpoint(url: str, allow_private: bool = False) -> tuple[Any, str, int]:
-    _validate_js_analysis_url(url, allow_private=allow_private)
+    _validate_js_analysis_url(url, allow_private=allow_private, resolve_host=False)
     parsed = urlparse(url)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     addresses = []
     for result in socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM):
-        address = result[4][0].split("%", 1)[0]
+        address = _validate_js_analysis_ip(result[4][0], allow_private=allow_private)
         if address not in addresses:
             addresses.append(address)
     if not addresses:

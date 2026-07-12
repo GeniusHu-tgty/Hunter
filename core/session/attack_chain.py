@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -9,7 +10,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 
 import yaml
 
@@ -23,6 +24,7 @@ _EXPLOIT_PAUSE_STATUSES = {
     "ready",
     "rejected",
 }
+_SAFE_REPLAY_METHODS = {"GET", "HEAD"}
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}")
 
 
@@ -184,6 +186,81 @@ class AttackChain:
         return status in {"ok", "success", "complete"}
 
     @staticmethod
+    def _response_summary(result: dict[str, Any]) -> dict[str, Any]:
+        body = result.get("body")
+        if isinstance(body, bytes):
+            body_bytes = body
+        elif body is None:
+            body_bytes = b""
+        elif isinstance(body, str):
+            body_bytes = body.encode("utf-8", errors="replace")
+        else:
+            body_bytes = json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8", errors="replace")
+        headers = result.get("headers")
+        location = ""
+        if isinstance(headers, dict):
+            for name, value in headers.items():
+                if str(name).lower() == "location":
+                    location = str(value)
+                    break
+        summary = {
+            "status": str(result.get("status") or ""),
+            "status_code": int(result.get("status_code") or 0),
+            "body_hash": hashlib.sha256(body_bytes).hexdigest(),
+            "body_size": len(body_bytes),
+        }
+        if result.get("url"):
+            parsed = urlparse(str(result["url"]))
+            summary["url"] = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if location:
+            parsed = urlparse(location)
+            summary["location"] = (
+                f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                if parsed.scheme and parsed.netloc
+                else parsed.path
+            )
+        if result.get("error"):
+            value = str(result["error"]).encode("utf-8", errors="replace")
+            summary["error"] = "request-error"
+            summary["error_hash"] = hashlib.sha256(value).hexdigest()
+        if result.get("reason"):
+            value = str(result["reason"]).encode("utf-8", errors="replace")
+            summary["reason"] = "request-reason"
+            summary["reason_hash"] = hashlib.sha256(value).hexdigest()
+        return summary
+
+    def _persist_in_flight(
+        self,
+        session: AttackSession,
+        step: AttackStep,
+        method: str,
+        url: str,
+        attempt: int,
+    ) -> None:
+        cursor = deepcopy(session.chain_cursors.get(self.name) or {})
+        cursor.update(
+            {
+                "current_step": step.step_id,
+                "status": "running",
+                "in_flight": {
+                    "step_id": step.step_id,
+                    "method": method,
+                    "url": url,
+                    "attempt": attempt,
+                    "started_at": time.time(),
+                },
+                "updated_at": time.time(),
+            }
+        )
+        session.chain_cursors[self.name] = cursor
+        session.save()
+
+    @staticmethod
     def _resolve_field(session: AttackSession, field_name: str) -> Any:
         if field_name == "state":
             return session.state
@@ -258,6 +335,13 @@ class AttackChain:
             "options": request_options,
         }
         payload.update(request)
+        self._persist_in_flight(
+            session,
+            step,
+            method,
+            url,
+            int(variables.get("_retry_attempt", 0)),
+        )
         result = self.request_executor(session, payload)
         if not isinstance(result, dict):
             raise TypeError("request executor must return a dict")
@@ -372,8 +456,45 @@ class AttackChain:
         variables.update(session.extracted_data)
         variables.update(params or {})
         saved_cursor = deepcopy(session.chain_cursors.get(self.name) or {})
+        in_flight = deepcopy(saved_cursor.get("in_flight") or {})
+        in_flight_method = str(in_flight.get("method") or "").upper()
+        if in_flight and in_flight_method not in _SAFE_REPLAY_METHODS:
+            pending = {
+                "step_id": str(
+                    in_flight.get("step_id")
+                    or saved_cursor.get("current_step")
+                    or self.start
+                ),
+                "status": "recovery-required",
+                "reason": "A mutating request was in flight without a confirmed outcome.",
+                "method": in_flight_method or "UNKNOWN",
+            }
+            if in_flight.get("url"):
+                pending["url"] = str(in_flight["url"])
+            saved_cursor["status"] = "recovery-required"
+            saved_cursor["current_step"] = pending["step_id"]
+            saved_cursor["updated_at"] = time.time()
+            session.chain_cursors[self.name] = saved_cursor
+            session.save()
+            return redact_sensitive(
+                {
+                    "status": "recovery-required",
+                    "chain": self.name,
+                    "steps": [],
+                    "variables": variables,
+                    "pending": pending,
+                },
+                sensitive_values,
+            )
+        if in_flight:
+            saved_cursor.pop("in_flight", None)
+            saved_cursor["status"] = "running"
+            saved_cursor["updated_at"] = time.time()
+            session.chain_cursors[self.name] = saved_cursor
+            session.save()
         resumable = (
-            saved_cursor.get("status") in {"blocked", "failed", "paused", "running"}
+            saved_cursor.get("status")
+            in {"blocked", "failed", "paused", "running", "recovery-required"}
             and saved_cursor.get("current_step") in self.by_id
         )
         current = (
@@ -472,13 +593,18 @@ class AttackChain:
                             self.sleep(delay)
 
             elapsed = time.monotonic() - started
+            public_attempt_results = (
+                [self._response_summary(item) for item in attempt_results]
+                if step.action == "request"
+                else attempt_results
+            )
             record = {
                 "step_id": step.step_id,
                 "name": step.name,
                 "action": step.action,
                 "success": success,
                 "attempts": len(attempt_results),
-                "results": attempt_results,
+                "results": public_attempt_results,
                 "error": error,
                 "elapsed": round(elapsed, 6),
             }
