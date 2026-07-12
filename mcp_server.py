@@ -1728,8 +1728,8 @@ def _workflow_result(tool: str, func, *args, **kwargs) -> str:
         return _json_dumps({"tool": tool, "status": "error", "error_type": type(exc).__name__, "error": str(exc), "data": {}, "evidence": {}, "next_actions": []})
 
 @mcp.tool()
-async def hunter_workflow_create(case_slug: str, objective: str, inputs: Optional[List[Dict[str, Any]]] = None, mode: str = "interactive") -> str:
-    return _workflow_result("hunter_workflow_create", _workflow_kernel().create, case_slug, objective, inputs or [], mode)
+async def hunter_workflow_create(case_slug: str, objective: str, inputs: Optional[List[Dict[str, Any]]] = None, mode: str = "interactive", success_conditions: Optional[List[str]] = None, proof_types: Optional[List[str]] = None) -> str:
+    return _workflow_result("hunter_workflow_create", _workflow_kernel().create, case_slug, objective, inputs or [], mode, success_conditions or [], proof_types or [])
 
 @mcp.tool()
 async def hunter_workflow_open(case_slug: str) -> str:
@@ -1771,16 +1771,16 @@ async def hunter_workflow_policy(case_slug: str, mode: str = "interactive", max_
     return _workflow_result("hunter_workflow_policy", _workflow_kernel().set_policy, case_slug, policy)
 
 @mcp.tool()
-async def hunter_hypothesis_add(case_slug: str, claim: str, confidence: float = 0.5, validation_step: Optional[Dict[str, Any]] = None) -> str:
-    return _workflow_result("hunter_hypothesis_add", _workflow_kernel().add_hypothesis, case_slug, claim, confidence, validation_step)
+async def hunter_hypothesis_add(case_slug: str, claim: str, confidence: float = 0.5, validation_step: Optional[Dict[str, Any]] = None, expected_revision: Optional[int] = None) -> str:
+    return _workflow_result("hunter_hypothesis_add", _workflow_kernel().add_hypothesis, case_slug, claim, confidence, validation_step, expected_revision)
 
 @mcp.tool()
 async def hunter_evidence_register(case_slug: str, summary: str, source: str, path_or_url: str = "", evidence_type: str = "note", confidence: str = "medium", sha256: str = "") -> str:
     return _workflow_result("hunter_evidence_register", _workflow_kernel().register_evidence, case_slug, summary, source, path_or_url, evidence_type, confidence, sha256)
 
 @mcp.tool()
-async def hunter_finding_promote(case_slug: str, title: str, status: str, evidence_ids: List[str], severity: str = "Info") -> str:
-    return _workflow_result("hunter_finding_promote", _workflow_kernel().promote_finding, case_slug, title, status, evidence_ids, severity)
+async def hunter_finding_promote(case_slug: str, title: str, status: str, evidence_ids: List[str], severity: str = "Info", satisfies: Optional[List[str]] = None, proof_type: str = "") -> str:
+    return _workflow_result("hunter_finding_promote", _workflow_kernel().promote_finding, case_slug, title, status, evidence_ids, severity, satisfies or [], proof_type)
 
 @mcp.tool()
 async def hunter_backend_status() -> str:

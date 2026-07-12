@@ -5,6 +5,10 @@
 Hunter is an AI-driven penetration testing framework that combines automated tools with intelligent analysis. Claude is the brain, and the tools are the hands.
 
 
+## Unified CTF Workflow Kernel
+
+Hunter now provides event-sourced workflow state, 14 target/artifact lanes, capability-based handoffs to reverse backends, guided/autopilot policies, evidence-backed proof conditions, hash-chained events, revision checks, checkpoint tail replay, and proof-aware early stop.
+
 ## MCP v8 Hardening
 
 Hunter Tools exposes **80 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.

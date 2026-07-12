@@ -7,7 +7,7 @@
 - `hunter_hypothesis_add`, `hunter_evidence_register`, `hunter_finding_promote`
 - `hunter_backend_status`, `hunter_lane_catalog`
 
-The kernel stores `workflow.events.jsonl`, materializes `workflow.json`, and emits immutable files under `cases/<slug>/checkpoints/`. PE/APK/JavaScript/mixed plans reference external MCP capabilities instead of copying reverse tooling.
+The kernel stores revisioned, hash-chained `workflow.events.jsonl`, atomically materializes `workflow.json`, and emits checkpoint snapshots under `cases/<slug>/checkpoints/`. `hunter_workflow_run` returns deferred native actions as pending, external actions as handoffs, and only records actually completed callbacks as executed. PE/APK/JavaScript/mixed plans reference external MCP capabilities instead of copying reverse tooling.
 
 # Hunter Pentest Framework - Tools Inventory
 # Generated: 2026-06-05 23:50:33

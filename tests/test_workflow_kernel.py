@@ -128,9 +128,9 @@ def test_all_catalog_lanes_have_backend_contracts():
 
 def test_proof_early_stop_marks_workflow_complete(tmp_path):
     kernel = WorkflowKernel(tmp_path)
-    kernel.create("early", objective="obtain proof", inputs=[{"url": "https://x.test"}], mode="autopilot")
+    kernel.create("early", objective="obtain proof", inputs=[{"url": "https://x.test"}], mode="autopilot", success_conditions=["flag"])
     ev = kernel.register_evidence("early", "flag captured", "test")
-    result = kernel.promote_finding("early", "CTF proof", "confirmed", [ev["evidence"]["id"]])
+    result = kernel.promote_finding("early", "CTF proof", "confirmed", [ev["evidence"]["id"]], satisfies=["flag"], proof_type="flag")
     assert result["state"]["status"] == "complete"
     assert kernel.plan("early")["actions"] == []
 
@@ -176,3 +176,58 @@ def test_event_matches_open_tgtylab_event_contract(tmp_path):
     assert event["schema_version"]=="1.0"
     assert event["workflow_id"].startswith("wf-")
     assert event["actor"]=="hunter_tools"
+
+
+def test_deferred_native_action_is_pending_not_executed(tmp_path):
+    kernel=WorkflowKernel(tmp_path); kernel.create("defer","proof",[{"url":"https://x.test"}],mode="autopilot")
+    result=kernel.run("defer", execute_native=lambda action:{"status":"deferred"}, max_actions=1)
+    assert result["executed"]==[]
+    assert result["pending_actions"][0]["server"]=="hunter_tools"
+
+
+def test_confirmed_finding_only_stops_when_it_satisfies_success_condition(tmp_path):
+    kernel=WorkflowKernel(tmp_path); kernel.create("proof-condition","get flag",[{"url":"https://x.test"}],mode="autopilot",success_conditions=["flag"] )
+    ev=kernel.register_evidence("proof-condition","nginx","test")
+    ordinary=kernel.promote_finding("proof-condition","nginx","confirmed",[ev["evidence"]["id"]])
+    assert ordinary["state"]["status"]=="active"
+    proof=kernel.promote_finding("proof-condition","flag captured","confirmed",[ev["evidence"]["id"]],satisfies=["flag"],proof_type="flag")
+    assert proof["state"]["status"]=="complete"
+
+
+def test_resume_replays_events_after_checkpoint(tmp_path):
+    kernel=WorkflowKernel(tmp_path); kernel.create("tail","proof",[{"url":"https://x.test"}])
+    cp=kernel.checkpoint("tail")
+    kernel.add_hypothesis("tail","later event")
+    resumed=kernel.resume("tail",cp["checkpoint_id"])["state"]
+    assert resumed["hypotheses"][0]["claim"]=="later event"
+    assert resumed["resume_metadata"]["events_after_checkpoint"]==1
+
+
+def test_events_have_revision_and_hash_chain(tmp_path):
+    kernel=WorkflowKernel(tmp_path); kernel.create("hash-chain","proof",[])
+    kernel.add_hypothesis("hash-chain","x")
+    events=[json.loads(x) for x in (tmp_path/"cases"/"hash-chain"/"workflow.events.jsonl").read_text().splitlines()]
+    assert [e["revision"] for e in events]==[1,2]
+    assert events[1]["previous_event_hash"]==events[0]["event_hash"]
+
+
+def test_guided_run_defers_expensive_actions(tmp_path):
+    kernel=WorkflowKernel(tmp_path); kernel.create("guided-run","proof",[{"url":"https://x.test"}],mode="guided")
+    result=kernel.run("guided-run", execute_native=lambda action:{"status":"ok"}, max_actions=3)
+    assert result["executed"]
+    assert result["confirmation_actions"]
+
+
+def test_materializer_rejects_tampered_event_chain(tmp_path):
+    kernel=WorkflowKernel(tmp_path); kernel.create("tamper","proof",[])
+    path=tmp_path/"cases"/"tamper"/"workflow.events.jsonl"
+    event=json.loads(path.read_text().splitlines()[0]); event["payload"]["state"]["status"]="tampered"
+    path.write_text(json.dumps(event)+"\n")
+    with pytest.raises(ValueError,match="event hash"):
+        kernel.materialize("tamper")
+
+
+def test_append_rejects_stale_expected_revision(tmp_path):
+    kernel=WorkflowKernel(tmp_path); kernel.create("revision","proof",[])
+    with pytest.raises(ValueError,match="revision conflict"):
+        kernel.add_hypothesis("revision","x",expected_revision=0)

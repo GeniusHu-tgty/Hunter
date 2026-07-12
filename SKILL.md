@@ -9,7 +9,7 @@ Hunter ?????? MCP server?
 
 - server name?`hunter_tools`
 - ?????`mcp_server.py`
-- ??????79
+- ??????80
 - ???pipeline?recon?auto vulnerability scanners?payload?session?report?Hunter KB?Burp bridge
 - `hunter_tools_mcp.py` ??????????????????? MCP server
 
@@ -120,4 +120,4 @@ state.json -> kb_router/kb_read_file -> hunter_healthcheck -> hunter_capabilitie
 
 ## Unified Workflow Kernel
 
-For CTF/reverse/pentest cases, use `hunter_workflow_create` -> `hunter_workflow_route` -> `hunter_workflow_plan` -> backend execution -> `hunter_evidence_register` / `hunter_finding_promote` -> `hunter_workflow_checkpoint`. Use `interactive` by default and bounded `autopilot` for repeatable lab automation. PE/APK/JavaScript/mixed lanes delegate to `reverse_lab_tools`, `ghidra`, and `jshook` through capability plans.
+For CTF/reverse/pentest cases, define explicit `success_conditions`, then use `hunter_workflow_create` -> `hunter_workflow_route` -> `hunter_workflow_plan` -> backend execution -> `hunter_evidence_register` / `hunter_finding_promote` -> `hunter_workflow_checkpoint`. Use `interactive` by default and bounded `autopilot` for repeatable lab automation. PE/APK/JavaScript/mixed lanes delegate to `reverse_lab_tools`, `ghidra`, and `jshook` through capability plans.

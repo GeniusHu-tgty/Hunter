@@ -23,5 +23,5 @@ def build_plan(state, registry: BackendRegistry, max_actions=5):
                 ordered.append(match); remaining.remove(match)
         candidates = ordered + remaining
     for backend, capability in candidates[:limit]:
-        actions.append({"id": f"action-{len(actions)+1:03d}", "server": backend["server"], "tool": capability, "execution": backend["execution"], "phase": state["phase"], "estimated_cost": {"tool_calls": 1, "weight": COSTS.get(backend["server"], 2)}, "status": "ready"})
+        actions.append({"id": f"action-{len(actions)+1:03d}", "server": backend["server"], "tool": capability, "execution": backend["execution"], "phase": state["phase"], "estimated_cost": {"tool_calls": 1, "weight": COSTS.get(backend["server"], 2)}, "risk": "low" if COSTS.get(backend["server"], 2) == 1 and capability in {"hunter_fast_scan", "hunter_scan_plan", "hunter_js_analyze", "hunter_kb_recommend"} else "medium", "status": "ready"})
     return {"workflow_id": state["workflow_id"], "lane": state["lane"], "phase": state["phase"], "actions": actions, "requires_confirmation": state["policy"]["mode"] == "interactive"}
