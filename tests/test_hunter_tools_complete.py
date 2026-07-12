@@ -37,9 +37,12 @@ def test_complete_server_exposes_all_legacy_and_v81_tools():
         "hunter_session_status", "hunter_agents_list", "hunter_phases_list", "hunter_report",
         "hunter_stealth_request", "hunter_stealth_scan", "hunter_session_create",
         "hunter_session_state", "hunter_set_proxy_pool",
+        "hunter_reverse_binary", "hunter_reverse_step",
+        "hunter_reverse_extract_iocs", "hunter_reverse_generate_rules",
+        "hunter_reverse_decrypt_plan",
     }
     assert required - registered_functions(mcp_server) == set()
-    assert len(required) == 55
+    assert len(required) == 60
 
 
 def test_project_mcp_config_has_only_hunter_tools():

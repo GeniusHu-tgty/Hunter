@@ -53,10 +53,22 @@ from core.adaptive_engine import AdaptiveEngine, get_mode_profile
 from core.recon_cache import ReconCache
 from core.workflow import WorkflowKernel, WorkflowPolicy
 from core.session import AttackChain, AttackSessionStore, PostExploitation
+from core.browser import (
+    BrowserController,
+    BrowserSessionStore,
+    DynamicHookInjector,
+)
 from core.js_analysis.api_extractor import extract_api
 from core.js_analysis.bundle_unpacker import unpack_bundle
 from core.js_analysis.deobfuscator import deobfuscate
 from core.js_analysis.signature_extractor import extract_signature
+from core.reverse import AndroidPipeline, BinaryPipeline, detect_binary_type
+from core.memory import (
+    FingerprintDatabase,
+    PatternEngine,
+    TargetMemory,
+    TechniqueMemory,
+)
 
 # ============================================================
 # MCP Server
@@ -82,6 +94,7 @@ JS_REPLAY_DIR = Path(os.getenv("OPEN_TGTYLAB_ROOT", r"D:\Open-tgtylab")) / "expo
 JS_ANALYSIS_MAX_BYTES = 10 * 1024 * 1024
 JS_ANALYSIS_MAX_SCRIPTS = 32
 JS_ANALYSIS_TIMEOUT_SECONDS = 15
+REVERSE_PIPELINE_ROOT = Path(os.getenv("OPEN_TGTYLAB_ROOT", r"D:\Open-tgtylab")) / "exports" / "reverse"
 
 def _reset_workspace_adapter(root: Optional[str | Path] = None) -> OpenTgtyLabWorkspaceAdapter:
     """Re-discover workspace after environment/config changes (also useful for tests)."""
@@ -98,6 +111,11 @@ _stealth_client = None
 _attack_session_store = None
 _attack_http_clients = {}
 _post_exploitation = PostExploitation()
+_browser_store = None
+_target_memory = None
+_technique_memory = None
+_pattern_engine = PatternEngine()
+_fingerprint_database = FingerprintDatabase()
 
 def _reset_stealth_client(state_dir: Optional[str | Path] = None):
     global _stealth_client
@@ -118,6 +136,44 @@ def _reset_attack_session_store(state_dir: Optional[str | Path] = None):
 
 def _get_attack_session_store():
     return _attack_session_store or _reset_attack_session_store()
+
+
+def _reset_browser_store(state_dir: Optional[str | Path] = None):
+    global _browser_store
+    _browser_store = BrowserSessionStore(
+        state_dir or (HUNTER_DIR / "sessions" / "browser")
+    )
+    return _browser_store
+
+
+def _get_browser_store():
+    return _browser_store or _reset_browser_store()
+
+
+def _browser_controller() -> BrowserController:
+    return BrowserController(artifact_dir=_get_browser_store().storage_dir)
+
+
+def _reset_memory_store(db_path: Optional[str | Path] = None):
+    global _target_memory, _technique_memory
+    target = Path(
+        db_path
+        or os.getenv(
+            "HUNTER_TARGET_MEMORY_DB",
+            str(Path(os.getenv("OPEN_TGTYLAB_ROOT", r"D:\Open-tgtylab")) / "data" / "targets.db"),
+        )
+    ).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _target_memory = TargetMemory(target)
+    _technique_memory = TechniqueMemory(target)
+    return _target_memory, _technique_memory
+
+
+def _get_memory_store():
+    return (
+        _target_memory,
+        _technique_memory,
+    ) if _target_memory is not None and _technique_memory is not None else _reset_memory_store()
 
 def _get_attack_http_client(session):
     from core.stealth.stealth_http_client import StealthHTTPClient
@@ -1283,6 +1339,159 @@ async def hunter_js_full_analysis(input_value: str, parameter_name: Optional[str
     return await _run_js_tool("hunter_js_full_analysis", lambda value: _full_analysis_js_input(value, parameter_name, observations, allow_private), input_value)
 
 
+def _reverse_envelope(
+    tool: str,
+    data: Dict[str, Any],
+    evidence: Optional[Dict[str, Any]] = None,
+    next_actions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    return {
+        "tool": tool,
+        "status": "ok",
+        "data": data,
+        "evidence": evidence or {},
+        "next_actions": next_actions or [],
+    }
+
+
+def _reverse_pipeline_class(sample_path: str | Path, sample_type: str = "auto"):
+    normalized = str(sample_type or "auto").strip().lower()
+    detected = detect_binary_type(sample_path)
+    if normalized == "auto":
+        normalized = detected
+    if normalized == "mach-o":
+        normalized = "macho"
+    normalized_detected = "macho" if detected == "mach-o" else detected
+    if detected != "unknown" and normalized != normalized_detected:
+        raise ValueError(
+            f"requested type {normalized!r} does not match detected type {normalized_detected!r}"
+        )
+    if normalized == "apk":
+        return AndroidPipeline, normalized
+    if normalized not in {"pe", "elf", "macho", "dex", "firmware", "script"}:
+        raise ValueError("type must be auto, pe, elf, macho, apk, dex, firmware, or script")
+    return BinaryPipeline, normalized
+
+
+def _load_reverse_pipeline(pipeline_id: str):
+    state_path = REVERSE_PIPELINE_ROOT / pipeline_id / "state.json"
+    if not state_path.is_file():
+        raise KeyError(f"reverse pipeline not found: {pipeline_id}")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    pipeline_class = AndroidPipeline if state.get("pipeline_kind") == "android" else BinaryPipeline
+    return pipeline_class.load(pipeline_id, output_root=REVERSE_PIPELINE_ROOT)
+
+
+@mcp.tool()
+async def hunter_reverse_binary(sample_path: str, type: str = "auto") -> str:
+    """Run the authorized binary/APK reverse-analysis pipeline and persist its state."""
+    def operate() -> Dict[str, Any]:
+        pipeline_class, normalized_type = _reverse_pipeline_class(sample_path, type)
+        pipeline = pipeline_class(
+            sample_path,
+            output_root=REVERSE_PIPELINE_ROOT,
+        )
+        state = pipeline.run_all()
+        triage = state.get("results", {}).get("triage", {})
+        return _reverse_envelope(
+            "hunter_reverse_binary",
+            {
+                "pipeline_id": state["pipeline_id"],
+                "pipeline_kind": state.get("pipeline_kind", "binary"),
+                "status": state["status"],
+                "sample": {
+                    "path": state["sample_path"],
+                    "type": triage.get("binary_type", normalized_type),
+                    "hashes": triage.get("hashes", {}),
+                },
+                "steps": state["steps"],
+                "artifacts": state.get("artifacts", {}),
+                "handoffs": state.get("handoffs", []),
+                "state_path": state["state_path"],
+            },
+            {
+                "sample_path": str(Path(sample_path).expanduser().resolve()),
+                "state_path": state["state_path"],
+            },
+            state.get("next_actions", []),
+        )
+
+    return await _safe_json_tool("hunter_reverse_binary", operate, timeout=1800)
+
+
+@mcp.tool()
+async def hunter_reverse_step(pipeline_id: str, step_name: str) -> str:
+    """Execute or refresh one persisted reverse-pipeline step."""
+    def operate() -> Dict[str, Any]:
+        pipeline = _load_reverse_pipeline(pipeline_id)
+        state = pipeline.run_step(step_name)
+        return _reverse_envelope(
+            "hunter_reverse_step",
+            {
+                "pipeline_id": pipeline_id,
+                "step_name": step_name,
+                "status": state["status"],
+                "step": next(item for item in state["steps"] if item["name"] == step_name),
+                "artifacts": state.get("artifacts", {}),
+                "handoffs": state.get("handoffs", []),
+            },
+            {"state_path": state["state_path"]},
+            state.get("next_actions", []),
+        )
+
+    return await _safe_json_tool("hunter_reverse_step", operate, timeout=1800)
+
+
+@mcp.tool()
+async def hunter_reverse_extract_iocs(pipeline_id: str) -> str:
+    """Extract and persist IOC indicators from a reverse pipeline."""
+    def operate() -> Dict[str, Any]:
+        pipeline = _load_reverse_pipeline(pipeline_id)
+        result = pipeline.extract_iocs()
+        return _reverse_envelope(
+            "hunter_reverse_extract_iocs",
+            {
+                "pipeline_id": pipeline_id,
+                "iocs": result,
+                "artifact": pipeline.state.get("artifacts", {}).get("iocs", ""),
+            },
+            {"state_path": pipeline.state["state_path"]},
+        )
+
+    return await _safe_json_tool("hunter_reverse_extract_iocs", operate)
+
+
+@mcp.tool()
+async def hunter_reverse_generate_rules(pipeline_id: str) -> str:
+    """Generate YARA and Sigma detection-rule artifacts for a reverse pipeline."""
+    def operate() -> Dict[str, Any]:
+        pipeline = _load_reverse_pipeline(pipeline_id)
+        result = pipeline.generate_rules()
+        return _reverse_envelope(
+            "hunter_reverse_generate_rules",
+            {"pipeline_id": pipeline_id, **result},
+            {"state_path": pipeline.state["state_path"]},
+        )
+
+    return await _safe_json_tool("hunter_reverse_generate_rules", operate)
+
+
+@mcp.tool()
+async def hunter_reverse_decrypt_plan(pipeline_id: str) -> str:
+    """Generate a decrypt/unpack plan and external backend handoffs."""
+    def operate() -> Dict[str, Any]:
+        pipeline = _load_reverse_pipeline(pipeline_id)
+        result = pipeline.decrypt_plan()
+        return _reverse_envelope(
+            "hunter_reverse_decrypt_plan",
+            {"pipeline_id": pipeline_id, **result},
+            {"state_path": pipeline.state["state_path"]},
+            result.get("next_actions", []),
+        )
+
+    return await _safe_json_tool("hunter_reverse_decrypt_plan", operate)
+
+
 # ============================================================
 # Auto-* Direct Tools (v8 hardened)
 # ============================================================
@@ -1589,12 +1798,16 @@ async def hunter_healthcheck() -> str:
         "hunter_session_state", "hunter_set_proxy_pool",
         "hunter_session_start", "hunter_session_execute_chain",
         "hunter_session_checkpoint", "hunter_post_exploit",
+        "hunter_reverse_binary", "hunter_reverse_step",
+        "hunter_reverse_extract_iocs", "hunter_reverse_generate_rules",
+        "hunter_reverse_decrypt_plan",
     ]
     registered = _registered_hunter_tools()
     missing_mcp = [name for name in required_mcp if name not in registered]
     external_names = [
         "nuclei", "subfinder", "naabu", "httpx", "ffuf", "katana", "gau",
         "dalfox", "sqlmap", "wafw00f", "whatweb", "getjs",
+        "diec", "rizin", "analyzeHeadless", "frida", "apktool", "jadx",
     ]
     external = {name: _tool_available(name) for name in external_names}
     wordlists = {
@@ -1669,6 +1882,11 @@ async def hunter_capabilities() -> str:
         "hunter_js_extract_api": ("js-analysis", "Extract HTTP, WebSocket, route, and auth usage"),
         "hunter_js_extract_signature": ("js-analysis", "Locate signature logic and generate replay scripts"),
         "hunter_js_full_analysis": ("js-analysis", "Run the complete JavaScript analysis pipeline"),
+        "hunter_reverse_binary": ("reverse-analysis", "Run the persistent binary or Android reverse-analysis pipeline"),
+        "hunter_reverse_step": ("reverse-analysis", "Execute one persisted reverse-analysis step"),
+        "hunter_reverse_extract_iocs": ("reverse-analysis", "Extract IOC indicators from reverse-analysis evidence"),
+        "hunter_reverse_generate_rules": ("reverse-analysis", "Generate YARA and Sigma rule artifacts"),
+        "hunter_reverse_decrypt_plan": ("reverse-analysis", "Generate decrypt and unpack execution plans"),
         "hunter_stealth_request": ("stealth-http", "Send adaptive stateful HTTP request"),
         "hunter_stealth_scan": ("stealth-http", "Detect WAF, rate limits, and captcha"),
         "hunter_session_create": ("stealth-http", "Create or restore target HTTP session"),
@@ -2357,6 +2575,403 @@ async def hunter_post_exploit(
         ),
     )
 
+
+@mcp.tool()
+async def hunter_browser_navigate(
+    target_url: str,
+    wait_for: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Create a browser session and emit a deferred Playwright navigation plan."""
+    def operate() -> Dict[str, Any]:
+        store = _get_browser_store()
+        session = store.create(target_url)
+        plan = _browser_controller().navigate_and_wait(target_url, wait_for or {})
+        store.update(session["session_id"], current_url=target_url, last_plan=plan)
+        return {
+            "browser_session_id": session["session_id"],
+            "target_url": target_url,
+            "plan": plan,
+        }
+
+    return _workflow_result("hunter_browser_navigate", operate)
+
+
+@mcp.tool()
+async def hunter_browser_interact(
+    browser_session_id: str,
+    action: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build a deferred browser interaction plan for a stored browser session."""
+    def operate() -> Dict[str, Any]:
+        store = _get_browser_store()
+        session = store.get(browser_session_id)
+        controller = _browser_controller()
+        options = dict(params or {})
+        normalized = str(action or "").strip().lower().replace("-", "_")
+        if normalized == "click":
+            plan = controller.click_and_capture(
+                options.get("selector") or options.get("target") or options.get("text", ""),
+                capture_network=bool(options.get("capture_network", True)),
+            )
+        elif normalized in {"fill", "form", "submit"}:
+            plan = controller.fill_form_and_submit(
+                options.get("form_fields") or options.get("fields") or {},
+                options.get("submit_button") or options.get("submit") or "",
+            )
+        elif normalized in {"scroll", "scroll_load_more"}:
+            plan = controller.scroll_and_load_more(options.get("scroll_times", 1))
+        elif normalized in {"login", "auto_login"}:
+            plan = controller.auto_login(
+                options.get("url") or session["target"],
+                options.get("username", ""),
+                options.get("password", ""),
+                options.get("login_button_selector"),
+            )
+        elif normalized in {"spa", "navigate_spa"}:
+            plan = controller.auto_navigate_spa(
+                options.get("base_url") or session["target"],
+                options.get("target_state", ""),
+            )
+        elif normalized in {"trigger_api", "api"}:
+            plan = controller.auto_trigger_api(
+                options.get("url") or session["target"],
+                options.get("action_description", ""),
+            )
+        elif normalized in {"execute", "evaluate", "execute_in_context"}:
+            plan = controller.execute_in_context(options.get("js_code", ""))
+            plan["requires_confirmation"] = True
+        else:
+            raise ValueError(
+                "action must be click, fill, scroll, login, spa, trigger_api, or execute"
+            )
+        store.update(browser_session_id, last_plan=plan)
+        return {"browser_session_id": browser_session_id, "plan": plan}
+
+    return _workflow_result("hunter_browser_interact", operate)
+
+
+@mcp.tool()
+async def hunter_browser_capture_network(
+    browser_session_id: str,
+    duration: float = 5.0,
+) -> str:
+    """Build a deferred plan that collects browser network traffic."""
+    def operate() -> Dict[str, Any]:
+        store = _get_browser_store()
+        store.get(browser_session_id)
+        plan = _browser_controller().capture_network_traffic(duration)
+        store.update(browser_session_id, last_plan=plan)
+        return {"browser_session_id": browser_session_id, "plan": plan}
+
+    return _workflow_result("hunter_browser_capture_network", operate)
+
+
+@mcp.tool()
+async def hunter_browser_inject_hooks(
+    browser_session_id: str,
+    hooks: Optional[List[str]] = None,
+    strategy: str = "preload",
+    refresh_interval_ms: int = 5000,
+) -> str:
+    """Build a deferred plan to install JavaScript observation hooks."""
+    def operate() -> Dict[str, Any]:
+        store = _get_browser_store()
+        store.get(browser_session_id)
+        injector = DynamicHookInjector()
+        plan = injector.build_plan(
+            hooks or ["xhr", "fetch", "crypto", "storage", "cookie", "websocket"],
+            strategy=strategy,
+            refresh_interval_ms=refresh_interval_ms,
+        )
+        store.update(browser_session_id, last_plan=plan)
+        return {"browser_session_id": browser_session_id, "plan": plan}
+
+    return _workflow_result("hunter_browser_inject_hooks", operate)
+
+
+@mcp.tool()
+async def hunter_browser_get_hook_results(
+    browser_session_id: str,
+    console_messages: Optional[List[str]] = None,
+) -> str:
+    """Ingest prefixed hook console records and return the redacted session view."""
+    def operate() -> Dict[str, Any]:
+        store = _get_browser_store()
+        if console_messages:
+            return store.ingest_console(browser_session_id, console_messages)
+        session = store.get(browser_session_id)
+        return {
+            "browser_session_id": browser_session_id,
+            "accepted": 0,
+            "rejected": 0,
+            "total": len(session.get("hook_results", [])),
+            "hook_results": session.get("hook_results", []),
+        }
+
+    return _workflow_result("hunter_browser_get_hook_results", operate)
+
+
+@mcp.tool()
+async def hunter_browser_snapshot(
+    browser_session_id: str,
+    include_network: bool = False,
+) -> str:
+    """Return a deferred browser snapshot plan for a stored browser session."""
+    def operate() -> Dict[str, Any]:
+        store = _get_browser_store()
+        session = store.get(browser_session_id)
+        plan = _browser_controller().snapshot(include_network=include_network)
+        store.update(browser_session_id, last_plan=plan)
+        return {
+            "browser_session_id": browser_session_id,
+            "current_url": session.get("current_url", ""),
+            "plan": plan,
+        }
+
+    return _workflow_result("hunter_browser_snapshot", operate)
+
+
+@mcp.tool()
+async def hunter_memory_query(
+    query_type: str,
+    query: str,
+) -> str:
+    """Query local target history, technique statistics, or reusable patterns."""
+    def operate() -> Dict[str, Any]:
+        target_memory, technique_memory = _get_memory_store()
+        normalized = str(query_type or "").strip().lower()
+        if normalized == "target":
+            return target_memory.query_target(query)
+        if normalized == "technique":
+            return {
+                "waf": query,
+                "techniques": technique_memory.best_for_waf(query),
+            }
+        if normalized == "pattern":
+            return {
+                "parameter": _pattern_engine.match_parameter(query),
+                "response": _pattern_engine.match_response(query),
+            }
+        raise ValueError("query_type must be target, technique, or pattern")
+
+    return _workflow_result("hunter_memory_query", operate)
+
+
+@mcp.tool()
+async def hunter_memory_record(
+    record_type: str,
+    data: Dict[str, Any],
+) -> str:
+    """Record a bounded target, technique, finding, or attack observation."""
+    def operate() -> Dict[str, Any]:
+        target_memory, technique_memory = _get_memory_store()
+        payload = dict(data or {})
+        normalized = str(record_type or "").strip().lower()
+        target_url = str(payload.get("target_url") or payload.get("url") or "").strip()
+        if normalized == "target":
+            result = target_memory.record_target(
+                target_url,
+                fingerprints=payload.get("fingerprints") or {},
+            )
+        elif normalized == "fingerprint":
+            result = target_memory.record_fingerprint(
+                target_url,
+                payload.get("fingerprint_type") or payload.get("type") or "",
+                payload.get("value") or payload.get("name") or "",
+                confidence=payload.get("confidence", 0.0),
+                evidence=payload.get("evidence") or {},
+            )
+        elif normalized == "endpoint":
+            result = target_memory.record_endpoint(
+                target_url,
+                payload.get("path") or payload.get("endpoint") or "",
+                method=payload.get("method", "GET"),
+                parameters=payload.get("parameters") or [],
+                injection_points=payload.get("injection_points") or [],
+                authorization_risk=bool(payload.get("authorization_risk", False)),
+            )
+        elif normalized in {"vulnerability", "vuln"}:
+            result = target_memory.record_vulnerability(
+                target_url,
+                vuln_type=payload.get("vuln_type") or payload.get("type") or "",
+                severity=payload.get("severity", "info"),
+                status=payload.get("status", "suspected"),
+                poc_path=payload.get("poc_path", ""),
+                report_path=payload.get("report_path", ""),
+            )
+        elif normalized == "attack":
+            result = target_memory.record_attack(
+                target_url,
+                tool=payload.get("tool", ""),
+                payload_metadata=payload.get("payload_metadata") or {},
+                success=bool(payload.get("success", False)),
+                bypass_strategy=payload.get("bypass_strategy", ""),
+                notes=payload.get("notes", ""),
+            )
+            if payload.get("technique"):
+                technique_memory.record_attempt(
+                    target_url=target_url,
+                    technique_name=payload["technique"],
+                    waf_type=payload.get("waf_type", ""),
+                    success=bool(payload.get("success", False)),
+                )
+        elif normalized in {"technique", "technique_attempt"}:
+            if normalized == "technique":
+                result = technique_memory.register_technique(
+                    payload.get("name") or payload.get("technique_name") or "",
+                    payload.get("type") or payload.get("technique_type") or "",
+                    payload.get("description", ""),
+                )
+            else:
+                result = technique_memory.record_attempt(
+                    target_url=target_url,
+                    technique_name=payload.get("technique_name") or payload.get("technique") or "",
+                    waf_type=payload.get("waf_type", ""),
+                    success=bool(payload.get("success", False)),
+                )
+        else:
+            raise ValueError(
+                "record_type must be target, fingerprint, endpoint, vulnerability, "
+                "attack, technique, or technique_attempt"
+            )
+        return {"record_type": normalized, "record": result}
+
+    return _workflow_result("hunter_memory_record", operate)
+
+
+@mcp.tool()
+async def hunter_memory_recommend(
+    target_url: str,
+) -> str:
+    """Return explainable, non-executing recommendations from local memory."""
+    def operate() -> Dict[str, Any]:
+        target_memory, technique_memory = _get_memory_store()
+        history = target_memory.query_target(target_url)
+        fingerprints = history.get("fingerprints", {})
+        waf = fingerprints.get("waf") or fingerprints.get("waf_type") or ""
+        recommendations: List[Dict[str, Any]] = []
+        ranked_techniques: List[Dict[str, Any]] = []
+        if waf:
+            ranked_techniques = technique_memory.best_for_waf(waf)[:5]
+            for item in ranked_techniques:
+                recommendations.append(
+                    {
+                        "kind": "technique",
+                        "name": item["name"],
+                        "reason": f"historical success rate for {waf}: {item['success_rate']:.2f}",
+                        "confidence": item["success_rate"],
+                    }
+                )
+            if not ranked_techniques or max(
+                (item["success_rate"] for item in ranked_techniques),
+                default=0.0,
+            ) < 0.10:
+                for combination in technique_memory.recommend_combinations(waf)[:3]:
+                    recommendations.append(
+                        {
+                            "kind": "technique-combination",
+                            "name": " + ".join(combination["techniques"]),
+                            "reason": "single historical techniques have low success; "
+                            "combine the highest-ranked independent strategies",
+                            "confidence": combination["estimated_success_rate"],
+                        }
+                    )
+        for endpoint in history.get("endpoints", []):
+            for parameter in endpoint.get("parameters", []):
+                pattern = _pattern_engine.match_parameter(
+                    parameter,
+                    context=f"{endpoint.get('method', 'GET')} {endpoint.get('url', '')}",
+                )
+                if pattern.get("vulnerability_types"):
+                    recommendations.append(
+                        {
+                            "kind": "parameter-pattern",
+                            "name": str(parameter),
+                            "reason": ", ".join(pattern["vulnerability_types"]),
+                            "confidence": pattern.get("confidence", 0.0),
+                        }
+                    )
+        stack = _pattern_engine.recommend_stack(fingerprints)
+        if stack.get("primary"):
+            recommendations.append(
+                {
+                    "kind": "stack",
+                    "name": stack["primary"]["name"],
+                    "reason": stack["primary"].get("reason", ""),
+                    "confidence": stack.get("confidence", 0.0),
+                }
+            )
+        similar_targets = target_memory.similar_targets(target_url, limit=5)
+        for similar in similar_targets:
+            similar_history = target_memory.query_target(similar["url"])
+            strategies = sorted(
+                {
+                    attack["bypass_strategy"]
+                    for attack in similar_history.get("attack_history", [])
+                    if attack.get("success") and attack.get("bypass_strategy")
+                }
+            )
+            for strategy in strategies:
+                recommendations.append(
+                    {
+                        "kind": "similar-target",
+                        "name": strategy,
+                        "reason": f"worked on similar target {similar['domain']} "
+                        f"(similarity {similar['similarity']:.2f})",
+                        "confidence": similar["similarity"],
+                    }
+                )
+        return {
+            "target_url": target_url,
+            "recommendations": recommendations,
+            "similar_targets": similar_targets,
+            "history_summary": {
+                "endpoints": len(history.get("endpoints", [])),
+                "vulnerabilities": len(history.get("vulnerabilities", [])),
+                "attacks": len(history.get("attack_history", [])),
+            },
+            "execution": "deferred",
+        }
+
+    return _workflow_result("hunter_memory_recommend", operate)
+
+
+@mcp.tool()
+async def hunter_fingerprint_detect(
+    target_url: str,
+    observations: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Match passive headers/body/path observations against local fingerprints."""
+    def operate() -> Dict[str, Any]:
+        result = _fingerprint_database.detect(observations or {})
+        if observations is None:
+            result["plan"] = {
+                "mode": "passive-observation-handoff",
+                "execution": "deferred",
+                "target_url": target_url,
+                "required_observations": ["headers", "body", "paths", "favicon_hash"],
+            }
+        return {"target_url": target_url, **result}
+
+    return _workflow_result("hunter_fingerprint_detect", operate)
+
+
+@mcp.tool()
+async def hunter_memory_stats() -> str:
+    """Return local memory database and fingerprint catalog statistics."""
+    def operate() -> Dict[str, Any]:
+        target_memory, technique_memory = _get_memory_store()
+        return {
+            "database_path": str(target_memory.db_path),
+            "memory": target_memory.stats(),
+            "techniques": technique_memory.stats(),
+            "fingerprints": _fingerprint_database.counts(),
+        }
+
+    return _workflow_result("hunter_memory_stats", operate)
+
+
 @mcp.tool()
 async def hunter_session_create(target: str, resume: bool = True, fingerprint_strategy: str = "random") -> str:
     """Create or restore an isolated target HTTP session."""
@@ -2477,6 +3092,7 @@ async def hunter_backend_status() -> str:
 @mcp.tool()
 async def hunter_lane_catalog() -> str:
     return _workflow_result("hunter_lane_catalog", _workflow_kernel().lane_catalog)
+
 
 # ============================================================
 # Entry Point

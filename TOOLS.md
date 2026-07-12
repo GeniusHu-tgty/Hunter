@@ -15,18 +15,32 @@ The kernel stores revisioned, hash-chained `workflow.events.jsonl`, atomically m
 
 ## MCP v8.1 Tool Surface
 
-- Total complete `hunter_tools` MCP tools: 94
+- Total complete `hunter_tools` MCP tools: 110
 - Meta/orchestration: `hunter_healthcheck`, `hunter_capabilities`, `hunter_recommend_next`, `hunter_agents_list`, `hunter_phases_list`
 - Pipelines: `hunter_scan`, `hunter_recon`, `hunter_vuln_scan`
 - Recon atomics: `hunter_subdomain`, `hunter_port_scan`, `hunter_tech_detect`, `hunter_dir_enum`, `hunter_js_analyze`
 - Auto verification: `hunter_auto_sqli`, `hunter_auto_xss`, `hunter_auto_ssrf`, `hunter_auto_ssti`, `hunter_auto_cmd`, `hunter_auto_xxe`, `hunter_auto_idor`, `hunter_auto_csrf`, `hunter_auto_cors`, `hunter_auto_jwt`, `hunter_auto_graphql`, `hunter_auto_websocket`, `hunter_auto_race`, `hunter_auto_access_control`, `hunter_unified_scan`
 - Payload/evidence/report: `hunter_payload_list`, `hunter_payload_search`, `hunter_payload_get`, `hunter_payload_generate`, `hunter_burp_import`, `hunter_session_list`, `hunter_session_status`, `hunter_report`
 - Persistent attack sessions: `hunter_session_start`, `hunter_session_execute_chain`, `hunter_session_checkpoint`, `hunter_post_exploit`, and dual-mode `hunter_session_state`
+- Browser bridge: `hunter_browser_navigate`, `hunter_browser_interact`, `hunter_browser_capture_network`, `hunter_browser_inject_hooks`, `hunter_browser_get_hook_results`, `hunter_browser_snapshot`
+- Memory: `hunter_memory_query`, `hunter_memory_record`, `hunter_memory_recommend`, `hunter_fingerprint_detect`, `hunter_memory_stats`
+- Reverse analysis: `hunter_reverse_binary`, `hunter_reverse_step`, `hunter_reverse_extract_iocs`, `hunter_reverse_generate_rules`, `hunter_reverse_decrypt_plan`
 - Hunter KB facade: `hunter_kb_list`, `hunter_kb_search`, `hunter_kb_read`, `hunter_kb_recommend`
 - Burp bridge plan facade: `hunter_burp_bridge`, `hunter_burp_repeater`, `hunter_burp_proxy_search`, `hunter_burp_scanner_issues`, `hunter_burp_collaborator_workflow`
 - Single server: `mcp_server.py` runs as `hunter_tools`; `hunter_tools_mcp.py` is only a compatibility launcher
 
 Run `hunter_healthcheck` first. If external CLIs are degraded, use payload/meta/report tools plus Burp/http_probe for proof collection.
+
+## Browser Bridge Safety
+
+The browser tools are an external Playwright MCP handoff layer. They generate
+auditable `browser_*` call descriptors with `execution: "deferred"` and do not
+launch a browser, evaluate JavaScript, send requests, or replay WebSocket
+messages in the Hunter process. Browser observations can be routed into
+confirmation-gated `hunter_*` descriptors, but existing active scanners are
+never invoked automatically. Hook output is bounded, redacted, and encrypted
+in the browser session store. WebSocket replay additionally requires an
+independent approval verifier and token.
 
 ## Go-based Tools (23 tools)
 

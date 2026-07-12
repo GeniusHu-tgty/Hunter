@@ -1,7 +1,7 @@
 {
   "contract_version": "1.0",
   "server_name": "hunter_tools",
-  "minimum_tool_count": 94,
+  "minimum_tool_count": 110,
   "workspace_schema_version": "1.0",
   "required_tools": [
     "hunter_scan",
@@ -97,10 +97,28 @@
     "hunter_session_start",
     "hunter_session_execute_chain",
     "hunter_session_checkpoint",
-    "hunter_post_exploit"
+    "hunter_post_exploit",
+    "hunter_browser_navigate",
+    "hunter_browser_interact",
+    "hunter_browser_capture_network",
+    "hunter_browser_inject_hooks",
+    "hunter_browser_get_hook_results",
+    "hunter_browser_snapshot",
+    "hunter_reverse_binary",
+    "hunter_reverse_step",
+    "hunter_reverse_extract_iocs",
+    "hunter_reverse_generate_rules",
+    "hunter_reverse_decrypt_plan",
+    "hunter_memory_query",
+    "hunter_memory_record",
+    "hunter_memory_recommend",
+    "hunter_fingerprint_detect",
+    "hunter_memory_stats"
   ],
   "adaptive_engine_version": "1.0",
   "workflow_kernel_version": "2.0",
   "stealth_http_version": "1.0",
-  "attack_session_version": "1.0"
+  "attack_session_version": "1.0",
+  "reverse_pipeline_version": "1.0",
+  "memory_system_version": "1.0"
 }

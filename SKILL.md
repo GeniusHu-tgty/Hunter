@@ -9,7 +9,7 @@ Hunter ?????? MCP server?
 
 - server name?`hunter_tools`
 - ?????`mcp_server.py`
-- ??????94
+- ??????110
 - ???pipeline?recon?auto vulnerability scanners?payload?session?report?Hunter KB?Burp bridge
 - `hunter_tools_mcp.py` ??????????????????? MCP server
 
@@ -29,7 +29,7 @@ Hunter ?????? MCP server?
 - Hunter KB / payload / Burp bridge ?????????
 - ???????? request/response?diff?payload?????????
 
-## 94 ??? `hunter_tools` MCP ??
+## 110 ??? `hunter_tools` MCP ??
 
 ### Meta / routing
 
@@ -98,6 +98,42 @@ Hunter ?????? MCP server?
 - `hunter_post_exploit`
 - `hunter_session_state`
 - `hunter_report`
+
+### Browser / Playwright MCP bridge
+
+- `hunter_browser_navigate`
+- `hunter_browser_interact`
+- `hunter_browser_capture_network`
+- `hunter_browser_inject_hooks`
+- `hunter_browser_get_hook_results`
+- `hunter_browser_snapshot`
+
+The browser bridge emits deferred external Playwright MCP descriptors. It does
+not control a browser directly; observations are redacted and persisted, and
+Hunter follow-up actions remain confirmation-gated.
+
+### Local memory
+
+- `hunter_memory_query`
+- `hunter_memory_record`
+- `hunter_memory_recommend`
+- `hunter_fingerprint_detect`
+- `hunter_memory_stats`
+
+Memory recommendations are local, explainable, and non-executing. Fingerprint
+detection consumes passive observations and does not make target requests.
+
+### Reverse analysis orchestration
+
+- `hunter_reverse_binary`
+- `hunter_reverse_step`
+- `hunter_reverse_extract_iocs`
+- `hunter_reverse_generate_rules`
+- `hunter_reverse_decrypt_plan`
+
+The reverse pipeline persists triage/static/identify/plan/capture/produce
+state and emits external Ghidra/ReverseLabTools/Frida handoffs when those
+backends are not directly available.
 
 ## ????
 

@@ -16,13 +16,60 @@ orchestration, full-state checkpoints, automatic Cookie/CSRF/auth/form
 extraction, and evidence-gated post-exploitation planning. The six preset
 templates live under `chains/`; see `docs/attack-session.md`.
 
+## Browser MCP Bridge
+
+The browser bridge adds six tools for real-browser workflows while keeping the
+Hunter process side-effect free:
+
+- `hunter_browser_navigate`
+- `hunter_browser_interact`
+- `hunter_browser_capture_network`
+- `hunter_browser_inject_hooks`
+- `hunter_browser_get_hook_results`
+- `hunter_browser_snapshot`
+
+These tools emit Playwright MCP call descriptors in
+`mode: "external-mcp-handoff"` with `execution: "deferred"`. They do not
+start Playwright, execute page JavaScript, send network traffic, or replay
+WebSocket frames directly. Hook observations are bounded, redacted, and
+encrypted in the browser session store. Browser-discovered Hunter actions are
+confirmation-gated descriptors rather than automatic scanner invocations.
+
+## Reverse Analysis Pipeline
+
+The reverse-analysis layer adds five persistent orchestration tools:
+
+- `hunter_reverse_binary`
+- `hunter_reverse_step`
+- `hunter_reverse_extract_iocs`
+- `hunter_reverse_generate_rules`
+- `hunter_reverse_decrypt_plan`
+
+Hunter performs safe local triage, state persistence, function correlation,
+planning, and report generation. Ghidra, ReverseLabTools, Frida, apktool, and
+jadx remain external analysis backends. Missing backends produce explicit
+handoffs instead of fabricated capture results.
+
 ## Unified CTF Workflow Kernel
 
 Hunter now provides event-sourced workflow state, 14 target/artifact lanes, capability-based handoffs to reverse backends, guided/autopilot policies, evidence-backed proof conditions, hash-chained events, revision checks, checkpoint tail replay, and proof-aware early stop.
 
+## Local Memory System
+
+Hunter stores reusable assessment knowledge in
+`D:\Open-tgtylab\data\targets.db`. The memory layer records target history,
+fingerprints, endpoints, vulnerabilities, attack outcomes, and technique
+success rates. It also provides deterministic parameter/response patterns and
+passive WAF, CMS, framework, and API fingerprint matching.
+
+The five memory tools are `hunter_memory_query`,
+`hunter_memory_record`, `hunter_memory_recommend`,
+`hunter_fingerprint_detect`, and `hunter_memory_stats`. Recommendations are
+explainable data only: they do not launch scanners or execute payloads.
+
 ## MCP v8 Hardening
 
-Hunter Tools exposes **94 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
+Hunter Tools exposes **110 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
 
 ### Local-first meta tools
 
@@ -53,7 +100,7 @@ All v8 wrappers return bounded JSON with `status`, `tool`, `elapsed_seconds`, an
 
 Hunter v8.2 consolidates every Hunter capability into one complete `hunter_tools` MCP server, including scanners, orchestration, sessions, reports, KB and Burp bridge.
 
-- Single complete server: `mcp_server.py` / server name `hunter_tools`, exposing **94 MCP tools**.
+- Single complete server: `mcp_server.py` / server name `hunter_tools`, exposing **110 MCP tools**.
 - `hunter_tools_mcp.py` is only a compatibility launcher that delegates to the complete server; it does not create a second MCP registry.
 - Core KB/Burp implementation: `core/hunter_tools_facade.py`.
 - Design/plan: `docs/hunter-tools-v81-design.md` and `docs/hunter-tools-v81-plan.md`.
