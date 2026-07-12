@@ -89,7 +89,8 @@ def test_binary_pipeline_orchestrates_six_steps_and_writes_artifacts(tmp_path):
     ]
     assert state["steps"][0]["status"] == "completed"
     assert state["steps"][4]["status"] == "awaiting-external"
-    assert state["steps"][5]["status"] == "completed"
+    assert state["steps"][5]["status"] == "awaiting-external"
+    assert state["results"]["produce"]["partial"] is True
     assert state["results"]["triage"]["requires_unpacking"] is True
     assert Path(state["artifacts"]["report_markdown"]).is_file()
     assert Path(state["artifacts"]["report_json"]).is_file()
@@ -250,7 +251,8 @@ def test_report_json_contains_final_produce_state(tmp_path):
     report = json.loads(Path(state["artifacts"]["report_json"]).read_text(encoding="utf-8"))
     produce = next(step for step in report["steps"] if step["name"] == "produce")
 
-    assert produce["status"] == "completed"
+    assert produce["status"] == "awaiting-external"
+    assert report["results"]["produce"]["partial"] is True
     assert report["artifacts"]["report_json"] == state["artifacts"]["report_json"]
     assert report["ioc_summary"]["dynamic_capture_present"] is False
 
