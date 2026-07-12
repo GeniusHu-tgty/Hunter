@@ -9,6 +9,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import uuid
 import zipfile
 from collections import Counter, defaultdict
@@ -758,7 +759,9 @@ class BinaryPipeline:
                 raise ValueError("pipeline_id resolves outside output_root")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.backend_runner = backend_runner
+        self._state_lock = threading.RLock()
         self.state = self._load_or_create_state()
+        self._loaded_revision = int(self.state.get("revision", 0))
         self._persist_state()
 
     @property
@@ -782,15 +785,18 @@ class BinaryPipeline:
         for state_path in candidates:
             if not state_path.is_file():
                 continue
+            resolved_state = state_path.resolve()
+            if resolved_state != root / "state.json" and root not in resolved_state.parents:
+                raise ValueError("pipeline state resolves outside output_root")
             try:
-                persisted = json.loads(state_path.read_text(encoding="utf-8"))
+                persisted = json.loads(resolved_state.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             if persisted.get("pipeline_id") != pipeline_id:
                 continue
             return cls(
                 persisted["sample_path"],
-                output_dir=state_path.parent,
+                output_dir=resolved_state.parent,
                 backend_runner=backend_runner,
                 pipeline_id=pipeline_id,
             )
@@ -838,6 +844,8 @@ class BinaryPipeline:
             state.setdefault("artifacts", {})
             state.setdefault("handoffs", [])
             state.setdefault("errors", [])
+            state.setdefault("next_actions", [])
+            state.setdefault("revision", 0)
             state["state_path"] = str(state_path.resolve())
             state["output_dir"] = str(self.output_dir)
             return state
@@ -861,6 +869,8 @@ class BinaryPipeline:
             "artifacts": {},
             "handoffs": [],
             "errors": [],
+            "next_actions": [],
+            "revision": 0,
         }
 
     def _step_record(self, name: str) -> dict[str, Any]:
@@ -885,26 +895,38 @@ class BinaryPipeline:
     def _persist_state(self) -> str:
         """Atomically persist the current state and return its path."""
 
-        self.state["updated_at"] = _utc_now()
-        self._refresh_pipeline_status()
-        state_path = Path(self.state["state_path"])
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True)
-        descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{state_path.name}.",
-            suffix=".tmp",
-            dir=state_path.parent,
-        )
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, state_path)
-        finally:
-            if os.path.exists(temporary_path):
-                os.unlink(temporary_path)
-        return str(state_path)
+        with self._state_lock:
+            self.state["updated_at"] = _utc_now()
+            self._refresh_pipeline_status()
+            state_path = Path(self.state["state_path"])
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            if state_path.is_file():
+                persisted = json.loads(state_path.read_text(encoding="utf-8"))
+                current_revision = int(persisted.get("revision", 0))
+                if current_revision != self._loaded_revision:
+                    raise RuntimeError(
+                        "concurrent pipeline modification detected: "
+                        f"expected revision {self._loaded_revision}, found {current_revision}"
+                    )
+            next_revision = self._loaded_revision + 1
+            self.state["revision"] = next_revision
+            payload = json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True)
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{state_path.name}.",
+                suffix=".tmp",
+                dir=state_path.parent,
+            )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, state_path)
+                self._loaded_revision = next_revision
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
+            return str(state_path)
 
     def _write_artifact(
         self,
@@ -1005,10 +1027,22 @@ class BinaryPipeline:
                 raise
             descriptor["result"] = _json_safe(result)
             external_status = result.get("status") if isinstance(result, Mapping) else None
-            if external_status in {None, "ok", "success", "completed"}:
+            implicit_error = (
+                external_status is None
+                and (
+                    bool(result.get("error"))
+                    or result.get("ok") is False
+                    or result.get("success") is False
+                )
+            )
+            if external_status in {"ok", "success", "completed"} or (
+                external_status is None and not implicit_error
+            ):
                 descriptor["status"] = "completed"
+                descriptor.pop("error", None)
             elif external_status in {"pending", "deferred", "awaiting-external"}:
                 descriptor["status"] = "pending"
+                descriptor.pop("error", None)
             else:
                 descriptor["status"] = "failed"
                 descriptor["error"] = str(
@@ -1024,10 +1058,20 @@ class BinaryPipeline:
         return descriptor
 
     def run_step(self, name: str) -> dict[str, Any]:
+        with self._state_lock:
+            return self._run_step_locked(name)
+
+    def _run_step_locked(self, name: str) -> dict[str, Any]:
         """Run one named step and return the complete persistent state."""
 
         if name not in self.STEPS:
             raise ValueError(f"unknown pipeline step: {name}")
+        for dependency in self.STEPS[: self.STEPS.index(name)]:
+            dependency_step = self._step_record(dependency)
+            if dependency_step["status"] == "failed":
+                raise RuntimeError(f"dependency step failed: {dependency}")
+            if dependency_step["status"] == "pending":
+                self._run_step_locked(dependency)
         step = self._step_record(name)
         if step["status"] == "completed":
             return self.state
@@ -1076,12 +1120,7 @@ class BinaryPipeline:
             raise
         self._persist_state()
         if name == "produce":
-            report_path = self.state.get("artifacts", {}).get("report_json")
-            if report_path:
-                Path(report_path).write_text(
-                    json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True),
-                    encoding="utf-8",
-                )
+            self._rewrite_report_json()
         return self.state
 
     def run_all(self) -> dict[str, Any]:
@@ -1102,13 +1141,15 @@ class BinaryPipeline:
         elif "static" not in self.state["results"]:
             self.state["results"]["static"] = _json_safe(self._step_static())
             self._persist_state()
-        return self._build_iocs()
+        result = self._build_iocs()
+        self._rewrite_report_json()
+        return result
 
     def generate_rules(self) -> dict[str, str]:
         """Generate YARA, Sigma, and IOC artifacts and return their paths."""
 
         iocs = self.extract_iocs()
-        return {
+        result = {
             "yara_rule": self._write_artifact(
                 "yara_rule",
                 "reports/sample.yar",
@@ -1121,6 +1162,30 @@ class BinaryPipeline:
             ),
             "iocs": self._write_artifact("iocs", "reports/iocs.json", iocs),
         }
+        self._rewrite_report_json()
+        return result
+
+    def _rewrite_report_json(self) -> None:
+        report_path_value = self.state.get("artifacts", {}).get("report_json")
+        if not report_path_value:
+            return
+        report_path = Path(report_path_value)
+        snapshot = json.loads(json.dumps(self.state, ensure_ascii=False, default=str))
+        snapshot["ioc_summary"] = self._build_iocs()
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{report_path.name}.",
+            suffix=".tmp",
+            dir=report_path.parent,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(snapshot, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, report_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     def decrypt_plan(self) -> dict[str, Any]:
         """Generate the decrypt/unpack plan used by MCP wrappers."""
@@ -1157,7 +1222,8 @@ class BinaryPipeline:
                     {
                         "target": str(self.sample_path),
                         "script_source": self._render_frida_script(
-                            self.state["results"].get("static", {}).get("imports", [])
+                            self.state["results"].get("static", {}).get("imports", []),
+                            triage.get("binary_type", "unknown"),
                         ),
                         "mode": "spawn",
                         "duration_seconds": 30,
@@ -1186,11 +1252,15 @@ class BinaryPipeline:
         imports = extract_imports(data)
         packers = detect_packers(data, self._probable_section_names(strings))
         compiler = detect_compiler_language(data, imports, strings)
+        triage_tool = "triage_pe" if binary_type == "pe" else "rizin_bin_info"
+        triage_arguments = {"path": str(self.sample_path)}
+        if binary_type == "pe":
+            triage_arguments["write_markdown"] = True
         triage_handoff = self._external_handoff(
             "reverse_lab_tools",
-            "triage_pe",
-            {"path": str(self.sample_path), "write_markdown": True},
-            "Run authoritative binary triage and return structured hashes, imports, strings, and sections.",
+            triage_tool,
+            triage_arguments,
+            "Run authoritative binary-format triage and return structured metadata.",
         )
         die_handoff = self._external_handoff(
             "reverse_lab_tools",
@@ -1228,7 +1298,7 @@ class BinaryPipeline:
             "requires_unpacking": packers["requires_unpacking"],
             "compiler_language": compiler,
             "backend": {
-                "triage_pe": backend_triage,
+                triage_tool: backend_triage,
                 "die_scan": backend_die,
             },
             "handoffs": [triage_handoff, die_handoff],
@@ -1370,9 +1440,18 @@ class BinaryPipeline:
         frida_path = self._write_artifact(
             "frida_script",
             "scripts/frida_hooks.js",
-            self._render_frida_script(static.get("imports", [])),
+            self._render_frida_script(static.get("imports", []), binary_type),
         )
-        unpack_plan_path = self.decrypt_plan()["path"]
+        decrypt_plan = self.decrypt_plan()
+        unpack_plan_path = decrypt_plan["path"]
+        self.state["next_actions"] = list(
+            dict.fromkeys(
+                [
+                    *self.state.get("next_actions", []),
+                    *decrypt_plan.get("next_actions", []),
+                ]
+            )
+        )
         summary_path = static.get("ghidra", {}).get("summary_path", "")
         api_names = ",".join(
             str(item.get("name", ""))
@@ -1440,7 +1519,8 @@ class BinaryPipeline:
             Path(script_path).read_text(encoding="utf-8")
             if script_path and Path(script_path).is_file()
             else self._render_frida_script(
-                self.state["results"].get("static", {}).get("imports", [])
+                self.state["results"].get("static", {}).get("imports", []),
+                self.state["results"].get("triage", {}).get("binary_type", "unknown"),
             )
         )
         descriptor = self._external_handoff(
@@ -1588,17 +1668,19 @@ class BinaryPipeline:
         lines.append("run")
         return "\n".join(lines) + "\n"
 
-    def _render_frida_script(self, imports: Sequence[Mapping[str, Any]]) -> str:
+    def _render_frida_script(
+        self,
+        imports: Sequence[Mapping[str, Any]],
+        binary_type: str = "pe",
+    ) -> str:
         names = [
             str(item.get("name", ""))
             for item in imports
             if _import_category(str(item.get("name", "")))
             in {"crypto", "network", "anti_debug", "persistence", "file", "process", "registry"}
         ]
-        names = list(
-            dict.fromkeys(
-                names
-                + [
+        platform_defaults = (
+            [
                     "CryptEncrypt",
                     "CryptDecrypt",
                     "WinHttpSendRequest",
@@ -1611,8 +1693,20 @@ class BinaryPipeline:
                     "IsDebuggerPresent",
                     "RegSetValueExW",
                 ]
-            )
+            if binary_type == "pe"
+            else [
+                "connect",
+                "send",
+                "recv",
+                "open",
+                "read",
+                "write",
+                "dlopen",
+                "mmap",
+                "mprotect",
+            ]
         )
+        names = list(dict.fromkeys(names + platform_defaults))
         encoded_names = json.dumps(names)
         return (
             "'use strict';\n"
@@ -1703,8 +1797,17 @@ class BinaryPipeline:
                 ips.add(host)
             except ValueError:
                 domains.add(host.lower())
+        capture_result = self.state["results"].get("capture", {})
+        capture_step = self._step_record("capture")
+        capture_evidence = {}
+        if capture_step.get("status") == "completed" and isinstance(capture_result, Mapping):
+            capture_evidence = (
+                capture_result.get("capture")
+                or capture_result.get("captures")
+                or {}
+            )
         capture_text = json.dumps(
-            self.state["results"].get("capture", {}),
+            capture_evidence,
             ensure_ascii=False,
             default=str,
         )
@@ -1714,7 +1817,11 @@ class BinaryPipeline:
             match = re.match(r"https?://([^/:?#]+)", url, re.IGNORECASE)
             if match:
                 domains.add(match.group(1).lower())
-        ips.update(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", capture_text))
+        for candidate in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", capture_text):
+            try:
+                ips.add(str(ipaddress.ip_address(candidate)))
+            except ValueError:
+                continue
         dynamic_paths = set(
             re.findall(r"(?:[A-Za-z]:\\[^\"'\r\n]+|/(?:tmp|var|etc|home|opt)/[^\"'\r\n]+)", capture_text)
         )
@@ -1746,7 +1853,7 @@ class BinaryPipeline:
                     if item.get("value")
                 }.union(dynamic_registry)
             ),
-            "dynamic_capture_present": bool(self.state["results"].get("capture")),
+            "dynamic_capture_present": bool(capture_evidence),
             "generated_at": _utc_now(),
         }
 
@@ -1758,19 +1865,39 @@ class BinaryPipeline:
         rule_name = re.sub(r"[^A-Za-z0-9_]", "_", self.sample_path.stem)
         if not rule_name or rule_name[0].isdigit():
             rule_name = f"sample_{rule_name}"
-        candidates = list(iocs.get("urls", [])) + [
-            item.get("name", "")
-            for item in self.state["results"].get("static", {}).get("imports", [])
-        ]
+        rule_name = rule_name[:120]
+        high_signal_apis = {
+            "CryptEncrypt",
+            "CryptDecrypt",
+            "BCryptEncrypt",
+            "BCryptDecrypt",
+            "VirtualAllocEx",
+            "WriteProcessMemory",
+            "CreateRemoteThread",
+            "RegSetValueExW",
+            "IsDebuggerPresent",
+            "NtQueryInformationProcess",
+        }
+        candidates = (
+            list(iocs.get("urls", []))
+            + list(iocs.get("domains", []))
+            + list(iocs.get("registry", []))
+            + list(iocs.get("paths", []))
+            + [
+                item.get("name", "")
+                for item in self.state["results"].get("static", {}).get("imports", [])
+                if item.get("name") in high_signal_apis
+            ]
+        )
         candidates = [str(value) for value in dict.fromkeys(candidates) if len(str(value)) >= 4]
         strings = [
             f'        $s{index} = "{self._yara_escape(value)}" ascii wide'
             for index, value in enumerate(candidates[:16], start=1)
         ]
-        if len(strings) >= 2:
+        if len(strings) >= 3:
             condition = (
                 f'hash.sha256(0, filesize) == "{iocs["hashes"]["sha256"]}" '
-                "or 2 of ($s*)"
+                "or 3 of ($s*)"
             )
         else:
             condition = f'hash.sha256(0, filesize) == "{iocs["hashes"]["sha256"]}"'
@@ -1808,8 +1935,8 @@ class BinaryPipeline:
                     f"    Image|endswith: {json.dumps(chr(92) + self.sample_path.name)}",
                     "  selection_hash:",
                     f"    Hashes|contains: {json.dumps('SHA256=' + sha256)}",
-                    "  condition: 1 of selection_*",
-                    "level: high",
+                    "  condition: selection_hash",
+                    "level: medium",
                     "tags:",
                     "  - attack.execution",
                 ]
@@ -1838,11 +1965,29 @@ class BinaryPipeline:
                     ]
                 )
             )
-        network_values = list(iocs.get("domains", [])) + list(iocs.get("ip_addresses", []))
-        if network_values:
-            values = "\n".join(
-                f"      - {json.dumps(value)}" for value in network_values[:20]
-            )
+        domains = list(iocs.get("domains", []))
+        ip_values = list(iocs.get("ip_addresses", []))
+        if domains or ip_values:
+            network_lines = []
+            conditions = []
+            if domains:
+                network_lines.extend(
+                    [
+                        "  selection_hostname:",
+                        "    DestinationHostname|contains:",
+                        *[f"      - {json.dumps(value)}" for value in domains[:20]],
+                    ]
+                )
+                conditions.append("selection_hostname")
+            if ip_values:
+                network_lines.extend(
+                    [
+                        "  selection_ip:",
+                        "    DestinationIp:",
+                        *[f"      - {json.dumps(value)}" for value in ip_values[:20]],
+                    ]
+                )
+                conditions.append("selection_ip")
             documents.append(
                 "\n".join(
                     [
@@ -1852,10 +1997,8 @@ class BinaryPipeline:
                         "logsource:",
                         "  category: network_connection",
                         "detection:",
-                        "  selection:",
-                        "    DestinationHostname|contains:",
-                        values,
-                        "  condition: selection",
+                        *network_lines,
+                        f"  condition: {' or '.join(conditions)}",
                         "level: high",
                         "tags:",
                         "  - attack.command-and-control",
