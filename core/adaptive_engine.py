@@ -115,7 +115,7 @@ class AdaptiveEngine:
         raw = json.dumps(plan.get("layers", []), ensure_ascii=False, sort_keys=True, default=list)
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    async def execute(self, target: str, *, mode: str = "fast", phases: list[str] | None = None, plan: dict[str, Any] | None = None, runner: Runner, use_cache: bool = True) -> dict[str, Any]:
+    async def execute(self, target: str, *, mode: str = "fast", phases: list[str] | None = None, plan: dict[str, Any] | None = None, runner: Runner, use_cache: bool = True, adaptive_routing: bool = False, stop_on_proof: bool = False) -> dict[str, Any]:
         plan = plan or self.plan(target, mode, phases)
         profile = get_mode_profile(plan.get("profile", mode))
         signature = self._signature(plan)
@@ -132,6 +132,9 @@ class AdaptiveEngine:
         tool_time_ms = 0.0
         skipped: list[str] = []
         timed_out = 0
+        observed_signals: set[str] = set()
+        routing_skipped = 0
+        early_stop_reason = ""
 
         async def run_one(agent: str, semaphore: asyncio.Semaphore) -> tuple[dict[str, Any], float]:
             if not budget.reserve_tool(agent):
@@ -150,10 +153,13 @@ class AdaptiveEngine:
 
         semaphore = asyncio.Semaphore(profile.concurrency)
         wall_started = time.monotonic()
+        signal_routes = {"jwt-vuln": {"jwt", "token", "api"}, "idor-vuln": {"idor", "authorization", "object", "api"}, "sqli-vuln": {"sql", "database", "parameter"}, "xss-vuln": {"xss", "javascript", "html", "parameter"}, "ssrf-vuln": {"ssrf", "url", "callback", "webhook"}, "ssti-vuln": {"ssti", "template"}, "xxe-vuln": {"xxe", "xml"}, "cors-vuln": {"cors", "origin", "api"}}
         for layer in plan.get("layers", []):
             selected = []
             for agent in layer:
-                if budget.remaining_tools <= 0 or budget.remaining_s <= 0:
+                if adaptive_routing and agent in signal_routes and observed_signals and not (signal_routes[agent] & observed_signals):
+                    skipped.append(agent); routing_skipped += 1
+                elif budget.remaining_tools <= 0 or budget.remaining_s <= 0:
                     skipped.append(agent)
                 else:
                     selected.append(agent)
@@ -164,6 +170,12 @@ class AdaptiveEngine:
                 results.append(result)
                 tool_time_ms += duration
                 timed_out += result.get("status") == "timeout"
+                signals = result.get("signals", [])
+                if isinstance(signals, str): signals = [signals]
+                observed_signals.update(str(x).lower() for x in signals)
+            if stop_on_proof and any(str(r.get("proof_status", "")).lower() in {"confirmed", "reproduced"} for r in results):
+                early_stop_reason = "confirmed_proof"
+                break
             if budget.remaining_s <= 0:
                 break
         wall_time_ms = (time.monotonic() - wall_started) * 1000
@@ -171,6 +183,7 @@ class AdaptiveEngine:
             "profile": profile.name, "wall_time_ms": round(wall_time_ms, 3), "tool_time_ms": round(tool_time_ms, 3),
             "parallelism_saved_ms": round(max(0.0, tool_time_ms - wall_time_ms), 3), "tools_started": len(budget.tools_started),
             "tools_skipped": len(skipped), "skipped_agents": skipped, "timeouts": timed_out, "cache_hit": False,
+            "routing_skipped": routing_skipped, "observed_signals": sorted(observed_signals), "early_stop_reason": early_stop_reason,
             "budget": {"wall_time_s": profile.wall_time_s, "max_tools": profile.max_tools, "concurrency": profile.concurrency, "output_limit_bytes": profile.output_limit_bytes},
         }
         envelope = ResultCompactor(self.artifact_dir, profile.output_limit_bytes, profile.top_findings).compact(target=target, profile=profile.name, results=results, metrics=metrics)

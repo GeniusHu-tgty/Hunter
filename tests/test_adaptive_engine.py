@@ -80,3 +80,31 @@ async def test_benchmark_proves_speed_cache_and_compression(tmp_path):
     assert result["speedup"] > 1.3
     assert result["cache"]["hit"] is True
     assert result["compression"]["ratio"] < 0.4
+import asyncio
+import pytest
+from core.adaptive_engine import AdaptiveEngine
+from core.recon_cache import ReconCache
+
+@pytest.mark.asyncio
+async def test_signal_routing_skips_irrelevant_vulnerability_agents(tmp_path):
+    calls=[]
+    async def runner(name,target,**kwargs):
+        calls.append(name)
+        if name=='recon': return {'status':'success','signals':['jwt','api']}
+        return {'status':'success'}
+    engine=AdaptiveEngine(ReconCache(tmp_path/'cache'),tmp_path/'artifacts')
+    plan={'profile':'standard','layers':[('recon',),('jwt-vuln','idor-vuln','sqli-vuln','xss-vuln')]}
+    result=await engine.execute('x.test',plan=plan,runner=runner,use_cache=False,adaptive_routing=True)
+    assert 'jwt-vuln' in calls and 'sqli-vuln' not in calls and 'xss-vuln' not in calls
+    assert result['metrics']['routing_skipped']>=2
+
+@pytest.mark.asyncio
+async def test_confirmed_proof_stops_later_layers(tmp_path):
+    calls=[]
+    async def runner(name,target,**kwargs):
+        calls.append(name)
+        return {'status':'success','proof_status':'confirmed'} if name=='proof' else {'status':'success'}
+    engine=AdaptiveEngine(ReconCache(tmp_path/'cache'),tmp_path/'artifacts')
+    plan={'profile':'fast','layers':[('proof',),('late-a','late-b')]}
+    result=await engine.execute('x.test',plan=plan,runner=runner,use_cache=False,stop_on_proof=True)
+    assert calls==['proof']; assert result['metrics']['early_stop_reason']=='confirmed_proof'

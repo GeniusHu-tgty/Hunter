@@ -29,3 +29,7 @@ Raw results are retained under `evidence/adaptive_raw/`. MCP responses contain o
 ## Metrics
 
 Every run reports wall time, accumulated tool time, estimated parallelism savings, tools started/skipped, timeouts, cache hit, output bytes, and compaction ratio.
+
+## Adaptive routing and proof stop
+
+`hunter_fast_scan` now enables signal-aware routing and proof-aware early stopping. Vulnerability agents with no supporting signals are skipped, and later DAG layers stop after a result reports `proof_status=confirmed|reproduced`. Metrics expose `routing_skipped`, `observed_signals`, and `early_stop_reason` so cost savings remain auditable.

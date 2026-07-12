@@ -608,7 +608,7 @@ async def hunter_scan(
 @mcp.tool()
 async def hunter_fast_scan(target: str, phases: Optional[List[str]] = None, use_cache: bool = True) -> str:
     """Run the low-cost fast adaptive profile and return a compact evidence envelope."""
-    result = await _adaptive_engine.execute(target, mode="fast", phases=phases, runner=_execute_agent_async, use_cache=use_cache)
+    result = await _adaptive_engine.execute(target, mode="fast", phases=phases, runner=_execute_agent_async, use_cache=use_cache, adaptive_routing=True, stop_on_proof=True)
     compact = result.get("compact", {})
     return _json_dumps({"status": result.get("status"), "target": target, "profile": "fast", "summary": compact.get("summary", {}), "signals": compact.get("signals", []), "top_findings": compact.get("top_findings", []), "artifact_path": compact.get("artifact_path"), "bytes": compact.get("bytes", {}), "metrics": result.get("metrics", {}), "plan": result.get("plan", {})})
 
