@@ -1,7 +1,7 @@
 {
   "contract_version": "1.0",
   "server_name": "hunter_tools",
-  "minimum_tool_count": 65,
+  "minimum_tool_count": 80,
   "workspace_schema_version": "1.0",
   "required_tools": [
     "hunter_scan",
@@ -68,7 +68,23 @@
     "hunter_scan_plan",
     "hunter_scan_benchmark",
     "hunter_cache_status",
-    "hunter_cache_clear"
+    "hunter_cache_clear",
+    "hunter_workflow_create",
+    "hunter_workflow_open",
+    "hunter_workflow_status",
+    "hunter_workflow_route",
+    "hunter_workflow_plan",
+    "hunter_workflow_run",
+    "hunter_workflow_transition",
+    "hunter_workflow_checkpoint",
+    "hunter_workflow_resume",
+    "hunter_workflow_policy",
+    "hunter_hypothesis_add",
+    "hunter_evidence_register",
+    "hunter_finding_promote",
+    "hunter_backend_status",
+    "hunter_lane_catalog"
   ],
-  "adaptive_engine_version": "1.0"
+  "adaptive_engine_version": "1.0",
+  "workflow_kernel_version": "2.0"
 }

@@ -534,6 +534,21 @@ class HunterToolsFacade:
 
     def capabilities(self) -> Dict[str, Any]:
         tools = {
+            "hunter_workflow_create": {"category": "workflow", "description": "Create workflow-state-v2 case"},
+            "hunter_workflow_open": {"category": "workflow", "description": "Open materialized workflow state"},
+            "hunter_workflow_status": {"category": "workflow", "description": "Read compact workflow status"},
+            "hunter_workflow_route": {"category": "workflow", "description": "Route targets and artifacts into analysis lanes"},
+            "hunter_workflow_plan": {"category": "workflow", "description": "Build bounded backend capability plan"},
+            "hunter_workflow_run": {"category": "workflow", "description": "Run native actions and emit external MCP handoffs"},
+            "hunter_workflow_transition": {"category": "workflow", "description": "Validate phase gate and transition"},
+            "hunter_workflow_checkpoint": {"category": "workflow", "description": "Persist immutable workflow checkpoint"},
+            "hunter_workflow_resume": {"category": "workflow", "description": "Resume from checkpoint or event state"},
+            "hunter_workflow_policy": {"category": "workflow", "description": "Configure interactive or autopilot policy"},
+            "hunter_hypothesis_add": {"category": "workflow", "description": "Register a testable hypothesis"},
+            "hunter_evidence_register": {"category": "workflow", "description": "Register normalized evidence"},
+            "hunter_finding_promote": {"category": "workflow", "description": "Promote evidence-backed finding"},
+            "hunter_backend_status": {"category": "workflow", "description": "Inspect backend capability contracts"},
+            "hunter_lane_catalog": {"category": "workflow", "description": "List unified CTF workflow lanes"},
             "hunter_kb_list": {"category": "kb", "description": "List Hunter markdown techniques and YAML payload files"},
             "hunter_kb_search": {"category": "kb", "description": "Search Hunter KB by signal/query"},
             "hunter_kb_read": {"category": "kb", "description": "Read a Hunter KB file under payloads/"},
@@ -551,6 +566,13 @@ class HunterToolsFacade:
                 "tool_style": "reverse_lab_tools-compatible",
                 "return_style": "dict for hunter_tools_mcp, JSON string for legacy mcp_server compatibility",
                 "tools": tools,
+                "workflow_kernel": {
+                    "schema_version": "2.0",
+                    "event_schema_version": "1.0",
+                    "lanes": ["web", "api", "source", "javascript", "pe", "apk", "firmware", "script", "document", "protocol", "capture", "pwn", "crypto", "mixed"],
+                    "policies": ["interactive", "guided", "autopilot"],
+                    "external_backends": ["reverse_lab_tools", "ghidra", "jshook"],
+                },
                 "workflow": [
                     "hunter_kb_search(query)",
                     "hunter_kb_read(path)",

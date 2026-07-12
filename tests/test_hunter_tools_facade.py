@@ -141,3 +141,14 @@ def test_generic_burp_bridge_filters_irrelevant_wrapper_kwargs(facade):
     )
     assert proxy["status"] == "ok"
     assert proxy["data"]["action"]["tool"] == "get_proxy_http_history_regex"
+from core.hunter_tools_facade import HunterToolsFacade
+
+
+def test_facade_exposes_workflow_kernel_capabilities():
+    result = HunterToolsFacade().capabilities()
+    tools = result["data"]["tools"]
+    assert "hunter_workflow_create" in tools
+    assert "hunter_workflow_plan" in tools
+    assert "hunter_backend_status" in tools
+    assert result["data"]["workflow_kernel"]["schema_version"] == "2.0"
+    assert {"pe", "apk", "javascript", "mixed"} <= set(result["data"]["workflow_kernel"]["lanes"])

@@ -45,6 +45,7 @@ from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
 from core.doctor import HunterDoctor
 from core.adaptive_engine import AdaptiveEngine, get_mode_profile
 from core.recon_cache import ReconCache
+from core.workflow import WorkflowKernel, WorkflowPolicy
 
 # ============================================================
 # MCP Server
@@ -71,6 +72,11 @@ def _reset_workspace_adapter(root: Optional[str | Path] = None) -> OpenTgtyLabWo
     global _workspace
     _workspace = OpenTgtyLabWorkspaceAdapter(root)
     return _workspace
+def _workflow_kernel() -> WorkflowKernel:
+    """Bind workflow persistence to the active OpenTgtyLab workspace."""
+    return WorkflowKernel(_workspace.root)
+
+
 _WORDLIST_ALIASES = {
     "default": "common.txt",
     "common": "common.txt",
@@ -1144,6 +1150,21 @@ async def hunter_capabilities() -> str:
     """Return the actual Hunter MCP capability matrix for agent-side routing."""
     registered = set(_registered_hunter_tools())
     definitions = {
+        "hunter_workflow_create": ("workflow", "Create workflow-state-v2 case"),
+        "hunter_workflow_open": ("workflow", "Open materialized workflow state"),
+        "hunter_workflow_status": ("workflow", "Read compact workflow status"),
+        "hunter_workflow_route": ("workflow", "Route target/artifact lanes"),
+        "hunter_workflow_plan": ("workflow", "Build bounded backend plan"),
+        "hunter_workflow_run": ("workflow", "Run bounded native actions and emit external handoffs"),
+        "hunter_workflow_transition": ("workflow", "Validate phase gate and transition"),
+        "hunter_workflow_checkpoint": ("workflow", "Persist workflow checkpoint"),
+        "hunter_workflow_resume": ("workflow", "Resume workflow state"),
+        "hunter_workflow_policy": ("workflow", "Configure interactive/autopilot policy"),
+        "hunter_hypothesis_add": ("workflow", "Register testable hypothesis"),
+        "hunter_evidence_register": ("workflow", "Register normalized evidence"),
+        "hunter_finding_promote": ("workflow", "Promote evidence-backed finding"),
+        "hunter_backend_status": ("workflow", "Inspect backend capability contracts"),
+        "hunter_lane_catalog": ("workflow", "List CTF workflow lanes"),
         "hunter_recon": ("pipeline", "Recon pipeline"),
         "hunter_vuln_scan": ("pipeline", "Recon + vulnerability-analysis pipeline"),
         "hunter_scan": ("pipeline", "Configurable full pipeline"),
@@ -1694,6 +1715,80 @@ async def hunter_report(session_id: str, format: str = "markdown", style: str = 
     else:
         return _render_markdown_report(session, style=style)
 
+
+
+# ============================================================
+# Unified CTF / reverse / pentest workflow kernel
+# ============================================================
+
+def _workflow_result(tool: str, func, *args, **kwargs) -> str:
+    try:
+        return _json_dumps({"tool": tool, "status": "ok", "data": func(*args, **kwargs), "evidence": {}, "next_actions": []})
+    except Exception as exc:
+        return _json_dumps({"tool": tool, "status": "error", "error_type": type(exc).__name__, "error": str(exc), "data": {}, "evidence": {}, "next_actions": []})
+
+@mcp.tool()
+async def hunter_workflow_create(case_slug: str, objective: str, inputs: Optional[List[Dict[str, Any]]] = None, mode: str = "interactive") -> str:
+    return _workflow_result("hunter_workflow_create", _workflow_kernel().create, case_slug, objective, inputs or [], mode)
+
+@mcp.tool()
+async def hunter_workflow_open(case_slug: str) -> str:
+    return _workflow_result("hunter_workflow_open", _workflow_kernel().open, case_slug)
+
+@mcp.tool()
+async def hunter_workflow_status(case_slug: str) -> str:
+    return _workflow_result("hunter_workflow_status", _workflow_kernel().status, case_slug)
+
+@mcp.tool()
+async def hunter_workflow_route(inputs: Optional[List[Dict[str, Any]]] = None) -> str:
+    return _workflow_result("hunter_workflow_route", _workflow_kernel().route, inputs or [])
+
+@mcp.tool()
+async def hunter_workflow_plan(case_slug: str, max_actions: int = 5) -> str:
+    return _workflow_result("hunter_workflow_plan", _workflow_kernel().plan, case_slug, max_actions)
+
+@mcp.tool()
+async def hunter_workflow_run(case_slug: str, max_actions: int = 5) -> str:
+    def execute_native(action):
+        return {"status": "deferred", "summary": "Native MCP dispatch is emitted as a bounded action for the Codex orchestrator.", "action": action}
+    return _workflow_result("hunter_workflow_run", _workflow_kernel().run, case_slug, execute_native, max_actions)
+
+@mcp.tool()
+async def hunter_workflow_transition(case_slug: str, phase: str, deliverables: Optional[Dict[str, Any]] = None) -> str:
+    return _workflow_result("hunter_workflow_transition", _workflow_kernel().transition, case_slug, phase, deliverables or {})
+
+@mcp.tool()
+async def hunter_workflow_checkpoint(case_slug: str, source_session: str = "") -> str:
+    return _workflow_result("hunter_workflow_checkpoint", _workflow_kernel().checkpoint, case_slug, source_session)
+
+@mcp.tool()
+async def hunter_workflow_resume(case_slug: str, checkpoint_id: str = "") -> str:
+    return _workflow_result("hunter_workflow_resume", _workflow_kernel().resume, case_slug, checkpoint_id)
+
+@mcp.tool()
+async def hunter_workflow_policy(case_slug: str, mode: str = "interactive", max_tool_calls: int = 8, max_escalation: int = 2, stop_on_proof: bool = True) -> str:
+    policy = WorkflowPolicy(mode=mode, max_tool_calls=max_tool_calls, max_escalation=max_escalation, stop_on_proof=stop_on_proof)
+    return _workflow_result("hunter_workflow_policy", _workflow_kernel().set_policy, case_slug, policy)
+
+@mcp.tool()
+async def hunter_hypothesis_add(case_slug: str, claim: str, confidence: float = 0.5, validation_step: Optional[Dict[str, Any]] = None) -> str:
+    return _workflow_result("hunter_hypothesis_add", _workflow_kernel().add_hypothesis, case_slug, claim, confidence, validation_step)
+
+@mcp.tool()
+async def hunter_evidence_register(case_slug: str, summary: str, source: str, path_or_url: str = "", evidence_type: str = "note", confidence: str = "medium", sha256: str = "") -> str:
+    return _workflow_result("hunter_evidence_register", _workflow_kernel().register_evidence, case_slug, summary, source, path_or_url, evidence_type, confidence, sha256)
+
+@mcp.tool()
+async def hunter_finding_promote(case_slug: str, title: str, status: str, evidence_ids: List[str], severity: str = "Info") -> str:
+    return _workflow_result("hunter_finding_promote", _workflow_kernel().promote_finding, case_slug, title, status, evidence_ids, severity)
+
+@mcp.tool()
+async def hunter_backend_status() -> str:
+    return _workflow_result("hunter_backend_status", _workflow_kernel().backend_status)
+
+@mcp.tool()
+async def hunter_lane_catalog() -> str:
+    return _workflow_result("hunter_lane_catalog", _workflow_kernel().lane_catalog)
 
 # ============================================================
 # Entry Point

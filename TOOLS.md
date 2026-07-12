@@ -1,10 +1,21 @@
+
+## Workflow Kernel (15)
+
+- `hunter_workflow_create`, `hunter_workflow_open`, `hunter_workflow_status`
+- `hunter_workflow_route`, `hunter_workflow_plan`, `hunter_workflow_transition`
+- `hunter_workflow_checkpoint`, `hunter_workflow_resume`, `hunter_workflow_policy`
+- `hunter_hypothesis_add`, `hunter_evidence_register`, `hunter_finding_promote`
+- `hunter_backend_status`, `hunter_lane_catalog`
+
+The kernel stores `workflow.events.jsonl`, materializes `workflow.json`, and emits immutable files under `cases/<slug>/checkpoints/`. PE/APK/JavaScript/mixed plans reference external MCP capabilities instead of copying reverse tooling.
+
 # Hunter Pentest Framework - Tools Inventory
 # Generated: 2026-06-05 23:50:33
 
 
 ## MCP v8.1 Tool Surface
 
-- Total complete `hunter_tools` MCP tools: 45
+- Total complete `hunter_tools` MCP tools: 80
 - Meta/orchestration: `hunter_healthcheck`, `hunter_capabilities`, `hunter_recommend_next`, `hunter_agents_list`, `hunter_phases_list`
 - Pipelines: `hunter_scan`, `hunter_recon`, `hunter_vuln_scan`
 - Recon atomics: `hunter_subdomain`, `hunter_port_scan`, `hunter_tech_detect`, `hunter_dir_enum`, `hunter_js_analyze`
