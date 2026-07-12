@@ -900,14 +900,7 @@ class BinaryPipeline:
             self._refresh_pipeline_status()
             state_path = Path(self.state["state_path"])
             state_path.parent.mkdir(parents=True, exist_ok=True)
-            if state_path.is_file():
-                persisted = json.loads(state_path.read_text(encoding="utf-8"))
-                current_revision = int(persisted.get("revision", 0))
-                if current_revision != self._loaded_revision:
-                    raise RuntimeError(
-                        "concurrent pipeline modification detected: "
-                        f"expected revision {self._loaded_revision}, found {current_revision}"
-                    )
+            self._assert_current_revision()
             next_revision = self._loaded_revision + 1
             self.state["revision"] = next_revision
             payload = json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True)
@@ -928,6 +921,18 @@ class BinaryPipeline:
                     os.unlink(temporary_path)
             return str(state_path)
 
+    def _assert_current_revision(self) -> None:
+        state_path = Path(self.state["state_path"])
+        if not state_path.is_file():
+            return
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        current_revision = int(persisted.get("revision", 0))
+        if current_revision != self._loaded_revision:
+            raise RuntimeError(
+                "concurrent pipeline modification detected: "
+                f"expected revision {self._loaded_revision}, found {current_revision}"
+            )
+
     def _write_artifact(
         self,
         name: str,
@@ -936,6 +941,7 @@ class BinaryPipeline:
     ) -> str:
         """Atomically write an artifact within the pipeline output directory."""
 
+        self._assert_current_revision()
         artifact_path = (self.output_dir / Path(relative_path)).resolve()
         try:
             artifact_path.relative_to(self.output_dir.resolve())
@@ -1066,6 +1072,7 @@ class BinaryPipeline:
 
         if name not in self.STEPS:
             raise ValueError(f"unknown pipeline step: {name}")
+        self._assert_current_revision()
         for dependency in self.STEPS[: self.STEPS.index(name)]:
             dependency_step = self._step_record(dependency)
             if dependency_step["status"] == "failed":
@@ -1101,6 +1108,12 @@ class BinaryPipeline:
                 step_status = str(explicit_status or "completed")
             if step_status not in {"completed", "awaiting-external"}:
                 raise ValueError(f"invalid step status returned by {name}: {step_status}")
+            if name == "produce" and any(
+                item["status"] == "awaiting-external"
+                for item in self.state["steps"][: self.STEPS.index(name)]
+            ):
+                result["partial"] = True
+                step_status = "awaiting-external"
             self.state["results"][name] = result
             step["status"] = step_status
             step["completed_at"] = _utc_now()
@@ -1776,27 +1789,42 @@ class BinaryPipeline:
         triage = self.state["results"].get("triage", {})
         static = self.state["results"].get("static", {})
         groups = static.get("string_groups", {})
-        urls = sorted({str(item.get("value", "")) for item in groups.get("urls", [])})
-        domains = {
+        static_urls = {
+            str(item.get("value", ""))
+            for item in groups.get("urls", [])
+            if item.get("value")
+        }
+        static_domains = {
             str(item.get("value", ""))
             for item in groups.get("domains", [])
             if item.get("value")
         }
-        ips = {
+        static_ips = {
             str(item.get("value", ""))
             for item in groups.get("ip_addresses", [])
             if item.get("value")
         }
-        for url in urls:
+        static_paths = {
+            str(item.get("value", ""))
+            for item in groups.get("paths", [])
+            if item.get("value")
+        }
+        static_registry = {
+            str(item.get("value", ""))
+            for category in ("registry", "persistence")
+            for item in groups.get(category, [])
+            if item.get("value")
+        }
+        for url in static_urls:
             match = re.match(r"https?://([^/:?#]+)", url, re.IGNORECASE)
             if not match:
                 continue
             host = match.group(1)
             try:
                 ipaddress.ip_address(host)
-                ips.add(host)
+                static_ips.add(host)
             except ValueError:
-                domains.add(host.lower())
+                static_domains.add(host.lower())
         capture_result = self.state["results"].get("capture", {})
         capture_step = self._step_record("capture")
         capture_evidence = {}
@@ -1811,15 +1839,16 @@ class BinaryPipeline:
             ensure_ascii=False,
             default=str,
         )
-        dynamic_urls = re.findall(r"https?://[^\s\"'<>]+", capture_text)
-        urls = sorted(set(urls).union(dynamic_urls))
+        dynamic_urls = set(re.findall(r"https?://[^\s\"'<>]+", capture_text))
+        dynamic_domains = set()
+        dynamic_ips = set()
         for url in dynamic_urls:
             match = re.match(r"https?://([^/:?#]+)", url, re.IGNORECASE)
             if match:
-                domains.add(match.group(1).lower())
+                dynamic_domains.add(match.group(1).lower())
         for candidate in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", capture_text):
             try:
-                ips.add(str(ipaddress.ip_address(candidate)))
+                dynamic_ips.add(str(ipaddress.ip_address(candidate)))
             except ValueError:
                 continue
         dynamic_paths = set(
@@ -1832,27 +1861,49 @@ class BinaryPipeline:
                 re.IGNORECASE,
             )
         )
+        combined = {
+            "urls": sorted(static_urls | dynamic_urls),
+            "domains": sorted(static_domains | dynamic_domains),
+            "ip_addresses": sorted(static_ips | dynamic_ips),
+            "paths": sorted(static_paths | dynamic_paths),
+            "registry": sorted(static_registry | dynamic_registry),
+        }
+        static_sets = {
+            "urls": static_urls,
+            "domains": static_domains,
+            "ip_addresses": static_ips,
+            "paths": static_paths,
+            "registry": static_registry,
+        }
+        dynamic_sets = {
+            "urls": dynamic_urls,
+            "domains": dynamic_domains,
+            "ip_addresses": dynamic_ips,
+            "paths": dynamic_paths,
+            "registry": dynamic_registry,
+        }
+        sources = {
+            category: [
+                {
+                    "value": value,
+                    "sources": [
+                        source
+                        for source, values in (
+                            ("static", static_sets[category]),
+                            ("dynamic", dynamic_sets[category]),
+                        )
+                        if value in values
+                    ],
+                }
+                for value in combined[category]
+            ]
+            for category in combined
+        }
         return {
             "sample": self.sample_path.name,
             "hashes": triage.get("hashes", compute_hashes(self.sample_path)),
-            "urls": urls,
-            "domains": sorted(domains),
-            "ip_addresses": sorted(ips),
-            "paths": sorted(
-                {
-                    str(item.get("value", ""))
-                    for item in groups.get("paths", [])
-                    if item.get("value")
-                }.union(dynamic_paths)
-            ),
-            "registry": sorted(
-                {
-                    str(item.get("value", ""))
-                    for category in ("registry", "persistence")
-                    for item in groups.get(category, [])
-                    if item.get("value")
-                }.union(dynamic_registry)
-            ),
+            **combined,
+            "sources": sources,
             "dynamic_capture_present": bool(capture_evidence),
             "generated_at": _utc_now(),
         }
@@ -1894,13 +1945,7 @@ class BinaryPipeline:
             f'        $s{index} = "{self._yara_escape(value)}" ascii wide'
             for index, value in enumerate(candidates[:16], start=1)
         ]
-        if len(strings) >= 3:
-            condition = (
-                f'hash.sha256(0, filesize) == "{iocs["hashes"]["sha256"]}" '
-                "or 3 of ($s*)"
-            )
-        else:
-            condition = f'hash.sha256(0, filesize) == "{iocs["hashes"]["sha256"]}"'
+        condition = f'hash.sha256(0, filesize) == "{iocs["hashes"]["sha256"]}"'
         return "\n".join(
             [
                 "import \"hash\"",
@@ -1909,6 +1954,7 @@ class BinaryPipeline:
                 "    meta:",
                 f'        description = "Hunter reverse pipeline signature for {self._yara_escape(self.sample_path.name)}"',
                 f'        sha256 = "{iocs["hashes"]["sha256"]}"',
+                '        candidate_strings = "Analyst refinement only; not used in the automatic condition"',
                 "    strings:",
                 *(strings or ['        $fallback = "Hunter reverse pipeline"']),
                 "    condition:",

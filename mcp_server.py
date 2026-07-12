@@ -1383,15 +1383,20 @@ def _load_reverse_pipeline(pipeline_id: str):
     root = REVERSE_PIPELINE_ROOT.expanduser().resolve()
     state_path = root / pipeline_id / "state.json"
     if not state_path.is_file():
-        state_path = next(
-            (
-                candidate
-                for candidate in root.rglob("state.json")
-                if json.loads(candidate.read_text(encoding="utf-8")).get("pipeline_id")
-                == pipeline_id
-            ),
-            None,
-        )
+        state_path = None
+        for candidate in root.rglob("state.json"):
+            resolved_candidate = candidate.resolve()
+            if root not in resolved_candidate.parents:
+                continue
+            try:
+                candidate_state = json.loads(
+                    resolved_candidate.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if candidate_state.get("pipeline_id") == pipeline_id:
+                state_path = resolved_candidate
+                break
     if state_path is None or not state_path.is_file():
         raise KeyError(f"reverse pipeline not found: {pipeline_id}")
     resolved_state = state_path.resolve()

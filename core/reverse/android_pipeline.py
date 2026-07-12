@@ -334,8 +334,7 @@ class AndroidPipeline(BinaryPipeline):
         result["apktool"] = apktool_result
         result["handoffs"] = []
         if not result["decoded"]:
-            result["handoffs"].append(
-                self._external_handoff(
+            baseline = self._external_handoff(
                     "reverse_lab_tools",
                     "android_app_baseline",
                     {
@@ -345,8 +344,20 @@ class AndroidPipeline(BinaryPipeline):
                         "grant_permissions": False,
                     },
                     "Collect an Android baseline while preserving the APK; apktool is required locally to decode binary AXML.",
-                )
             )
+            result["handoffs"].append(baseline)
+            baseline_result = baseline.get("result", {})
+            if isinstance(baseline_result, dict):
+                baseline_summary = baseline_result.get("summary", {})
+                result["package"] = (
+                    result["package"]
+                    or baseline_result.get("package_name", "")
+                    or (
+                        baseline_summary.get("package_name", "")
+                        if isinstance(baseline_summary, dict)
+                        else ""
+                    )
+                )
         if result["package"]:
             result["handoffs"].append(
                 self._external_handoff(
@@ -533,7 +544,12 @@ class AndroidPipeline(BinaryPipeline):
                     continue
                 payload = archive.read(entry)
                 remaining -= len(payload)
-                values.extend(item["value"] for item in extract_strings(payload))
+                for item in extract_strings(payload):
+                    text = item["value"]
+                    values.extend(re.findall(r"https?://[^\s\"'<>]+", text))
+                    values.extend(re.findall(r"(?:content|file)://[^\s\"'<>]+", text))
+                    values.extend(re.findall(r"/(?:data|sdcard|storage)/[^\s\"'<>]+", text))
+                    values.extend(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text))
         normalized_values = []
         for value in dict.fromkeys(values):
             text = str(value).strip()
@@ -634,7 +650,14 @@ class AndroidPipeline(BinaryPipeline):
     def _step_capture(self) -> dict[str, Any]:
         hook_path = self.state.get("artifacts", {}).get("android_frida_hooks")
         frontend = self.state["results"].get("android_frontend", {})
-        target = frontend.get("package") or "<package-or-process>"
+        target = frontend.get("package", "")
+        if not target:
+            return {
+                "status": "awaiting-external",
+                "handoffs": frontend.get("handoffs", []),
+                "captures": {},
+                "message": "Android package name is unresolved; complete the manifest/baseline handoff first.",
+            }
         native_architectures = self.state["results"].get("native", {}).get("architectures", [])
         frida_arch = {
             "arm64-v8a": "android-arm64",
@@ -713,7 +736,7 @@ class AndroidPipeline(BinaryPipeline):
         if self._step_record("android_frontend")["status"] == "pending":
             self.run_step("android_frontend")
         frontend = self.state["results"].get("android_frontend", {})
-        package_name = frontend.get("package") or "<package-name>"
+        package_name = frontend.get("package", "")
         content = "\n".join(
             [
                 "# Android Decrypt and Unpack Plan",
@@ -734,6 +757,19 @@ class AndroidPipeline(BinaryPipeline):
             "plans/android-decrypt-unpack-plan.md",
             content,
         )
+        if not package_name:
+            return {
+                "path": path,
+                "content": content,
+                "requires_unpacking": bool(
+                    self.state["results"].get("triage", {}).get("requires_unpacking")
+                ),
+                "detected_packers": self.state["results"].get("triage", {}).get("detected_packers", []),
+                "handoffs": frontend.get("handoffs", []),
+                "next_actions": [
+                    "Resolve the Android package name with apktool or android_app_baseline before dynamic capture."
+                ],
+            }
         handoffs = [
             self._external_handoff(
                 "reverse_lab_tools",
