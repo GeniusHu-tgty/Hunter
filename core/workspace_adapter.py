@@ -39,12 +39,17 @@ class OpenTgtyLabWorkspaceAdapter:
                 candidates.append(Path(os.environ[name]).expanduser())
         cwd = Path.cwd().resolve()
         candidates.extend([cwd, *cwd.parents])
-        candidates.extend([Path(r"D:\Open-tgtylab"), Path.home() / "Open-tgtylab"])
+        candidates.extend([Path.home() / "Open-tgtylab", Path.home() / "Open-tgtyLab"])
         for candidate in candidates:
             resolved = candidate.resolve()
             if cls._looks_like_workspace(resolved):
                 return resolved
-        return (Path(explicit).expanduser().resolve() if explicit else Path(r"D:\Open-tgtylab").resolve())
+        if explicit:
+            return Path(explicit).expanduser().resolve()
+        for name in _ENV_NAMES:
+            if os.environ.get(name):
+                return Path(os.environ[name]).expanduser().resolve()
+        return cwd
 
     @staticmethod
     def _looks_like_workspace(path: Path) -> bool:

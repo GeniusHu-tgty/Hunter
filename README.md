@@ -353,3 +353,14 @@ This copies Burp-exported request/response/screenshots/evidence files into Hunte
 ## Related Projects
 
 - [Open-tgtylab](https://github.com/GeniusHu-tgty/Open-tgtylab) — 安全研究工作台，集成逆向工程、CTF、移动安全、Web安全于一体
+
+## Integration v2 diagnostics
+
+Hunter publishes `integration-contract.json` as the machine-readable compatibility contract. The complete MCP provides:
+
+- `hunter_contract_check`
+- `hunter_config_audit`
+- `hunter_runtime_status`
+- `hunter_doctor`
+
+Run `hunter_doctor` after install/update or when the MCP registry changes. CI tests the contract and complete pytest suite on Windows and Linux.

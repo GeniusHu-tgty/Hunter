@@ -1,0 +1,29 @@
+﻿name: Hunter Integration Contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest-and-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test dependencies
+        shell: bash
+        run: python -m pip install --upgrade pip pytest mcp pyyaml
+      - name: Validate integration contract
+        run: python scripts/check_integration_contract.py
+      - name: Run test suite
+        run: python -m pytest -q

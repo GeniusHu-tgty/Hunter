@@ -1,0 +1,25 @@
+﻿name: Hunter CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test-and-contract:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -U pip pytest mcp pyyaml
+      - run: python -m pytest -q
+      - name: Contract smoke
+        shell: python
+        run: |
+          import asyncio, json, mcp_server
+          data=json.loads(asyncio.run(mcp_server.hunter_contract_check()))
+          assert data["status"] == "ok", data

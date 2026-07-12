@@ -42,6 +42,7 @@ from core.burp_import import import_burp_evidence
 from payloads.loader import PayloadLoader
 from core.hunter_tools_facade import HunterToolsFacade
 from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
+from core.doctor import HunterDoctor
 
 # ============================================================
 # MCP Server
@@ -1032,6 +1033,39 @@ def _registered_hunter_tools() -> List[str]:
     )
 
 
+def _doctor() -> HunterDoctor:
+    workspace_root = _workspace.root if _workspace and _workspace.root else None
+    return HunterDoctor(
+        HUNTER_DIR,
+        registered_tools=_registered_hunter_tools(),
+        workspace_root=workspace_root,
+    )
+
+
+@mcp.tool()
+async def hunter_contract_check() -> str:
+    """Validate the machine-readable Hunter/OpenTgtyLab integration contract."""
+    return _json_dumps(_doctor().contract_check())
+
+
+@mcp.tool()
+async def hunter_config_audit() -> str:
+    """Audit discovered Codex/project MCP configs for legacy hunter registrations."""
+    return _json_dumps(_doctor().config_audit())
+
+
+@mcp.tool()
+async def hunter_runtime_status() -> str:
+    """Return portable runtime, interpreter, workspace and tool-count diagnostics."""
+    return _json_dumps(_doctor().runtime_status())
+
+
+@mcp.tool()
+async def hunter_doctor() -> str:
+    """Run contract, configuration and runtime diagnostics in one call."""
+    return _json_dumps(_doctor().run())
+
+
 def _payload_inventory() -> Dict[str, Any]:
     types = _payload_loader.list_types()
     counts = {}
@@ -1098,6 +1132,7 @@ async def hunter_healthcheck() -> str:
         "payloads": payloads,
         "hunter_tools": _hunter_tools.health().get("data", {}),
         "workspace": _workspace.health().get("data", {}),
+        "integration_v2": _doctor().run()["data"]["checks"],
         "notes": [
             "网络型扫描依赖外部 CLI；缺失时仍可使用 payload/meta/report 工具。",
             "所有 auto 工具经 safe wrapper 返回 JSON，不应把异常泄漏到 MCP 层。",
@@ -1166,6 +1201,10 @@ async def hunter_capabilities() -> str:
         "hunter_note_write": ("workspace-artifact", "Write a project note under exports/notes"),
         "hunter_report_publish": ("workspace-artifact", "Publish a report under exports/reports"),
         "hunter_workspace_recommend": ("workspace", "Combine case state, project KB and Hunter routing"),
+        "hunter_doctor": ("diagnostics", "Aggregate Integration v2 diagnostics"),
+        "hunter_config_audit": ("diagnostics", "Audit MCP configuration registrations"),
+        "hunter_runtime_status": ("diagnostics", "Inspect portable runtime state"),
+        "hunter_contract_check": ("diagnostics", "Validate the machine-readable integration contract"),
     }
     tools = {
         name: {
@@ -1182,6 +1221,7 @@ async def hunter_capabilities() -> str:
         "payloads": _payload_inventory(),
         "hunter_tools": _hunter_tools.capabilities().get("data", {}),
         "workspace": _workspace.health().get("data", {}),
+        "integration_contract": _doctor().contract_check().get("data", {}),
         "recommended_workflow": [
             "hunter_healthcheck",
             "hunter_capabilities",

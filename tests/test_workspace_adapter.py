@@ -96,3 +96,11 @@ def test_case_state_accepts_utf8_bom(workspace):
     assert opened["data"]["state"]["slug"] == "demo"
     updated = adapter.case_update("demo", {"status": "bom-compatible"})
     assert updated["status"] == "ok"
+
+def test_workspace_discovery_has_no_fixed_windows_drive(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    for name in ("OPEN_TGTYLAB_ROOT", "OPEN_TGTYLAB_WORKSPACE", "TGTYLAB_ROOT"):
+        monkeypatch.delenv(name, raising=False)
+    from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
+    root = OpenTgtyLabWorkspaceAdapter.discover_root()
+    assert root == tmp_path.resolve()
