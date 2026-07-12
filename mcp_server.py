@@ -41,6 +41,7 @@ from core.mcp_server import get_hunter
 from core.burp_import import import_burp_evidence
 from payloads.loader import PayloadLoader
 from core.hunter_tools_facade import HunterToolsFacade
+from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
 
 # ============================================================
 # MCP Server
@@ -58,6 +59,13 @@ _sessions: Dict[str, AuditSession] = {}
 _payload_loader = PayloadLoader(str(HUNTER_DIR / "payloads"))
 _hunter = get_hunter()
 _hunter_tools = HunterToolsFacade(HUNTER_DIR)
+_workspace = OpenTgtyLabWorkspaceAdapter()
+
+def _reset_workspace_adapter(root: Optional[str | Path] = None) -> OpenTgtyLabWorkspaceAdapter:
+    """Re-discover workspace after environment/config changes (also useful for tests)."""
+    global _workspace
+    _workspace = OpenTgtyLabWorkspaceAdapter(root)
+    return _workspace
 _WORDLIST_ALIASES = {
     "default": "common.txt",
     "common": "common.txt",
@@ -1089,6 +1097,7 @@ async def hunter_healthcheck() -> str:
         "wordlists": wordlists,
         "payloads": payloads,
         "hunter_tools": _hunter_tools.health().get("data", {}),
+        "workspace": _workspace.health().get("data", {}),
         "notes": [
             "网络型扫描依赖外部 CLI；缺失时仍可使用 payload/meta/report 工具。",
             "所有 auto 工具经 safe wrapper 返回 JSON，不应把异常泄漏到 MCP 层。",
@@ -1146,6 +1155,17 @@ async def hunter_capabilities() -> str:
         "hunter_burp_proxy_search": ("burp-bridge", "Build a Proxy history regex search action"),
         "hunter_burp_scanner_issues": ("burp-bridge", "Build a Scanner issues retrieval action"),
         "hunter_burp_collaborator_workflow": ("burp-bridge", "Build SSRF/XXE/CMDI Collaborator workflow plan"),
+        "hunter_workspace_health": ("workspace", "Check OpenTgtyLab workspace integration"),
+        "hunter_case_open": ("workspace", "Read a case state.json"),
+        "hunter_case_status": ("workspace", "Read compact case status"),
+        "hunter_case_update": ("workspace", "Atomically update controlled case state fields"),
+        "hunter_case_next_steps": ("workspace", "Read case next_steps"),
+        "hunter_project_kb_search": ("workspace-kb", "Search OpenTgtyLab project KB"),
+        "hunter_project_kb_read": ("workspace-kb", "Read an exact project KB technique"),
+        "hunter_evidence_save": ("workspace-artifact", "Save case evidence under exports"),
+        "hunter_note_write": ("workspace-artifact", "Write a project note under exports/notes"),
+        "hunter_report_publish": ("workspace-artifact", "Publish a report under exports/reports"),
+        "hunter_workspace_recommend": ("workspace", "Combine case state, project KB and Hunter routing"),
     }
     tools = {
         name: {
@@ -1161,6 +1181,7 @@ async def hunter_capabilities() -> str:
         "tools": tools,
         "payloads": _payload_inventory(),
         "hunter_tools": _hunter_tools.capabilities().get("data", {}),
+        "workspace": _workspace.health().get("data", {}),
         "recommended_workflow": [
             "hunter_healthcheck",
             "hunter_capabilities",
@@ -1174,7 +1195,7 @@ async def hunter_capabilities() -> str:
 
 
 @mcp.tool()
-async def hunter_recommend_next(target: str = "", signals: Optional[List[str]] = None, finding: str = "") -> str:
+async def hunter_recommend_next(target: str = "", signals: Optional[List[str]] = None, finding: str = "", case_slug: str = "") -> str:
     """Recommend next Hunter tools from observed signals/findings."""
     raw = " ".join((signals or []) + [finding or ""]).lower()
     recommendations: List[Dict[str, Any]] = []
@@ -1224,6 +1245,7 @@ async def hunter_recommend_next(target: str = "", signals: Optional[List[str]] =
 
     recommendations.sort(key=lambda item: item["priority"], reverse=True)
     hunter_tools_rec = _hunter_tools.kb_recommend(signals=signals or [], finding=finding, target=target, limit=5)
+    workspace_rec = _workspace.recommend(case_slug=case_slug, signals=signals or [], finding=finding, target=target, limit=5)
     return _json_dumps({
         "target": target,
         "signals": signals or [],
@@ -1231,8 +1253,70 @@ async def hunter_recommend_next(target: str = "", signals: Optional[List[str]] =
         "recommendations": recommendations,
         "proof_goals": [item["proof_goal"] for item in recommendations[:5]],
         "hunter_tools": hunter_tools_rec.get("data", {}),
+        "workspace": workspace_rec.get("data", {}),
         "routing_rule": "逻辑漏洞/认证边界优先；每个结论必须有可重复请求、响应差异和影响数据。",
     })
+
+
+
+# ============================================================
+# OpenTgtyLab Workspace Tools
+# ============================================================
+
+@mcp.tool()
+async def hunter_workspace_health() -> str:
+    """Check OpenTgtyLab root, cases, KB boards, and artifact routes."""
+    return _json_dumps(_workspace.health())
+
+@mcp.tool()
+async def hunter_case_open(case_slug: str) -> str:
+    """Read cases/<slug>/state.json from the OpenTgtyLab workspace."""
+    return _json_dumps(_workspace.case_open(case_slug))
+
+@mcp.tool()
+async def hunter_case_status(case_slug: str) -> str:
+    """Read compact status for an OpenTgtyLab case."""
+    return _json_dumps(_workspace.case_status(case_slug))
+
+@mcp.tool()
+async def hunter_case_update(case_slug: str, updates: Dict[str, Any]) -> str:
+    """Atomically merge controlled fields into a case state.json."""
+    return _json_dumps(_workspace.case_update(case_slug, updates))
+
+@mcp.tool()
+async def hunter_case_next_steps(case_slug: str) -> str:
+    """Read next_steps from an OpenTgtyLab case."""
+    return _json_dumps(_workspace.case_next_steps(case_slug))
+
+@mcp.tool()
+async def hunter_project_kb_search(query: str, board: str = "general", limit: int = 20) -> str:
+    """Search an OpenTgtyLab knowledge-base board."""
+    return _json_dumps(_workspace.kb_search(query, board=board, limit=limit))
+
+@mcp.tool()
+async def hunter_project_kb_read(technique_path: str, board: str = "general", max_chars: int = 12000) -> str:
+    """Read an exact Markdown technique within an OpenTgtyLab KB board."""
+    return _json_dumps(_workspace.kb_read(technique_path, board=board, max_chars=max_chars))
+
+@mcp.tool()
+async def hunter_evidence_save(case_slug: str, relative_path: str, content: str, append: bool = False) -> str:
+    """Save evidence under exports/evidence/<case>/ with traversal protection."""
+    return _json_dumps(_workspace.evidence_save(case_slug, relative_path, content, append=append))
+
+@mcp.tool()
+async def hunter_note_write(relative_path: str, content: str, append: bool = False) -> str:
+    """Write a note under exports/notes with traversal protection."""
+    return _json_dumps(_workspace.note_write(relative_path, content, append=append))
+
+@mcp.tool()
+async def hunter_report_publish(relative_path: str, content: str, append: bool = False) -> str:
+    """Publish a report under exports/reports with traversal protection."""
+    return _json_dumps(_workspace.report_publish(relative_path, content, append=append))
+
+@mcp.tool()
+async def hunter_workspace_recommend(case_slug: str = "", signals: Optional[List[str]] = None, finding: str = "", target: str = "", limit: int = 8) -> str:
+    """Combine case state, project KB, protocol rules, and Hunter tool routing."""
+    return _json_dumps(_workspace.recommend(case_slug=case_slug, signals=signals or [], finding=finding, target=target, limit=limit))
 
 
 # ============================================================

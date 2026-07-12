@@ -52,7 +52,7 @@ def test_codex_configs_have_only_hunter_tools():
         Path(r"C:\Users\Administrator\.codex\config.toml"),
     ]
     for path in paths:
-        config = tomllib.loads(path.read_text(encoding="utf-8"))
+        config = tomllib.loads(path.read_text(encoding="utf-8-sig"))
         servers = config.get("mcp_servers", {})
         assert "hunter" not in servers
         assert "hunter_tools" in servers
