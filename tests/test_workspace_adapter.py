@@ -85,3 +85,14 @@ def test_workspace_recommend_combines_case_project_kb_and_protocol(workspace):
     assert data["project_kb_hits"]
     assert data["protocol"]["http_priority"][0] == "Burp send_http2_request"
     assert "hunter_auto_jwt" in [x["tool"] for x in data["tool_recommendations"]]
+
+def test_case_state_accepts_utf8_bom(workspace):
+    state_path = workspace / "cases" / "demo" / "state.json"
+    original = state_path.read_text(encoding="utf-8")
+    state_path.write_text(original, encoding="utf-8-sig")
+    adapter = OpenTgtyLabWorkspaceAdapter()
+    opened = adapter.case_open("demo")
+    assert opened["status"] == "ok"
+    assert opened["data"]["state"]["slug"] == "demo"
+    updated = adapter.case_update("demo", {"status": "bom-compatible"})
+    assert updated["status"] == "ok"

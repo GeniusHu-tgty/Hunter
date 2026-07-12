@@ -91,7 +91,7 @@ class OpenTgtyLabWorkspaceAdapter:
     def case_open(self, slug: str) -> Dict[str, Any]:
         try:
             path = self._case_file(slug)
-            state = json.loads(path.read_text(encoding="utf-8"))
+            state = json.loads(path.read_text(encoding="utf-8-sig"))
             return self._ok("hunter_case_open", {"slug": slug, "path": str(path), "state": state})
         except Exception as exc: return self._error("hunter_case_open", exc)
 
@@ -110,7 +110,7 @@ class OpenTgtyLabWorkspaceAdapter:
         try:
             if not isinstance(updates, dict): raise ValueError("updates must be an object")
             path = self._case_file(slug)
-            state = json.loads(path.read_text(encoding="utf-8"))
+            state = json.loads(path.read_text(encoding="utf-8-sig"))
             protected = {"slug", "created_at"}
             for key, value in updates.items():
                 if key not in protected: state[key] = value
