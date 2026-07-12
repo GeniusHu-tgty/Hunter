@@ -1,0 +1,94 @@
+name: sqli_to_data_dump
+description: Evidence-gated SQL injection validation and bounded data-enumeration plan.
+parameters:
+  probe_path: /
+  parameter: id
+start: probe-injection
+steps:
+  - step_id: probe-injection
+    name: Probe injection point
+    action: exploit
+    state: scan
+    options:
+      vuln_type: sqli
+      confirmed: false
+      action: probe_injection
+    on_success: confirm-injection
+    on_failure: ""
+  - step_id: confirm-injection
+    name: Confirm injection type
+    action: exploit
+    state: exploit
+    options:
+      vuln_type: sqli
+      confirmed: true
+      capabilities:
+        - read
+      action: confirm_injection_type
+    on_success: database-version
+    on_failure: ""
+  - step_id: database-version
+    name: Extract database version
+    action: exploit
+    options:
+      vuln_type: sqli
+      confirmed: true
+      capabilities:
+        - read
+      approved_actions:
+        - fingerprint_database
+      action: fingerprint_database
+    on_success: enumerate-databases
+    on_failure: ""
+  - step_id: enumerate-databases
+    name: Enumerate databases
+    action: exploit
+    options:
+      vuln_type: sqli
+      confirmed: true
+      capabilities:
+        - read
+      approved_actions:
+        - enumerate_databases
+      action: enumerate_databases
+    on_success: enumerate-tables
+    on_failure: ""
+  - step_id: enumerate-tables
+    name: Enumerate tables
+    action: exploit
+    options:
+      vuln_type: sqli
+      confirmed: true
+      capabilities:
+        - read
+      approved_actions:
+        - enumerate_tables
+        - identify_user_tables
+      action: enumerate_tables
+    on_success: enumerate-columns
+    on_failure: ""
+  - step_id: enumerate-columns
+    name: Enumerate columns
+    action: exploit
+    options:
+      vuln_type: sqli
+      confirmed: true
+      capabilities:
+        - read
+      action: enumerate_columns
+    on_success: export-data
+    on_failure: ""
+  - step_id: export-data
+    name: Export bounded user rows
+    action: exploit
+    state: post_exploit
+    options:
+      vuln_type: sqli
+      confirmed: true
+      capabilities:
+        - read
+      approved_actions:
+        - export_user_rows
+      max_export_rows: 100
+      action: export_user_rows
+    critical: true

@@ -15,12 +15,13 @@ The kernel stores revisioned, hash-chained `workflow.events.jsonl`, atomically m
 
 ## MCP v8.1 Tool Surface
 
-- Total complete `hunter_tools` MCP tools: 90
+- Total complete `hunter_tools` MCP tools: 94
 - Meta/orchestration: `hunter_healthcheck`, `hunter_capabilities`, `hunter_recommend_next`, `hunter_agents_list`, `hunter_phases_list`
 - Pipelines: `hunter_scan`, `hunter_recon`, `hunter_vuln_scan`
 - Recon atomics: `hunter_subdomain`, `hunter_port_scan`, `hunter_tech_detect`, `hunter_dir_enum`, `hunter_js_analyze`
 - Auto verification: `hunter_auto_sqli`, `hunter_auto_xss`, `hunter_auto_ssrf`, `hunter_auto_ssti`, `hunter_auto_cmd`, `hunter_auto_xxe`, `hunter_auto_idor`, `hunter_auto_csrf`, `hunter_auto_cors`, `hunter_auto_jwt`, `hunter_auto_graphql`, `hunter_auto_websocket`, `hunter_auto_race`, `hunter_auto_access_control`, `hunter_unified_scan`
 - Payload/evidence/report: `hunter_payload_list`, `hunter_payload_search`, `hunter_payload_get`, `hunter_payload_generate`, `hunter_burp_import`, `hunter_session_list`, `hunter_session_status`, `hunter_report`
+- Persistent attack sessions: `hunter_session_start`, `hunter_session_execute_chain`, `hunter_session_checkpoint`, `hunter_post_exploit`, and dual-mode `hunter_session_state`
 - Hunter KB facade: `hunter_kb_list`, `hunter_kb_search`, `hunter_kb_read`, `hunter_kb_recommend`
 - Burp bridge plan facade: `hunter_burp_bridge`, `hunter_burp_repeater`, `hunter_burp_proxy_search`, `hunter_burp_scanner_issues`, `hunter_burp_collaborator_workflow`
 - Single server: `mcp_server.py` runs as `hunter_tools`; `hunter_tools_mcp.py` is only a compatibility launcher

@@ -22,7 +22,7 @@ jobs:
           cache: pip
       - name: Install test dependencies
         shell: bash
-        run: python -m pip install --upgrade pip pytest mcp pyyaml
+        run: python -m pip install --upgrade pip pytest mcp pyyaml cryptography
       - name: Validate integration contract
         run: python scripts/check_integration_contract.py
       - name: Run test suite

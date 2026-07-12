@@ -9,13 +9,20 @@ Hunter is an AI-driven penetration testing framework that combines automated too
 
 The `hunter_tools` server includes stateful browser fingerprints, WAF/rate-limit/captcha detection, classified proxy pools, persistent cookies/CSRF, bounded retries and complete request audit timelines. See `docs/adaptive-http.md`.
 
+## Persistent Attack Sessions
+
+Hunter now adds persistent AttackSession state, YAML/JSON attack-chain
+orchestration, full-state checkpoints, automatic Cookie/CSRF/auth/form
+extraction, and evidence-gated post-exploitation planning. The six preset
+templates live under `chains/`; see `docs/attack-session.md`.
+
 ## Unified CTF Workflow Kernel
 
 Hunter now provides event-sourced workflow state, 14 target/artifact lanes, capability-based handoffs to reverse backends, guided/autopilot policies, evidence-backed proof conditions, hash-chained events, revision checks, checkpoint tail replay, and proof-aware early stop.
 
 ## MCP v8 Hardening
 
-Hunter Tools exposes **90 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
+Hunter Tools exposes **94 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
 
 ### Local-first meta tools
 
@@ -46,7 +53,7 @@ All v8 wrappers return bounded JSON with `status`, `tool`, `elapsed_seconds`, an
 
 Hunter v8.2 consolidates every Hunter capability into one complete `hunter_tools` MCP server, including scanners, orchestration, sessions, reports, KB and Burp bridge.
 
-- Single complete server: `mcp_server.py` / server name `hunter_tools`, exposing **90 MCP tools**.
+- Single complete server: `mcp_server.py` / server name `hunter_tools`, exposing **94 MCP tools**.
 - `hunter_tools_mcp.py` is only a compatibility launcher that delegates to the complete server; it does not create a second MCP registry.
 - Core KB/Burp implementation: `core/hunter_tools_facade.py`.
 - Design/plan: `docs/hunter-tools-v81-design.md` and `docs/hunter-tools-v81-plan.md`.

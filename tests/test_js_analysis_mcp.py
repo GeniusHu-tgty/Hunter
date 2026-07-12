@@ -1,8 +1,10 @@
 ﻿import asyncio
+import inspect
 import json
 from pathlib import Path
 
 import mcp_server
+import pytest
 
 
 JS_TOOLS = {
@@ -59,7 +61,7 @@ def test_js_extract_api_fetches_html_scripts(monkeypatch):
         "https://example.test/": ("text/html", '<script src="/assets/app.js"></script>'),
         "https://example.test/assets/app.js": ("application/javascript", "fetch('/api/users')"),
     }
-    monkeypatch.setattr(mcp_server, "_fetch_js_analysis_url", lambda url: (*pages[url], url))
+    monkeypatch.setattr(mcp_server, "_fetch_js_analysis_url", lambda url, **kwargs: (*pages[url], url))
     result = run(mcp_server.hunter_js_extract_api, "https://example.test/")
     assert result["status"] == "ok"
     assert result["data"]["endpoints"][0]["url"] == "/api/users"
@@ -84,3 +86,72 @@ def test_js_tool_errors_use_envelope():
     assert result["status"] == "error"
     assert result["tool"] == "hunter_js_unpack"
     assert result["data"] == {}
+
+
+def test_all_js_tools_expose_allow_private_parameter():
+    for name in JS_TOOLS:
+        assert "allow_private" in inspect.signature(getattr(mcp_server, name)).parameters
+
+
+def test_private_url_is_blocked_by_default_and_explicitly_allowed(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server,
+        "_fetch_js_analysis_url",
+        lambda url, **kwargs: ("application/javascript", "fetch('/api/private')", url),
+    )
+
+    blocked = run(mcp_server.hunter_js_extract_api, "http://127.0.0.1/app.js")
+    monkeypatch.setenv("HUNTER_ALLOW_PRIVATE_JS_ANALYSIS", "1")
+    allowed = run(
+        mcp_server.hunter_js_extract_api,
+        "http://127.0.0.1/app.js",
+        allow_private=True,
+    )
+
+    assert blocked["status"] == "error"
+    assert "blocked address" in blocked["error"]
+    assert allowed["status"] == "ok"
+    assert allowed["data"]["endpoints"][0]["url"] == "/api/private"
+
+
+def test_redirect_handler_revalidates_destination():
+    handler = mcp_server._JSAnalysisRedirectHandler(allow_private=False)
+
+    with pytest.raises(ValueError, match="blocked address"):
+        handler.redirect_request(
+            None,
+            None,
+            302,
+            "Found",
+            {},
+            "http://169.254.169.254/latest/meta-data",
+        )
+
+
+def test_html_rejects_more_than_32_scripts(monkeypatch):
+    html = "".join(f'<script src="/assets/{index}.js"></script>' for index in range(33))
+
+    def fake_fetch(url, **kwargs):
+        if url == "https://example.test/":
+            return "text/html", html, url
+        return "application/javascript", "void 0", url
+
+    monkeypatch.setattr(mcp_server, "_fetch_js_analysis_url", fake_fetch)
+
+    with pytest.raises(ValueError, match="32"):
+        mcp_server._load_js_analysis_input("https://example.test/")
+
+
+def test_html_enforces_cumulative_10mb_limit(monkeypatch):
+    html = '<script src="/one.js"></script><script src="/two.js"></script>'
+    raw_chunk_size = mcp_server.JS_ANALYSIS_MAX_BYTES // 2 + 1
+
+    def fake_fetch(url, **kwargs):
+        if url == "https://example.test/":
+            return "text/html", html, url, len(html.encode("utf-8"))
+        return "application/javascript", "void 0", url, raw_chunk_size
+
+    monkeypatch.setattr(mcp_server, "_fetch_js_analysis_url", fake_fetch)
+
+    with pytest.raises(ValueError, match="cumulative"):
+        mcp_server._load_js_analysis_input("https://example.test/")

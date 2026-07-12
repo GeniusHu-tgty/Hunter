@@ -1,0 +1,76 @@
+name: card_shop_attack
+description: Business-logic assessment flow for an explicitly authorized card shop.
+parameters:
+  home_path: /
+start: visit-shop
+steps:
+  - step_id: visit-shop
+    name: Visit card shop
+    action: request
+    state: discovery
+    request:
+      method: GET
+      path: ${home_path}
+    on_success: identify-recharge
+    critical: true
+  - step_id: identify-recharge
+    name: Identify recharge endpoint
+    action: extract
+    extract_rules:
+      - name: recharge_endpoint
+        pattern: 'regex:(/[A-Za-z0-9_./-]*(?:recharge|charge|pay)[A-Za-z0-9_./-]*)'
+        store_as: recharge_endpoint
+    on_success: identify-query
+  - step_id: identify-query
+    name: Identify query endpoint
+    action: extract
+    extract_rules:
+      - name: query_endpoint
+        pattern: 'regex:(/[A-Za-z0-9_./-]*(?:query|status|order)[A-Za-z0-9_./-]*)'
+        store_as: query_endpoint
+    on_success: identify-use
+  - step_id: identify-use
+    name: Identify redemption endpoint
+    action: extract
+    extract_rules:
+      - name: use_endpoint
+        pattern: 'regex:(/[A-Za-z0-9_./-]*(?:use|redeem|consume)[A-Za-z0-9_./-]*)'
+        store_as: use_endpoint
+    on_success: test-amount
+  - step_id: test-amount
+    name: Plan amount-tampering proof
+    action: exploit
+    state: scan
+    options:
+      vuln_type: business_logic
+      confirmed: true
+      action: test_amount_tampering
+    on_success: test-race
+    on_failure: ""
+  - step_id: test-race
+    name: Plan bounded concurrency proof
+    action: exploit
+    options:
+      vuln_type: business_logic
+      confirmed: true
+      action: test_race_condition
+    on_success: test-authorization
+    on_failure: ""
+  - step_id: test-authorization
+    name: Plan object-authorization proof
+    action: exploit
+    options:
+      vuln_type: business_logic
+      confirmed: true
+      action: test_object_authorization
+    on_success: extract-card-data
+    on_failure: ""
+  - step_id: extract-card-data
+    name: Prepare bounded card-data evidence extraction
+    action: exploit
+    state: post_exploit
+    options:
+      vuln_type: business_logic
+      confirmed: true
+      action: extract_card_evidence
+    critical: true

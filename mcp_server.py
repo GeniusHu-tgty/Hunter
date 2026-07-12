@@ -14,11 +14,14 @@ Tools:
 
 import asyncio
 import hashlib
+import http.client
+import ipaddress
 import inspect
 import json
 import os
 import shutil
 import socket
+import ssl
 import sys
 import time
 from datetime import datetime
@@ -26,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from mcp.server.fastmcp import FastMCP
 
@@ -49,6 +52,7 @@ from core.doctor import HunterDoctor
 from core.adaptive_engine import AdaptiveEngine, get_mode_profile
 from core.recon_cache import ReconCache
 from core.workflow import WorkflowKernel, WorkflowPolicy
+from core.session import AttackChain, AttackSessionStore, PostExploitation
 from core.js_analysis.api_extractor import extract_api
 from core.js_analysis.bundle_unpacker import unpack_bundle
 from core.js_analysis.deobfuscator import deobfuscate
@@ -74,8 +78,9 @@ _workspace = OpenTgtyLabWorkspaceAdapter()
 _adaptive_cache = ReconCache(HUNTER_DIR / "evidence" / "adaptive_cache")
 _adaptive_engine = AdaptiveEngine(_adaptive_cache, HUNTER_DIR / "evidence" / "adaptive_raw")
 JS_ANALYSIS_EVIDENCE_DIR = HUNTER_DIR / "evidence" / "js_analysis"
-JS_REPLAY_DIR = Path(os.getenv("OPEN_TGTYLAB_ROOT", str(HUNTER_DIR))) / "exports" / "scripts"
+JS_REPLAY_DIR = Path(os.getenv("OPEN_TGTYLAB_ROOT", r"D:\Open-tgtylab")) / "exports" / "scripts"
 JS_ANALYSIS_MAX_BYTES = 10 * 1024 * 1024
+JS_ANALYSIS_MAX_SCRIPTS = 32
 JS_ANALYSIS_TIMEOUT_SECONDS = 15
 
 def _reset_workspace_adapter(root: Optional[str | Path] = None) -> OpenTgtyLabWorkspaceAdapter:
@@ -90,6 +95,9 @@ def _workflow_kernel() -> WorkflowKernel:
 
 
 _stealth_client = None
+_attack_session_store = None
+_attack_http_clients = {}
+_post_exploitation = PostExploitation()
 
 def _reset_stealth_client(state_dir: Optional[str | Path] = None):
     global _stealth_client
@@ -99,6 +107,102 @@ def _reset_stealth_client(state_dir: Optional[str | Path] = None):
 
 def _get_stealth_client():
     return _stealth_client or _reset_stealth_client()
+
+def _reset_attack_session_store(state_dir: Optional[str | Path] = None):
+    global _attack_session_store, _attack_http_clients
+    _attack_session_store = AttackSessionStore(
+        state_dir or (HUNTER_DIR / "sessions" / "attack")
+    )
+    _attack_http_clients = {}
+    return _attack_session_store
+
+def _get_attack_session_store():
+    return _attack_session_store or _reset_attack_session_store()
+
+def _get_attack_http_client(session):
+    from core.stealth.stealth_http_client import StealthHTTPClient
+
+    if session.session_id not in _attack_http_clients:
+        client = StealthHTTPClient(session.directory / "http", persist_secrets=False)
+        client.session_create(session.target, resume=True)
+        _attack_http_clients[session.session_id] = client
+    return _attack_http_clients[session.session_id]
+
+def _sync_attack_http_client(session):
+    client = _get_attack_http_client(session)
+    runtime = client._runtime(session.target)
+    state = runtime["state"]
+    state["cookies"] = session.cookie_dict()
+    state["csrf_tokens"] = {
+        key: value
+        for page_tokens in session.csrf_tokens.values()
+        for key, value in page_tokens.items()
+    }
+    transport = runtime["transport"]
+    if hasattr(transport, "cookies"):
+        try:
+            transport.cookies.clear()
+            transport.cookies.update(state["cookies"])
+        except Exception:
+            pass
+    client._save(state)
+    return client
+
+def _resolve_attack_chain(chain_name: str) -> Path:
+    raw = Path(chain_name)
+    if raw.is_absolute() or raw.parent != Path("."):
+        candidate = raw.resolve()
+        allowed_roots = [
+            (HUNTER_DIR / "chains").resolve(),
+            (_workspace.root / "exports" / "scripts").resolve(),
+        ]
+        if not any(candidate == root or root in candidate.parents for root in allowed_roots):
+            raise ValueError("attack chain path is outside approved chain roots")
+    else:
+        name = raw.name
+        if Path(name).suffix.lower() not in {".yaml", ".yml", ".json"}:
+            name = f"{name}.yml"
+        candidate = (HUNTER_DIR / "chains" / name).resolve()
+    if not candidate.is_file():
+        raise FileNotFoundError(f"attack chain not found: {chain_name}")
+    return candidate
+
+def _attack_request_executor(session, request):
+    client = _sync_attack_http_client(session)
+    options = dict(request.get("options") or {})
+    options["follow_redirects"] = False
+    return client.stealth_request(
+        request["method"],
+        request["url"],
+        headers=request.get("headers"),
+        data=request.get("data"),
+        options=options,
+    )
+
+def _attack_exploit_executor(session, details):
+    vuln_type = str(details.get("vuln_type") or details.get("type") or "")
+    if not vuln_type:
+        return {
+            "status": "approval-required",
+            "reason": "exploit step requires a confirmed vuln_type",
+            "details": details,
+        }
+    supported = set(_post_exploitation.ACTIONS) | set(_post_exploitation.ALIASES)
+    if vuln_type not in supported:
+        return {
+            "status": "approval-required",
+            "vuln_type": vuln_type,
+            "action": details.get("action") or "exploit",
+            "confirmed": bool(details.get("confirmed", False)),
+            "execution": "deferred",
+            "reason": "This chain step requires an explicitly authorized domain executor.",
+        }
+    return _post_exploitation.run(
+        session,
+        vuln_type,
+        details,
+        approved=bool(details.get("approved", False)),
+    )
 
 _WORDLIST_ALIASES = {
     "default": "common.txt",
@@ -830,42 +934,175 @@ class _ScriptSourceParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.sources: List[str] = []
+        self.inline_scripts: List[str] = []
+        self._inside_script = False
+        self._script_has_source = False
 
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag.lower() == "script":
+            self._inside_script = True
             source = dict(attrs).get("src")
+            self._script_has_source = bool(source)
             if source:
                 self.sources.append(source)
 
+    def handle_data(self, data: str) -> None:
+        if self._inside_script and not self._script_has_source and data.strip():
+            self.inline_scripts.append(data)
 
-def _fetch_js_analysis_url(url: str) -> tuple[str, str, str]:
-    request = Request(url, headers={"User-Agent": "Hunter-JS-Analysis/1.0"})
-    with urlopen(request, timeout=JS_ANALYSIS_TIMEOUT_SECONDS) as response:
-        declared = response.headers.get("Content-Length")
-        if declared and int(declared) > JS_ANALYSIS_MAX_BYTES:
-            raise ValueError("remote input exceeds 10MB limit")
-        content = response.read(JS_ANALYSIS_MAX_BYTES + 1)
-        if len(content) > JS_ANALYSIS_MAX_BYTES:
-            raise ValueError("remote input exceeds 10MB limit")
-        content_type = response.headers.get_content_type()
-        charset = response.headers.get_content_charset() or "utf-8"
-        return content_type, content.decode(charset, errors="replace"), response.geturl()
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script":
+            self._inside_script = False
+            self._script_has_source = False
 
 
-def _load_js_analysis_input(value: str) -> Dict[str, Any]:
+_JS_ANALYSIS_METADATA_HOSTS = {
+    "metadata.google",
+    "metadata.google.internal",
+    "metadata.goog",
+}
+
+
+def _validate_js_analysis_url(url: str, allow_private: bool = False, resolve_host: bool = True) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("JS analysis URL must use http or https")
+    if not parsed.hostname:
+        raise ValueError("JS analysis URL must include a hostname")
+    if allow_private and os.getenv("HUNTER_ALLOW_PRIVATE_JS_ANALYSIS", "").strip().lower() not in {"1", "true", "yes"}:
+        raise PermissionError("private JS analysis requires HUNTER_ALLOW_PRIVATE_JS_ANALYSIS=1")
+    if allow_private:
+        return
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in _JS_ANALYSIS_METADATA_HOSTS:
+        raise ValueError(f"JS analysis URL uses blocked address: {hostname}")
+    addresses: set[str] = set()
+    try:
+        addresses.add(str(ipaddress.ip_address(hostname)))
+    except ValueError:
+        if resolve_host:
+            try:
+                addresses.update(
+                    result[4][0]
+                    for result in socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+                )
+            except socket.gaierror as exc:
+                raise ValueError(f"unable to resolve JS analysis host: {hostname}") from exc
+    for address in addresses:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_unspecified
+            or ip.is_multicast
+        ):
+            raise ValueError(f"JS analysis URL uses blocked address: {ip}")
+
+
+def _resolve_js_analysis_endpoint(url: str, allow_private: bool = False) -> tuple[Any, str, int]:
+    _validate_js_analysis_url(url, allow_private=allow_private)
+    parsed = urlparse(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    addresses = []
+    for result in socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM):
+        address = result[4][0].split("%", 1)[0]
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise ValueError(f"unable to resolve JS analysis host: {parsed.hostname}")
+    return parsed, addresses[0], port
+
+
+class _JSAnalysisRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, allow_private: bool = False) -> None:
+        super().__init__()
+        self.allow_private = allow_private
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_js_analysis_url(newurl, allow_private=self.allow_private)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_js_analysis_url(url: str, allow_private: bool = False, max_bytes: int = JS_ANALYSIS_MAX_BYTES) -> tuple[str, str, str, int]:
+    if max_bytes < 1:
+        raise ValueError("remote input exceeds cumulative 10MB limit")
+    current_url = url
+    for _ in range(6):
+        parsed, address, port = _resolve_js_analysis_endpoint(current_url, allow_private)
+        raw_socket = socket.create_connection((address, port), timeout=JS_ANALYSIS_TIMEOUT_SECONDS)
+        if parsed.scheme == "https":
+            raw_socket = ssl.create_default_context().wrap_socket(raw_socket, server_hostname=parsed.hostname)
+        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=JS_ANALYSIS_TIMEOUT_SECONDS)
+        connection.sock = raw_socket
+        target = parsed.path or "/"
+        if parsed.query:
+            target += f"?{parsed.query}"
+        try:
+            connection.request("GET", target, headers={"User-Agent": "Hunter-JS-Analysis/1.0", "Host": parsed.netloc})
+            response = connection.getresponse()
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("redirect response omitted Location")
+                current_url = urljoin(current_url, location)
+                _validate_js_analysis_url(current_url, allow_private=allow_private)
+                continue
+            declared = response.headers.get("Content-Length")
+            if declared and int(declared) > max_bytes:
+                raise ValueError("remote input exceeds cumulative 10MB limit")
+            content = response.read(max_bytes + 1)
+            if len(content) > max_bytes:
+                raise ValueError("remote input exceeds cumulative 10MB limit")
+            content_type = response.headers.get_content_type()
+            charset = response.headers.get_content_charset() or "utf-8"
+            return content_type, content.decode(charset, errors="replace"), current_url, len(content)
+        finally:
+            connection.close()
+    raise ValueError("JS analysis URL exceeded redirect limit")
+
+
+def _js_fetch_parts(result) -> tuple[str, str, str, int]:
+    if len(result) == 4:
+        content_type, content, final_url, byte_count = result
+        return content_type, content, final_url, int(byte_count)
+    content_type, content, final_url = result
+    return content_type, content, final_url, len(content.encode("utf-8"))
+
+
+def _load_js_analysis_input(value: str, allow_private: bool = False) -> Dict[str, Any]:
     parsed = urlparse(value)
     if parsed.scheme in {"http", "https"}:
-        content_type, content, final_url = _fetch_js_analysis_url(value)
+        _validate_js_analysis_url(value, allow_private=allow_private, resolve_host=False)
+        content_type, content, final_url, total_bytes = _js_fetch_parts(
+            _fetch_js_analysis_url(value, allow_private=allow_private)
+        )
+        if total_bytes > JS_ANALYSIS_MAX_BYTES:
+            raise ValueError("remote input exceeds cumulative 10MB limit")
         sources = [{"name": final_url, "code": content}]
         if content_type == "text/html" or "<script" in content.lower():
             parser = _ScriptSourceParser()
             parser.feed(content)
-            sources = []
-            for source in dict.fromkeys(parser.sources):
-                _, script_code, resolved_url = _fetch_js_analysis_url(urljoin(final_url, source))
+            external_sources = list(dict.fromkeys(parser.sources))
+            if len(parser.inline_scripts) + len(external_sources) > JS_ANALYSIS_MAX_SCRIPTS:
+                raise ValueError(f"HTML input exceeds {JS_ANALYSIS_MAX_SCRIPTS} script limit")
+            sources = [{"name": f"{final_url}#inline-{index}", "code": code} for index, code in enumerate(parser.inline_scripts)]
+            for source in external_sources:
+                remaining_bytes = JS_ANALYSIS_MAX_BYTES - total_bytes
+                _, script_code, resolved_url, script_bytes = _js_fetch_parts(
+                    _fetch_js_analysis_url(
+                        urljoin(final_url, source),
+                        allow_private=allow_private,
+                        max_bytes=remaining_bytes,
+                    )
+                )
+                total_bytes += script_bytes
+                if total_bytes > JS_ANALYSIS_MAX_BYTES:
+                    raise ValueError("remote input exceeds cumulative 10MB limit")
                 sources.append({"name": resolved_url, "code": script_code})
         if not sources:
-            raise ValueError("HTML input did not reference external JavaScript")
+            raise ValueError("HTML input did not contain JavaScript")
         return {"kind": "url", "value": final_url, "sources": sources, "script_count": len(sources)}
     path = Path(value).expanduser()
     if path.is_file():
@@ -891,6 +1128,16 @@ def _js_envelope(tool: str, data: Dict[str, Any], evidence: Dict[str, Any], next
     return _json_dumps({"tool": tool, "status": "ok", "data": data, "evidence": evidence, "next_actions": next_actions or []})
 
 
+def _jshook_signature_plan() -> Dict[str, Any]:
+    return {
+        "server": "jshook",
+        "mode": "external-mcp-handoff",
+        "hooks": ["fetch", "XMLHttpRequest.open", "XMLHttpRequest.send", "XMLHttpRequest.setRequestHeader", "axios", "WebSocket.send"],
+        "captures": ["original_parameters", "final_url", "final_headers", "final_body", "added_parameters", "call_stack"],
+        "observation_schema": {"added_parameters": {"signature": "<captured-value>"}, "parameters": {}, "call_stack": []},
+    }
+
+
 async def _run_js_tool(tool: str, operation, input_value: str) -> str:
     try:
         return await asyncio.to_thread(operation, input_value)
@@ -898,8 +1145,8 @@ async def _run_js_tool(tool: str, operation, input_value: str) -> str:
         return _json_dumps({"tool": tool, "status": "error", "data": {}, "evidence": {}, "next_actions": [], "error": str(exc)})
 
 
-def _unpack_js_input(input_value: str) -> str:
-    loaded = _load_js_analysis_input(input_value)
+def _unpack_js_input(input_value: str, allow_private: bool = False) -> str:
+    loaded = _load_js_analysis_input(input_value, allow_private=allow_private)
     destination = _js_artifact_dir("hunter_js_unpack", loaded["value"])
     results = [unpack_bundle(source["code"], destination / f"source_{index}", source_name=source["name"]) for index, source in enumerate(loaded["sources"])]
     primary = results[0]
@@ -907,8 +1154,8 @@ def _unpack_js_input(input_value: str) -> str:
     return _js_envelope("hunter_js_unpack", data, {"input": {key: loaded[key] for key in ("kind", "value", "script_count")}, "artifact_dir": str(destination), "results": results})
 
 
-def _deobfuscate_js_input(input_value: str) -> str:
-    loaded = _load_js_analysis_input(input_value)
+def _deobfuscate_js_input(input_value: str, allow_private: bool = False) -> str:
+    loaded = _load_js_analysis_input(input_value, allow_private=allow_private)
     destination = _js_artifact_dir("hunter_js_deobfuscate", loaded["value"])
     results = []
     for index, source in enumerate(loaded["sources"]):
@@ -920,10 +1167,10 @@ def _deobfuscate_js_input(input_value: str) -> str:
     return _js_envelope("hunter_js_deobfuscate", {"code_preview": preview, "sources": results}, {"input": {key: loaded[key] for key in ("kind", "value", "script_count")}, "artifact_dir": str(destination)})
 
 
-def _extract_api_js_input(input_value: str) -> str:
-    loaded = _load_js_analysis_input(input_value)
+def _extract_api_js_input(input_value: str, allow_private: bool = False) -> str:
+    loaded = _load_js_analysis_input(input_value, allow_private=allow_private)
     destination = _js_artifact_dir("hunter_js_extract_api", loaded["value"])
-    combined = {"endpoints": [], "websockets": [], "routes": [], "auth": [], "unresolved": []}
+    combined = {"endpoints": [], "websockets": [], "routes": [], "authentication": [], "confirmed": [], "inferred": [], "unresolved": []}
     for source in loaded["sources"]:
         result = extract_api(source["code"], source_name=source["name"])
         for key in combined:
@@ -933,53 +1180,101 @@ def _extract_api_js_input(input_value: str) -> str:
     return _js_envelope("hunter_js_extract_api", combined, {"input": {key: loaded[key] for key in ("kind", "value", "script_count")}, "artifact": str(output)})
 
 
-def _extract_signature_js_input(input_value: str, parameter_name: Optional[str]) -> str:
-    loaded = _load_js_analysis_input(input_value)
+def _extract_signature_js_input(input_value: str, parameter_name: Optional[str], observations: Optional[List[Dict[str, Any]]] = None, allow_private: bool = False) -> str:
+    loaded = _load_js_analysis_input(input_value, allow_private=allow_private)
     source = "\n".join(item["code"] for item in loaded["sources"])
-    result = extract_signature(source, parameter_name=parameter_name, target_url=loaded["value"] if loaded["kind"] == "url" else "", output_dir=JS_REPLAY_DIR)
+    result = extract_signature(source, parameter_name=parameter_name, observations=observations, target_url=loaded["value"] if loaded["kind"] == "url" else "", output_dir=JS_REPLAY_DIR)
     destination = _js_artifact_dir("hunter_js_extract_signature", loaded["value"])
     output = destination / "signature_analysis.json"
     output.write_text(_json_dumps({key: value for key, value in result.items() if key != "replay_code"}), encoding="utf-8")
     evidence = {"input": {key: loaded[key] for key in ("kind", "value", "script_count")}, "artifact": str(output), "replay_script": result.get("replay_script")}
     data = {key: value for key, value in result.items() if key not in {"replay_code", "candidates"}}
+    data["analysis_mode"] = "static+observed" if observations else "static-only"
+    data["dynamic_hook_plan"] = _jshook_signature_plan()
     return _js_envelope("hunter_js_extract_signature", data, evidence, ["Validate the generated replay script against an authorized captured request."])
 
 
+def _full_analysis_js_input(input_value: str, parameter_name: Optional[str], observations: Optional[List[Dict[str, Any]]] = None, allow_private: bool = False) -> str:
+    loaded = _load_js_analysis_input(input_value, allow_private=allow_private)
+    destination = _js_artifact_dir("hunter_js_full_analysis", loaded["value"])
+    unpacked = []
+    deobfuscated = []
+    api_inventory = {"endpoints": [], "websockets": [], "routes": [], "authentication": [], "confirmed": [], "inferred": [], "unresolved": []}
+    transformed_sources = []
+    for index, source in enumerate(loaded["sources"]):
+        unpacked_result = unpack_bundle(source["code"], destination / f"source_{index}" / "unpacked", source_name=source["name"])
+        unpacked.append(unpacked_result)
+        deobfuscated_result = deobfuscate(source["code"])
+        transformed_sources.append({"name": source["name"], "code": deobfuscated_result["code"]})
+        deobfuscated_path = destination / f"source_{index}" / "deobfuscated.js"
+        deobfuscated_path.parent.mkdir(parents=True, exist_ok=True)
+        deobfuscated_path.write_text(deobfuscated_result["code"], encoding="utf-8")
+        deobfuscated.append({"source": source["name"], "path": str(deobfuscated_path), "transformations": deobfuscated_result["transformations"], "rename_map": deobfuscated_result.get("rename_map", {})})
+        api_result = extract_api(deobfuscated_result["code"], source_name=source["name"])
+        for key in api_inventory:
+            api_inventory[key].extend(api_result.get(key, []))
+    combined_code = "\n".join(item["code"] for item in transformed_sources)
+    signature = extract_signature(
+        combined_code,
+        parameter_name=parameter_name,
+        observations=observations,
+        target_url=loaded["value"] if loaded["kind"] == "url" else "",
+        output_dir=JS_REPLAY_DIR,
+    )
+    api_path = destination / "api_inventory.json"
+    api_path.write_text(_json_dumps(api_inventory), encoding="utf-8")
+    signature_path = destination / "signature_analysis.json"
+    signature_path.write_text(_json_dumps({key: value for key, value in signature.items() if key != "replay_code"}), encoding="utf-8")
+    data = {
+        "pipeline": {
+            "input_sources": len(loaded["sources"]),
+            "unpacked_sources": len(unpacked),
+            "deobfuscated_sources": len(deobfuscated),
+            "downstream_input": "deobfuscated",
+        },
+        "unpack": unpacked,
+        "deobfuscation": deobfuscated,
+        "api": api_inventory,
+        "signature": {key: value for key, value in signature.items() if key not in {"replay_code", "candidates"}},
+    }
+    evidence = {
+        "input": {key: loaded[key] for key in ("kind", "value", "script_count")},
+        "artifact_dir": str(destination),
+        "api_inventory": str(api_path),
+        "signature_analysis": str(signature_path),
+        "replay_script": signature.get("replay_script"),
+    }
+    return _js_envelope("hunter_js_full_analysis", data, evidence, ["Validate inferred endpoints and signature assumptions with JSHook or Burp evidence."])
+
+
 @mcp.tool()
-async def hunter_js_unpack(input_value: str) -> str:
+async def hunter_js_unpack(input_value: str, allow_private: bool = False) -> str:
     """Unpack a JavaScript bundle from inline code, local path, or HTTP(S) URL."""
-    return await _run_js_tool("hunter_js_unpack", _unpack_js_input, input_value)
+    return await _run_js_tool("hunter_js_unpack", lambda value: _unpack_js_input(value, allow_private), input_value)
 
 
 @mcp.tool()
-async def hunter_js_deobfuscate(input_value: str) -> str:
+async def hunter_js_deobfuscate(input_value: str, allow_private: bool = False) -> str:
     """Deobfuscate JavaScript from inline code, local path, or HTTP(S) URL."""
-    return await _run_js_tool("hunter_js_deobfuscate", _deobfuscate_js_input, input_value)
+    return await _run_js_tool("hunter_js_deobfuscate", lambda value: _deobfuscate_js_input(value, allow_private), input_value)
 
 
 @mcp.tool()
-async def hunter_js_extract_api(input_value: str) -> str:
+async def hunter_js_extract_api(input_value: str, allow_private: bool = False) -> str:
     """Extract APIs from JavaScript or scripts referenced by an HTML URL."""
-    return await _run_js_tool("hunter_js_extract_api", _extract_api_js_input, input_value)
+    return await _run_js_tool("hunter_js_extract_api", lambda value: _extract_api_js_input(value, allow_private), input_value)
 
 
 @mcp.tool()
-async def hunter_js_extract_signature(input_value: str, parameter_name: Optional[str] = None) -> str:
+async def hunter_js_extract_signature(input_value: str, parameter_name: Optional[str] = None, observations: Optional[List[Dict[str, Any]]] = None, allow_private: bool = False) -> str:
     """Locate request-signature logic and generate a Python replay scaffold."""
-    return await _run_js_tool("hunter_js_extract_signature", lambda value: _extract_signature_js_input(value, parameter_name), input_value)
+    return await _run_js_tool("hunter_js_extract_signature", lambda value: _extract_signature_js_input(value, parameter_name, observations, allow_private), input_value)
 
 
 @mcp.tool()
-async def hunter_js_full_analysis(input_value: str, parameter_name: Optional[str] = None) -> str:
+async def hunter_js_full_analysis(input_value: str, parameter_name: Optional[str] = None, observations: Optional[List[Dict[str, Any]]] = None, allow_private: bool = False) -> str:
     """Run unpack, deobfuscation, API extraction, and signature analysis."""
-    try:
-        results = {}
-        operations = (("unpack", _unpack_js_input), ("deobfuscate", _deobfuscate_js_input), ("api", _extract_api_js_input), ("signature", lambda value: _extract_signature_js_input(value, parameter_name)))
-        for name, operation in operations:
-            results[name] = json.loads(await asyncio.to_thread(operation, input_value))
-        return _json_dumps({"tool": "hunter_js_full_analysis", "status": "ok", "data": results, "evidence": {"stages": [item.get("evidence", {}) for item in results.values()]}, "next_actions": ["Review unresolved static-analysis findings and validate signatures dynamically."]})
-    except Exception as exc:
-        return _json_dumps({"tool": "hunter_js_full_analysis", "status": "error", "data": {}, "evidence": {}, "next_actions": [], "error": str(exc)})
+    return await _run_js_tool("hunter_js_full_analysis", lambda value: _full_analysis_js_input(value, parameter_name, observations, allow_private), input_value)
 
 
 # ============================================================
@@ -1286,6 +1581,8 @@ async def hunter_healthcheck() -> str:
         "hunter_js_extract_signature", "hunter_js_full_analysis",
         "hunter_stealth_request", "hunter_stealth_scan", "hunter_session_create",
         "hunter_session_state", "hunter_set_proxy_pool",
+        "hunter_session_start", "hunter_session_execute_chain",
+        "hunter_session_checkpoint", "hunter_post_exploit",
     ]
     registered = _registered_hunter_tools()
     missing_mcp = [name for name in required_mcp if name not in registered]
@@ -1369,8 +1666,12 @@ async def hunter_capabilities() -> str:
         "hunter_stealth_request": ("stealth-http", "Send adaptive stateful HTTP request"),
         "hunter_stealth_scan": ("stealth-http", "Detect WAF, rate limits, and captcha"),
         "hunter_session_create": ("stealth-http", "Create or restore target HTTP session"),
-        "hunter_session_state": ("stealth-http", "Inspect target HTTP session state"),
+        "hunter_session_state": ("session", "Inspect attack session by id or stealth session by target"),
         "hunter_set_proxy_pool": ("stealth-http", "Configure classified proxy pool"),
+        "hunter_session_start": ("attack-session", "Create a persistent attack session"),
+        "hunter_session_execute_chain": ("attack-session", "Execute a bounded YAML/JSON attack chain"),
+        "hunter_session_checkpoint": ("attack-session", "Save, restore, or list attack-session checkpoints"),
+        "hunter_post_exploit": ("attack-session", "Build an evidence-gated post-exploitation plan"),
         "hunter_auto_sqli": ("auto-vuln", "SQL injection checks"),
         "hunter_auto_xss": ("auto-vuln", "XSS checks"),
         "hunter_auto_ssrf": ("auto-vuln", "SSRF checks"),
@@ -1916,14 +2217,172 @@ async def hunter_report(session_id: str, format: str = "markdown", style: str = 
 # ============================================================
 
 @mcp.tool()
+async def hunter_session_start(
+    target_url: str,
+    authorization: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Create a persistent attack session for an authorized target."""
+    try:
+        session = _get_attack_session_store().create(
+            target_url,
+            authorization=authorization or {},
+        )
+        client = _get_attack_http_client(session)
+        stealth_state = client.session_state(target_url)
+        fingerprint = client.fingerprints.get(stealth_state["fingerprint_id"])
+        session.fingerprint_headers = fingerprint.get("headers", {})
+        session.save()
+        return _json_dumps(
+            {
+                "tool": "hunter_session_start",
+                "status": "ok",
+                "data": session.public_snapshot(),
+                "evidence": {"state_path": str(session.state_path)},
+                "next_actions": [
+                    "Select a bounded chain and review its parameters before execution."
+                ],
+            }
+        )
+    except Exception as exc:
+        return _json_dumps(
+            {
+                "tool": "hunter_session_start",
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "data": {},
+                "evidence": {},
+                "next_actions": [],
+            }
+        )
+
+@mcp.tool()
+async def hunter_session_execute_chain(
+    session_id: str,
+    chain_name: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Execute a bounded attack chain and persist state after every step."""
+    def run_chain():
+        session = _get_attack_session_store().get(session_id)
+        chain = AttackChain.load(
+            _resolve_attack_chain(chain_name),
+            request_executor=_attack_request_executor,
+            exploit_executor=_attack_exploit_executor,
+        )
+        return chain.execute(session, params=params or {})
+
+    try:
+        result = await asyncio.to_thread(run_chain)
+        domain_status = str(result.get("status") or "ok")
+        envelope_status = domain_status if domain_status in {
+            "approval-required", "blocked", "failed", "recovery-required", "rejected"
+        } else "ok"
+        return _json_dumps(
+            {
+                "tool": "hunter_session_execute_chain",
+                "status": envelope_status,
+                "data": result,
+                "evidence": {
+                    "session_id": session_id,
+                    "chain": str(_resolve_attack_chain(chain_name)),
+                },
+                "next_actions": (
+                    ["Resolve the blocker or restore its checkpoint."]
+                    if result.get("status") == "blocked"
+                    else []
+                ),
+            }
+        )
+    except Exception as exc:
+        return _json_dumps(
+            {
+                "tool": "hunter_session_execute_chain",
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "data": {},
+                "evidence": {},
+                "next_actions": [],
+            }
+        )
+
+@mcp.tool()
+async def hunter_session_checkpoint(
+    session_id: str,
+    action: str,
+    name: str = "",
+) -> str:
+    """Save, restore, or list persistent attack-session checkpoints."""
+    def operate():
+        session = _get_attack_session_store().get(session_id)
+        normalized = action.strip().lower()
+        if normalized == "save":
+            if not name:
+                raise ValueError("checkpoint name is required for save")
+            return session.save_checkpoint(name)
+        if normalized == "restore":
+            if not name:
+                raise ValueError("checkpoint name is required for restore")
+            result = session.restore_checkpoint(name)
+            _sync_attack_http_client(session)
+            return result
+        if normalized == "list":
+            return {"checkpoints": session.checkpoints}
+        raise ValueError("action must be save, restore, or list")
+
+    return _workflow_result("hunter_session_checkpoint", operate)
+
+@mcp.tool()
+async def hunter_post_exploit(
+    session_id: str,
+    vuln_type: str,
+    vuln_details: Dict[str, Any],
+    approved: bool = False,
+) -> str:
+    """Create an evidence-gated post-exploitation action plan."""
+    return _workflow_result(
+        "hunter_post_exploit",
+        lambda: _post_exploitation.run(
+            _get_attack_session_store().get(session_id),
+            vuln_type,
+            vuln_details,
+            approved,
+        ),
+    )
+
+@mcp.tool()
 async def hunter_session_create(target: str, resume: bool = True, fingerprint_strategy: str = "random") -> str:
     """Create or restore an isolated target HTTP session."""
     return _workflow_result("hunter_session_create", _get_stealth_client().session_create, target, resume, fingerprint_strategy)
 
 @mcp.tool()
-async def hunter_session_state(target: str) -> str:
-    """Inspect target session cookies, tokens, fingerprint, proxy, and timeline."""
-    return _workflow_result("hunter_session_state", _get_stealth_client().session_state, target)
+async def hunter_session_state(target: str = "", session_id: str = "") -> str:
+    """Inspect an attack session by id, or a stealth HTTP session by target."""
+    if target and session_id:
+        return _workflow_result(
+            "hunter_session_state",
+            lambda: (_ for _ in ()).throw(
+                ValueError("provide either target or session_id, not both")
+            ),
+        )
+    if session_id:
+        return _workflow_result(
+            "hunter_session_state",
+            lambda: _get_attack_session_store().get(session_id).public_snapshot(),
+        )
+    if not target:
+        return _workflow_result(
+            "hunter_session_state",
+            lambda: (_ for _ in ()).throw(
+                ValueError("target or session_id is required")
+            ),
+        )
+    return _workflow_result(
+        "hunter_session_state",
+        _get_stealth_client().session_state,
+        target,
+    )
 
 @mcp.tool()
 async def hunter_set_proxy_pool(proxies: Optional[List[str]] = None, file_path: str = "") -> str:

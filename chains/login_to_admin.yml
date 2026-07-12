@@ -1,0 +1,71 @@
+name: login_to_admin
+description: Stateful login flow with CSRF, cookie, token, and admin-link extraction.
+parameters:
+  login_path: /login
+  admin_path: /admin
+  username: ""
+  password: ""
+start: visit-login
+steps:
+  - step_id: visit-login
+    name: Visit login page
+    action: request
+    state: auth
+    request:
+      method: GET
+      path: ${login_path}
+    on_success: extract-csrf
+    max_retries: 1
+    critical: true
+  - step_id: extract-csrf
+    name: Extract CSRF token
+    action: extract
+    extract_rules:
+      - name: csrf
+        pattern: 'regex:name=["''](?:csrf_token|_token)["''][^>]*value=["'']([^"'']+)'
+        store_as: csrf
+    on_success: submit-login
+    critical: true
+  - step_id: submit-login
+    name: Submit credentials
+    action: request
+    request:
+      method: POST
+      path: ${login_path}
+      data:
+        username: ${username}
+        password: ${password}
+        csrf_token: ${csrf}
+    on_success: visit-admin
+    max_retries: 1
+    critical: true
+  - step_id: visit-admin
+    name: Visit admin home
+    action: request
+    preconditions:
+      - authenticated
+    request:
+      method: GET
+      path: ${admin_path}
+    options:
+      authentication_proof:
+        body_regex: '(admin|dashboard|管理)'
+        reject_url_regex: '/login(?:[/?#]|$)'
+    on_success: verify-admin
+    critical: true
+  - step_id: verify-admin
+    name: Verify admin access
+    action: condition
+    condition:
+      field: authenticated
+      operator: truthy
+      true_branch: extract-admin-links
+      false_branch: ""
+    critical: true
+  - step_id: extract-admin-links
+    name: Extract first admin function link
+    action: extract
+    extract_rules:
+      - name: admin_link
+        pattern: 'regex:href=["'']([^"'']*(?:admin|manage|dashboard)[^"'']*)'
+        store_as: admin_link

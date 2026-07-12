@@ -1,5 +1,7 @@
 ﻿from pathlib import Path
 
+import re
+
 import pytest
 
 from core.js_analysis.bundle_unpacker import detect_bundler, unpack_bundle
@@ -110,3 +112,84 @@ def test_signature_extractor_contract_for_md5():
     assert result["algorithm"] == "md5"
     assert "sort" in result["operations"]
     assert result["confidence"] > 0
+
+
+def test_replay_preserves_sorted_keys_only_canonicalization(tmp_path):
+    from core.js_analysis.signature_extractor import extract_signature
+
+    source = "function sign(p){ return md5(Object.keys(p).sort().join('&') + 'fixed-salt'); }"
+    result = extract_signature(
+        source,
+        parameter_name="sign",
+        target_url="https://example.test/api",
+        output_dir=tmp_path,
+    )
+
+    assert result["replay_status"] == "signing-scaffold"
+    assert result["canonicalization"] == {
+        "kind": "object_keys",
+        "sort": "lexicographic",
+        "projection": "key",
+        "delimiter": "&",
+    }
+    assert re.findall(r"^def (\w+)\(", result["replay_code"], re.M) == [
+        "canonicalize",
+        "calculate_signature",
+    ]
+    assert "utf-16-be" in result["replay_code"]
+    assert "params[key]" not in result["replay_code"]
+    assert "def send(" not in result["replay_code"]
+    assert "urllib" not in result["replay_code"]
+    assert "json" not in result["replay_code"]
+    assert "POST" not in result["replay_code"]
+
+
+def test_replay_requires_recovered_canonicalization():
+    from core.js_analysis.signature_extractor import extract_signature
+
+    result = extract_signature(
+        "function sign(p){ return md5(p + 'fixed-salt'); }",
+        parameter_name="sign",
+        target_url="https://example.test/api",
+    )
+
+    assert result["algorithm"] == "md5"
+    assert result["canonicalization"] is None
+    assert result["replay_status"] == "unavailable"
+    assert result["replay_code"] is None
+    assert any(item["type"] == "canonicalization" for item in result["unresolved"])
+
+
+def test_storage_key_is_reference_not_embedded_secret():
+    from core.js_analysis.signature_extractor import extract_signature
+
+    source = """
+function sign(p) {
+  const secret = localStorage.getItem('session-secret');
+  return HmacSHA256(Object.keys(p).sort().join('&'), secret);
+}
+"""
+    result = extract_signature(
+        source,
+        parameter_name="sign",
+        target_url="https://example.test/api",
+    )
+
+    assert result["replay_status"] == "signing-scaffold"
+    assert {"source": "local_storage", "reference": "session-secret"} in result["key_sources"]
+    assert "session-secret" not in result["replay_code"]
+    assert "HUNTER_REPLAY_SECRET" in result["replay_code"]
+    assert "secret_from_local_storage" in result["missing_inputs"]
+
+
+def test_cryptojs_namespaced_hash_uses_same_canonical_ir():
+    from core.js_analysis.signature_extractor import extract_signature
+
+    result = extract_signature(
+        "function sign(p){ return CryptoJS.MD5(Object.keys(p).sort().join('|') + 'salt').toString(); }",
+        parameter_name="sign",
+        target_url="https://example.test/api",
+    )
+
+    assert result["replay_status"] == "signing-scaffold"
+    assert result["canonicalization"]["delimiter"] == "|"

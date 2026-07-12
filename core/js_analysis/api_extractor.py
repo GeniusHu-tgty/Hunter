@@ -50,6 +50,7 @@ def _object_value(text: str, key: str) -> str | None:
 
 def extract_api(source: str, source_name: str = "bundle.js") -> dict[str, Any]:
     endpoints, websockets, routes, auth, unresolved = [], [], [], [], []
+    message_formats = []
     def location(offset: int) -> dict[str, Any]: return {"source": source_name, "line": _line(source, offset), "offset": offset}
     def add(kind: str, method: str, expression: str, offset: int, options: str = "") -> None:
         url, confidence, parameters = _literal(expression)
@@ -76,9 +77,19 @@ def extract_api(source: str, source_name: str = "bundle.js") -> dict[str, Any]:
         for match in re.finditer(pattern, source):
             parts = _split(_balanced(source, match.end() - 1))
             if parts:
-                url, confidence, parameters = _literal(parts[0]); websockets.append({"kind": kind, "url": url, "parameters": parameters, "message_formats": [], "confidence": confidence, "location": location(match.start())})
+                url, confidence, parameters = _literal(parts[0]); websockets.append({"kind": kind, "url": url, "parameters": parameters, "message_formats": message_formats, "confidence": confidence, "location": location(match.start())})
+    for match in re.finditer(r"\.send\s*\(\s*JSON\.stringify\s*\(\s*\{([\s\S]*?)\}\s*\)", source):
+        fields = sorted(set(re.findall(r"(?:^|,)\s*([A-Za-z_$][\w$]*)\s*(?::|,|$)", match.group(1))))
+        message_formats.append({"kind": "json", "fields": fields, "location": location(match.start())})
+    for match in re.finditer(r"\.emit\s*\(\s*(['\"])([^'\"]+)\1\s*,\s*\{([\s\S]*?)\}", source):
+        fields = sorted(set(re.findall(r"(?:^|,)\s*([A-Za-z_$][\w$]*)\s*(?::|,|$)", match.group(3))))
+        message_formats.append({"kind": "socket.io", "event": match.group(2), "fields": fields, "location": location(match.start())})
     for pattern, framework in ((r"<Route\b[^>]*\bpath\s*=\s*(?:{\s*)?(['\"])(.*?)\1", "react-router"), (r"\bpath\s*:\s*(['\"])(.*?)\1", "router-config"), (r"RouterModule\.forRoot\s*\(", "angular")):
         for match in re.finditer(pattern, source, re.I | re.S): routes.append({"framework": framework, "path": match.group(2) if (match.lastindex or 0) >= 2 else "<route-array>", "confidence": "confirmed", "location": location(match.start())})
+    if re.search(r"(?:^|[/\\])(?:pages|app)(?:[/\\])|__NEXT_DATA__|__BUILD_MANIFEST", source_name + " " + source, re.I):
+        routes.append({"framework": "next", "path": source_name, "confidence": "confirmed", "location": {"source": source_name, "line": 1, "offset": 0}})
+        for match in re.finditer(r"(['\"])(/api/[^'\"]+)\1", source, re.I):
+            routes.append({"framework": "next", "path": match.group(2), "confidence": "inferred", "location": location(match.start())})
     auth_patterns = {"authorization_header": r"['\"]Authorization['\"]|\bAuthorization\s*:", "bearer_token": r"\bBearer\s+|['\"]Bearer['\"]\s*\+|`Bearer\s+\$\{", "auth_header": r"['\"](?:x-auth-token|x-api-key)['\"]", "token_storage": r"(?:localStorage|sessionStorage)\.(?:getItem|setItem|removeItem)\s*\(\s*(['\"])([^'\"]*(?:token|key|auth)[^'\"]*)\1", "auth_function": r"\b(?:login|logout|refreshToken|refresh_token)\s*[=:;(]"}
     for signal, pattern in auth_patterns.items():
         for match in re.finditer(pattern, source, re.I): auth.append({"type": signal, "value": match.group(2) if (match.lastindex or 0) >= 2 else match.group(0), "confidence": "confirmed", "location": location(match.start())})

@@ -16,8 +16,8 @@ from .captcha_handler import CaptchaHandler
 CSRF_RE=re.compile(r'(?:name=["\'](?P<name>csrf(?:_token)?|_token|authenticity_token)["\'][^>]*value=["\'](?P<value>[^"\']+)|value=["\'](?P<value2>[^"\']+)["\'][^>]*name=["\'](?P<name2>csrf(?:_token)?|_token|authenticity_token)["\'])',re.I)
 
 class StealthHTTPClient:
- def __init__(self,state_dir=None,transport_factory=None,sleep=time.sleep,fingerprint_manager=None,proxy_pool=None):
-  self.state_dir=Path(state_dir or 'sessions/stealth').resolve(); self.state_dir.mkdir(parents=True,exist_ok=True); self.transport_factory=transport_factory or self._default_transport; self.sleep=sleep; self.fingerprints=fingerprint_manager or FingerprintManager(); self.proxy_pool=proxy_pool or ProxyPool(); self.waf=WAFDetector(self.state_dir/'waf_history.json'); self.rate=AdaptiveRateLimiter(sleep=sleep); self.captcha=CaptchaHandler(artifact_dir=self.state_dir/'captcha'); self._sessions={}
+ def __init__(self,state_dir=None,transport_factory=None,sleep=time.sleep,fingerprint_manager=None,proxy_pool=None,persist_secrets=True):
+  self.state_dir=Path(state_dir or 'sessions/stealth').resolve(); self.state_dir.mkdir(parents=True,exist_ok=True); self.transport_factory=transport_factory or self._default_transport; self.sleep=sleep; self.fingerprints=fingerprint_manager or FingerprintManager(); self.proxy_pool=proxy_pool or ProxyPool(); self.waf=WAFDetector(self.state_dir/'waf_history.json'); self.rate=AdaptiveRateLimiter(sleep=sleep); self.captcha=CaptchaHandler(artifact_dir=self.state_dir/'captcha'); self.persist_secrets=bool(persist_secrets); self._sessions={}
  def _default_transport(self):
   if requests is None: raise RuntimeError('requests is required for live HTTP transport')
   s=requests.Session(); return s
@@ -39,7 +39,10 @@ class StealthHTTPClient:
   if key not in self._sessions: self.session_create(target)
   return self._sessions[key]
  def _save(self,state):
-  path=self._path(state['target']); temporary=path.with_suffix(path.suffix+f'.{uuid.uuid4().hex}.tmp'); temporary.write_text(json.dumps(state,ensure_ascii=False,indent=2)+'\n',encoding='utf-8'); os.replace(temporary,path)
+  persisted=deepcopy(state)
+  if not self.persist_secrets:
+   persisted['cookies']={}; persisted['csrf_tokens']={}
+  path=self._path(state['target']); temporary=path.with_suffix(path.suffix+f'.{uuid.uuid4().hex}.tmp'); temporary.write_text(json.dumps(persisted,ensure_ascii=False,indent=2)+'\n',encoding='utf-8'); os.replace(temporary,path)
  def session_state(self,target):
   runtime=self._runtime(target); state=deepcopy(runtime['state']); state['state_path']=str(self._path(state['target'])); return state
  def set_proxy_pool(self,proxies=None,file_path=None,checker=None,target=None):

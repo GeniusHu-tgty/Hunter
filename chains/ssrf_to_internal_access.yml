@@ -1,0 +1,69 @@
+name: ssrf_to_internal_access
+description: SSRF validation and bounded internal-service discovery plan.
+parameters:
+  probe_path: /
+start: probe-ssrf
+steps:
+  - step_id: probe-ssrf
+    name: Probe SSRF
+    action: exploit
+    state: scan
+    options:
+      vuln_type: ssrf
+      confirmed: false
+      action: probe_ssrf
+    on_success: confirm-protocols
+    on_failure: ""
+  - step_id: confirm-protocols
+    name: Confirm supported protocols
+    action: exploit
+    state: exploit
+    options:
+      vuln_type: ssrf
+      confirmed: true
+      capabilities:
+        - internal_access
+      action: confirm_protocol_support
+    on_success: scan-common-ports
+    on_failure: ""
+  - step_id: scan-common-ports
+    name: Scan bounded common internal ports
+    action: exploit
+    options:
+      vuln_type: ssrf
+      confirmed: true
+      capabilities:
+        - internal_access
+      action: scan_common_internal_ports
+      ports:
+        - 80
+        - 443
+        - 8080
+        - 6379
+        - 27017
+        - 3306
+        - 22
+    on_success: identify-services
+    on_failure: ""
+  - step_id: identify-services
+    name: Identify unauthenticated internal services
+    action: exploit
+    options:
+      vuln_type: ssrf
+      confirmed: true
+      capabilities:
+        - internal_access
+      action: identify_unauthenticated_services
+    on_success: extract-sensitive-data
+    on_failure: ""
+  - step_id: extract-sensitive-data
+    name: Prepare sensitive-data access plan
+    action: exploit
+    state: post_exploit
+    options:
+      vuln_type: ssrf
+      confirmed: true
+      capabilities:
+        - metadata_access
+      action: access_cloud_metadata
+    critical: true

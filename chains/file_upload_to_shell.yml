@@ -1,0 +1,79 @@
+name: file_upload_to_shell
+description: Upload validation flow with explicit approval gates for server-side execution.
+parameters:
+  upload_path: /upload
+  uploaded_path: ""
+start: visit-upload
+steps:
+  - step_id: visit-upload
+    name: Visit upload page
+    action: request
+    state: scan
+    request:
+      method: GET
+      path: ${upload_path}
+    on_success: extract-csrf
+    critical: true
+  - step_id: extract-csrf
+    name: Extract CSRF token
+    action: extract
+    extract_rules:
+      - name: csrf
+        pattern: 'regex:name=["''](?:csrf_token|_token)["''][^>]*value=["'']([^"'']+)'
+        store_as: csrf
+    on_success: test-upload-constraints
+    critical: true
+  - step_id: test-upload-constraints
+    name: Test upload constraints
+    action: exploit
+    options:
+      vuln_type: file_upload
+      confirmed: true
+      capabilities:
+        - upload
+      action: test_upload_constraints
+    on_success: generate-variants
+    on_failure: ""
+  - step_id: generate-variants
+    name: Generate bounded upload variants
+    action: exploit
+    options:
+      vuln_type: file_upload
+      confirmed: true
+      capabilities:
+        - upload
+      action: generate_upload_variants
+    on_success: upload-candidate
+    on_failure: ""
+  - step_id: upload-candidate
+    name: Upload approved candidate
+    action: exploit
+    state: exploit
+    options:
+      vuln_type: file_upload
+      confirmed: true
+      capabilities:
+        - upload
+      action: upload_server_script
+    on_success: visit-uploaded-file
+    on_failure: ""
+    critical: true
+  - step_id: visit-uploaded-file
+    name: Visit uploaded file
+    action: request
+    request:
+      method: GET
+      path: ${uploaded_path}
+    on_success: verify-execution
+    critical: true
+  - step_id: verify-execution
+    name: Verify approved execution proof
+    action: exploit
+    state: post_exploit
+    options:
+      vuln_type: file_upload
+      confirmed: true
+      capabilities:
+        - command_execution
+      action: verify_server_execution
+    critical: true

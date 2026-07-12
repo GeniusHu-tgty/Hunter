@@ -1,0 +1,81 @@
+name: jwt_to_account_takeover
+description: JWT weakness validation with explicit approval before forged-token use.
+parameters:
+  token_path: /
+  protected_path: /admin
+  forged_jwt: ""
+start: obtain-jwt
+steps:
+  - step_id: obtain-jwt
+    name: Obtain JWT
+    action: request
+    request:
+      method: GET
+      path: ${token_path}
+    on_success: extract-jwt
+    critical: true
+  - step_id: extract-jwt
+    name: Extract JWT
+    action: extract
+    extract_rules:
+      - name: jwt
+        pattern: 'regex:(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)'
+        store_as: jwt
+    on_success: decode-header
+    critical: true
+  - step_id: decode-header
+    name: Decode JWT payload
+    action: extract
+    extract_rules:
+      - name: jwt_claims
+        pattern: jwt:${jwt}
+        store_as: jwt_claims
+    on_success: test-none
+  - step_id: test-none
+    name: Test none algorithm
+    action: exploit
+    state: scan
+    options:
+      vuln_type: jwt
+      confirmed: true
+      action: test_none_algorithm
+    on_success: test-weak-key
+    on_failure: ""
+  - step_id: test-weak-key
+    name: Test bounded weak-key candidates
+    action: exploit
+    options:
+      vuln_type: jwt
+      confirmed: true
+      action: test_weak_signing_key
+    on_success: test-kid
+    on_failure: ""
+  - step_id: test-kid
+    name: Test KID handling
+    action: exploit
+    options:
+      vuln_type: jwt
+      confirmed: true
+      action: test_kid_injection
+    on_success: access-with-forged-token
+    on_failure: ""
+  - step_id: access-with-forged-token
+    name: Access protected route with approved token
+    action: request
+    state: exploit
+    request:
+      method: GET
+      path: ${protected_path}
+      headers:
+        Authorization: Bearer ${forged_jwt}
+    on_success: verify-authorization
+    critical: true
+  - step_id: verify-authorization
+    name: Verify authorization boundary
+    action: condition
+    condition:
+      field: authenticated
+      operator: truthy
+      true_branch: ""
+      false_branch: ""
+    critical: true
