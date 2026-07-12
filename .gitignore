@@ -10,3 +10,6 @@ npm-cache/
 # Hunter Adaptive Engine runtime artifacts
 evidence/adaptive_cache/
 evidence/adaptive_raw/
+
+evidence/js_analysis/
+sessions/stealth/

@@ -20,7 +20,9 @@ def test_complete_server_exposes_all_legacy_and_v81_tools():
     required = {
         "hunter_scan", "hunter_recon", "hunter_vuln_scan",
         "hunter_subdomain", "hunter_port_scan", "hunter_tech_detect",
-        "hunter_dir_enum", "hunter_js_analyze",
+        "hunter_dir_enum", "hunter_js_analyze", "hunter_js_unpack",
+        "hunter_js_deobfuscate", "hunter_js_extract_api",
+        "hunter_js_extract_signature", "hunter_js_full_analysis",
         "hunter_auto_sqli", "hunter_auto_xss", "hunter_auto_ssrf",
         "hunter_auto_ssti", "hunter_auto_cmd", "hunter_auto_xxe",
         "hunter_auto_idor", "hunter_auto_csrf", "hunter_auto_cors",
@@ -33,9 +35,11 @@ def test_complete_server_exposes_all_legacy_and_v81_tools():
         "hunter_burp_import", "hunter_payload_list", "hunter_payload_search",
         "hunter_payload_get", "hunter_payload_generate", "hunter_session_list",
         "hunter_session_status", "hunter_agents_list", "hunter_phases_list", "hunter_report",
+        "hunter_stealth_request", "hunter_stealth_scan", "hunter_session_create",
+        "hunter_session_state", "hunter_set_proxy_pool",
     }
     assert required - registered_functions(mcp_server) == set()
-    assert len(required) == 45
+    assert len(required) == 55
 
 
 def test_project_mcp_config_has_only_hunter_tools():

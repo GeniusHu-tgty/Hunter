@@ -15,7 +15,7 @@ The kernel stores revisioned, hash-chained `workflow.events.jsonl`, atomically m
 
 ## MCP v8.1 Tool Surface
 
-- Total complete `hunter_tools` MCP tools: 80
+- Total complete `hunter_tools` MCP tools: 90
 - Meta/orchestration: `hunter_healthcheck`, `hunter_capabilities`, `hunter_recommend_next`, `hunter_agents_list`, `hunter_phases_list`
 - Pipelines: `hunter_scan`, `hunter_recon`, `hunter_vuln_scan`
 - Recon atomics: `hunter_subdomain`, `hunter_port_scan`, `hunter_tech_detect`, `hunter_dir_enum`, `hunter_js_analyze`

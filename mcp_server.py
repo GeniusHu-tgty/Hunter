@@ -13,6 +13,7 @@ Tools:
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -23,7 +24,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 from mcp.server.fastmcp import FastMCP
 
@@ -46,6 +49,10 @@ from core.doctor import HunterDoctor
 from core.adaptive_engine import AdaptiveEngine, get_mode_profile
 from core.recon_cache import ReconCache
 from core.workflow import WorkflowKernel, WorkflowPolicy
+from core.js_analysis.api_extractor import extract_api
+from core.js_analysis.bundle_unpacker import unpack_bundle
+from core.js_analysis.deobfuscator import deobfuscate
+from core.js_analysis.signature_extractor import extract_signature
 
 # ============================================================
 # MCP Server
@@ -66,6 +73,10 @@ _hunter_tools = HunterToolsFacade(HUNTER_DIR)
 _workspace = OpenTgtyLabWorkspaceAdapter()
 _adaptive_cache = ReconCache(HUNTER_DIR / "evidence" / "adaptive_cache")
 _adaptive_engine = AdaptiveEngine(_adaptive_cache, HUNTER_DIR / "evidence" / "adaptive_raw")
+JS_ANALYSIS_EVIDENCE_DIR = HUNTER_DIR / "evidence" / "js_analysis"
+JS_REPLAY_DIR = Path(os.getenv("OPEN_TGTYLAB_ROOT", str(HUNTER_DIR))) / "exports" / "scripts"
+JS_ANALYSIS_MAX_BYTES = 10 * 1024 * 1024
+JS_ANALYSIS_TIMEOUT_SECONDS = 15
 
 def _reset_workspace_adapter(root: Optional[str | Path] = None) -> OpenTgtyLabWorkspaceAdapter:
     """Re-discover workspace after environment/config changes (also useful for tests)."""
@@ -76,6 +87,18 @@ def _workflow_kernel() -> WorkflowKernel:
     """Bind workflow persistence to the active OpenTgtyLab workspace."""
     return WorkflowKernel(_workspace.root)
 
+
+
+_stealth_client = None
+
+def _reset_stealth_client(state_dir: Optional[str | Path] = None):
+    global _stealth_client
+    from core.stealth.stealth_http_client import StealthHTTPClient
+    _stealth_client = StealthHTTPClient(state_dir or (HUNTER_DIR / "sessions" / "stealth"))
+    return _stealth_client
+
+def _get_stealth_client():
+    return _stealth_client or _reset_stealth_client()
 
 _WORDLIST_ALIASES = {
     "default": "common.txt",
@@ -803,6 +826,162 @@ async def hunter_js_analyze(target: str) -> str:
     return await _run_single_agent("js-analyze", target)
 
 
+class _ScriptSourceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sources: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() == "script":
+            source = dict(attrs).get("src")
+            if source:
+                self.sources.append(source)
+
+
+def _fetch_js_analysis_url(url: str) -> tuple[str, str, str]:
+    request = Request(url, headers={"User-Agent": "Hunter-JS-Analysis/1.0"})
+    with urlopen(request, timeout=JS_ANALYSIS_TIMEOUT_SECONDS) as response:
+        declared = response.headers.get("Content-Length")
+        if declared and int(declared) > JS_ANALYSIS_MAX_BYTES:
+            raise ValueError("remote input exceeds 10MB limit")
+        content = response.read(JS_ANALYSIS_MAX_BYTES + 1)
+        if len(content) > JS_ANALYSIS_MAX_BYTES:
+            raise ValueError("remote input exceeds 10MB limit")
+        content_type = response.headers.get_content_type()
+        charset = response.headers.get_content_charset() or "utf-8"
+        return content_type, content.decode(charset, errors="replace"), response.geturl()
+
+
+def _load_js_analysis_input(value: str) -> Dict[str, Any]:
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"}:
+        content_type, content, final_url = _fetch_js_analysis_url(value)
+        sources = [{"name": final_url, "code": content}]
+        if content_type == "text/html" or "<script" in content.lower():
+            parser = _ScriptSourceParser()
+            parser.feed(content)
+            sources = []
+            for source in dict.fromkeys(parser.sources):
+                _, script_code, resolved_url = _fetch_js_analysis_url(urljoin(final_url, source))
+                sources.append({"name": resolved_url, "code": script_code})
+        if not sources:
+            raise ValueError("HTML input did not reference external JavaScript")
+        return {"kind": "url", "value": final_url, "sources": sources, "script_count": len(sources)}
+    path = Path(value).expanduser()
+    if path.is_file():
+        if path.stat().st_size > JS_ANALYSIS_MAX_BYTES:
+            raise ValueError("local input exceeds 10MB limit")
+        code = path.read_text(encoding="utf-8", errors="replace")
+        return {"kind": "path", "value": str(path.resolve()), "sources": [{"name": path.name, "code": code}], "script_count": 1}
+    if any(marker in value for marker in (";", "function", "=>", "fetch(", "axios", "var ", "const ", "let ")):
+        if len(value.encode("utf-8")) > JS_ANALYSIS_MAX_BYTES:
+            raise ValueError("inline code exceeds 10MB limit")
+        return {"kind": "code", "value": "inline", "sources": [{"name": "inline.js", "code": value}], "script_count": 1}
+    raise FileNotFoundError(f"JavaScript input not found: {value}")
+
+
+def _js_artifact_dir(tool: str, input_value: str) -> Path:
+    digest = hashlib.sha256(input_value.encode("utf-8", errors="replace")).hexdigest()[:12]
+    destination = JS_ANALYSIS_EVIDENCE_DIR / f"{tool.removeprefix('hunter_js_')}_{digest}_{int(time.time())}"
+    destination.mkdir(parents=True, exist_ok=True)
+    return destination
+
+
+def _js_envelope(tool: str, data: Dict[str, Any], evidence: Dict[str, Any], next_actions: Optional[List[str]] = None) -> str:
+    return _json_dumps({"tool": tool, "status": "ok", "data": data, "evidence": evidence, "next_actions": next_actions or []})
+
+
+async def _run_js_tool(tool: str, operation, input_value: str) -> str:
+    try:
+        return await asyncio.to_thread(operation, input_value)
+    except Exception as exc:
+        return _json_dumps({"tool": tool, "status": "error", "data": {}, "evidence": {}, "next_actions": [], "error": str(exc)})
+
+
+def _unpack_js_input(input_value: str) -> str:
+    loaded = _load_js_analysis_input(input_value)
+    destination = _js_artifact_dir("hunter_js_unpack", loaded["value"])
+    results = [unpack_bundle(source["code"], destination / f"source_{index}", source_name=source["name"]) for index, source in enumerate(loaded["sources"])]
+    primary = results[0]
+    data = {"bundler": primary["bundler"], "modules": primary.get("modules", []), "sources": len(results)}
+    return _js_envelope("hunter_js_unpack", data, {"input": {key: loaded[key] for key in ("kind", "value", "script_count")}, "artifact_dir": str(destination), "results": results})
+
+
+def _deobfuscate_js_input(input_value: str) -> str:
+    loaded = _load_js_analysis_input(input_value)
+    destination = _js_artifact_dir("hunter_js_deobfuscate", loaded["value"])
+    results = []
+    for index, source in enumerate(loaded["sources"]):
+        result = deobfuscate(source["code"])
+        output = destination / f"deobfuscated_{index}.js"
+        output.write_text(result["code"], encoding="utf-8")
+        results.append({"source": source["name"], "path": str(output), "transformations": result.get("transformations", {})})
+    preview = (destination / "deobfuscated_0.js").read_text(encoding="utf-8")[:4000]
+    return _js_envelope("hunter_js_deobfuscate", {"code_preview": preview, "sources": results}, {"input": {key: loaded[key] for key in ("kind", "value", "script_count")}, "artifact_dir": str(destination)})
+
+
+def _extract_api_js_input(input_value: str) -> str:
+    loaded = _load_js_analysis_input(input_value)
+    destination = _js_artifact_dir("hunter_js_extract_api", loaded["value"])
+    combined = {"endpoints": [], "websockets": [], "routes": [], "auth": [], "unresolved": []}
+    for source in loaded["sources"]:
+        result = extract_api(source["code"], source_name=source["name"])
+        for key in combined:
+            combined[key].extend(result.get(key, []))
+    output = destination / "api_inventory.json"
+    output.write_text(_json_dumps(combined), encoding="utf-8")
+    return _js_envelope("hunter_js_extract_api", combined, {"input": {key: loaded[key] for key in ("kind", "value", "script_count")}, "artifact": str(output)})
+
+
+def _extract_signature_js_input(input_value: str, parameter_name: Optional[str]) -> str:
+    loaded = _load_js_analysis_input(input_value)
+    source = "\n".join(item["code"] for item in loaded["sources"])
+    result = extract_signature(source, parameter_name=parameter_name, target_url=loaded["value"] if loaded["kind"] == "url" else "", output_dir=JS_REPLAY_DIR)
+    destination = _js_artifact_dir("hunter_js_extract_signature", loaded["value"])
+    output = destination / "signature_analysis.json"
+    output.write_text(_json_dumps({key: value for key, value in result.items() if key != "replay_code"}), encoding="utf-8")
+    evidence = {"input": {key: loaded[key] for key in ("kind", "value", "script_count")}, "artifact": str(output), "replay_script": result.get("replay_script")}
+    data = {key: value for key, value in result.items() if key not in {"replay_code", "candidates"}}
+    return _js_envelope("hunter_js_extract_signature", data, evidence, ["Validate the generated replay script against an authorized captured request."])
+
+
+@mcp.tool()
+async def hunter_js_unpack(input_value: str) -> str:
+    """Unpack a JavaScript bundle from inline code, local path, or HTTP(S) URL."""
+    return await _run_js_tool("hunter_js_unpack", _unpack_js_input, input_value)
+
+
+@mcp.tool()
+async def hunter_js_deobfuscate(input_value: str) -> str:
+    """Deobfuscate JavaScript from inline code, local path, or HTTP(S) URL."""
+    return await _run_js_tool("hunter_js_deobfuscate", _deobfuscate_js_input, input_value)
+
+
+@mcp.tool()
+async def hunter_js_extract_api(input_value: str) -> str:
+    """Extract APIs from JavaScript or scripts referenced by an HTML URL."""
+    return await _run_js_tool("hunter_js_extract_api", _extract_api_js_input, input_value)
+
+
+@mcp.tool()
+async def hunter_js_extract_signature(input_value: str, parameter_name: Optional[str] = None) -> str:
+    """Locate request-signature logic and generate a Python replay scaffold."""
+    return await _run_js_tool("hunter_js_extract_signature", lambda value: _extract_signature_js_input(value, parameter_name), input_value)
+
+
+@mcp.tool()
+async def hunter_js_full_analysis(input_value: str, parameter_name: Optional[str] = None) -> str:
+    """Run unpack, deobfuscation, API extraction, and signature analysis."""
+    try:
+        results = {}
+        operations = (("unpack", _unpack_js_input), ("deobfuscate", _deobfuscate_js_input), ("api", _extract_api_js_input), ("signature", lambda value: _extract_signature_js_input(value, parameter_name)))
+        for name, operation in operations:
+            results[name] = json.loads(await asyncio.to_thread(operation, input_value))
+        return _json_dumps({"tool": "hunter_js_full_analysis", "status": "ok", "data": results, "evidence": {"stages": [item.get("evidence", {}) for item in results.values()]}, "next_actions": ["Review unresolved static-analysis findings and validate signatures dynamically."]})
+    except Exception as exc:
+        return _json_dumps({"tool": "hunter_js_full_analysis", "status": "error", "data": {}, "evidence": {}, "next_actions": [], "error": str(exc)})
+
+
 # ============================================================
 # Auto-* Direct Tools (v8 hardened)
 # ============================================================
@@ -1103,6 +1282,10 @@ async def hunter_healthcheck() -> str:
         "hunter_kb_list", "hunter_kb_search", "hunter_kb_read", "hunter_kb_recommend",
         "hunter_burp_bridge", "hunter_burp_repeater", "hunter_burp_proxy_search",
         "hunter_burp_scanner_issues", "hunter_burp_collaborator_workflow",
+        "hunter_js_unpack", "hunter_js_deobfuscate", "hunter_js_extract_api",
+        "hunter_js_extract_signature", "hunter_js_full_analysis",
+        "hunter_stealth_request", "hunter_stealth_scan", "hunter_session_create",
+        "hunter_session_state", "hunter_set_proxy_pool",
     ]
     registered = _registered_hunter_tools()
     missing_mcp = [name for name in required_mcp if name not in registered]
@@ -1178,6 +1361,16 @@ async def hunter_capabilities() -> str:
         "hunter_tech_detect": ("recon", "Technology fingerprinting"),
         "hunter_dir_enum": ("recon", "Directory/path enumeration"),
         "hunter_js_analyze": ("recon", "JavaScript and endpoint extraction"),
+        "hunter_js_unpack": ("js-analysis", "Unpack modern JavaScript bundles"),
+        "hunter_js_deobfuscate": ("js-analysis", "Conservative JavaScript deobfuscation"),
+        "hunter_js_extract_api": ("js-analysis", "Extract HTTP, WebSocket, route, and auth usage"),
+        "hunter_js_extract_signature": ("js-analysis", "Locate signature logic and generate replay scripts"),
+        "hunter_js_full_analysis": ("js-analysis", "Run the complete JavaScript analysis pipeline"),
+        "hunter_stealth_request": ("stealth-http", "Send adaptive stateful HTTP request"),
+        "hunter_stealth_scan": ("stealth-http", "Detect WAF, rate limits, and captcha"),
+        "hunter_session_create": ("stealth-http", "Create or restore target HTTP session"),
+        "hunter_session_state": ("stealth-http", "Inspect target HTTP session state"),
+        "hunter_set_proxy_pool": ("stealth-http", "Configure classified proxy pool"),
         "hunter_auto_sqli": ("auto-vuln", "SQL injection checks"),
         "hunter_auto_xss": ("auto-vuln", "XSS checks"),
         "hunter_auto_ssrf": ("auto-vuln", "SSRF checks"),
@@ -1716,6 +1909,36 @@ async def hunter_report(session_id: str, format: str = "markdown", style: str = 
         return _render_markdown_report(session, style=style)
 
 
+
+
+# ============================================================
+# Stateful adaptive HTTP infrastructure
+# ============================================================
+
+@mcp.tool()
+async def hunter_session_create(target: str, resume: bool = True, fingerprint_strategy: str = "random") -> str:
+    """Create or restore an isolated target HTTP session."""
+    return _workflow_result("hunter_session_create", _get_stealth_client().session_create, target, resume, fingerprint_strategy)
+
+@mcp.tool()
+async def hunter_session_state(target: str) -> str:
+    """Inspect target session cookies, tokens, fingerprint, proxy, and timeline."""
+    return _workflow_result("hunter_session_state", _get_stealth_client().session_state, target)
+
+@mcp.tool()
+async def hunter_set_proxy_pool(proxies: Optional[List[str]] = None, file_path: str = "") -> str:
+    """Configure the classified HTTP/HTTPS/SOCKS5 proxy pool."""
+    return _workflow_result("hunter_set_proxy_pool", _get_stealth_client().set_proxy_pool, proxies or [], file_path or None)
+
+@mcp.tool()
+async def hunter_stealth_request(method: str, url: str, headers: Optional[Dict[str, str]] = None, data: Optional[Any] = None, options: Optional[Dict[str, Any]] = None) -> str:
+    """Send a stateful adaptive request with fingerprint, WAF/rate-limit/captcha handling."""
+    return _workflow_result("hunter_stealth_request", _get_stealth_client().stealth_request, method, url, headers, data, options or {})
+
+@mcp.tool()
+async def hunter_stealth_scan(target: str, options: Optional[Dict[str, Any]] = None) -> str:
+    """Run bounded WAF, rate-limit, and captcha reconnaissance for a target."""
+    return _workflow_result("hunter_stealth_scan", _get_stealth_client().stealth_scan, target, options or {})
 
 # ============================================================
 # Unified CTF / reverse / pentest workflow kernel

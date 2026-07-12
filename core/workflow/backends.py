@@ -12,11 +12,14 @@ class BackendRegistry:
         return cls({
             "web": [{"server": "hunter_tools", "execution": "native", "capabilities": ["hunter_fast_scan", "hunter_scan_plan", "hunter_auto_access_control"]}],
             "api": [{"server": "hunter_tools", "execution": "native", "capabilities": ["hunter_fast_scan", "hunter_auto_graphql", "hunter_auto_idor"]}],
-            "source": [{"server": "hunter_tools", "execution": "native", "capabilities": ["hunter_js_analyze", "hunter_kb_recommend"]}],
+            "source": [{"server": "hunter_tools", "execution": "native", "capabilities": ["hunter_js_analyze", "hunter_js_extract_api", "hunter_js_full_analysis", "hunter_kb_recommend"]}],
             "pe": [{**common_reverse, "capabilities": ["triage_pe", "die_scan", "ghidra_headless_analyze", "sample_full_workup"]}, {"server": "ghidra", "execution": "external-mcp", "capabilities": ["decompile_function", "get_function_xrefs"]}],
             "pwn": [{**common_reverse, "capabilities": ["triage_pe", "rizin_bin_info", "ghidra_headless_analyze", "make_x64dbg_breakpoint_script"]}, {"server": "ghidra", "execution": "external-mcp", "capabilities": ["decompile_function", "disassemble_function"]}],
             "apk": [{**common_reverse, "capabilities": ["android_app_baseline", "android_package_info", "android_http_observation_recipe", "android_crypto_unpack_recipe"]}],
-            "javascript": [{"server": "jshook", "execution": "external-mcp", "capabilities": ["collect_code", "search_in_scripts", "extract_function_tree", "manage_hooks"]}],
+            "javascript": [
+                {"server": "jshook", "execution": "external-mcp", "capabilities": ["collect_code", "search_in_scripts", "extract_function_tree", "manage_hooks"]},
+                {"server": "hunter_tools", "execution": "native", "capabilities": ["hunter_js_unpack", "hunter_js_deobfuscate", "hunter_js_extract_api", "hunter_js_extract_signature", "hunter_js_full_analysis"]},
+            ],
             "firmware": [{**common_reverse, "capabilities": ["hash_file", "die_scan", "carve_payloads_from_dump", "sample_full_workup"]}],
             "script": [{"server": "jshook", "execution": "external-mcp", "capabilities": ["detect_obfuscation", "advanced_deobfuscate", "detect_crypto", "understand_code"]}],
             "document": [{**common_reverse, "capabilities": ["hash_file", "die_scan", "sample_full_workup"]}],
