@@ -364,3 +364,15 @@ Hunter publishes `integration-contract.json` as the machine-readable compatibili
 - `hunter_doctor`
 
 Run `hunter_doctor` after install/update or when the MCP registry changes. CI tests the contract and complete pytest suite on Windows and Linux.
+
+## Adaptive Engine v1
+
+Use `hunter_fast_scan` for the first pass. It executes a bounded DAG, runs independent agents concurrently, reuses target/profile cache, persists raw results, and returns a compact evidence envelope. Preview work with `hunter_scan_plan`; measure local scheduling/cache/compaction with `hunter_scan_benchmark`; inspect or clear cache with `hunter_cache_status` and `hunter_cache_clear`.
+
+Profiles:
+
+- `fast`: 180s, 10 tools, concurrency 4, compact 16KB response.
+- `standard`: 1200s, 24 tools, concurrency 6, compact 32KB response.
+- `deep`: 3600s, 50 tools, concurrency 8, compact 64KB response.
+
+Raw scanner output is written under `evidence/adaptive_raw`; MCP responses contain top findings, signals, agent summaries, metrics, artifact path and SHA-256 instead of unbounded stdout.

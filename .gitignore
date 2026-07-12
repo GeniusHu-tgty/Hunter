@@ -7,3 +7,6 @@ __pycache__/
 pip-cache/
 npm-cache/
 *.body
+# Hunter Adaptive Engine runtime artifacts
+evidence/adaptive_cache/
+evidence/adaptive_raw/

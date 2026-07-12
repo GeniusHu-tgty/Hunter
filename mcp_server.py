@@ -43,6 +43,8 @@ from payloads.loader import PayloadLoader
 from core.hunter_tools_facade import HunterToolsFacade
 from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
 from core.doctor import HunterDoctor
+from core.adaptive_engine import AdaptiveEngine, get_mode_profile
+from core.recon_cache import ReconCache
 
 # ============================================================
 # MCP Server
@@ -61,6 +63,8 @@ _payload_loader = PayloadLoader(str(HUNTER_DIR / "payloads"))
 _hunter = get_hunter()
 _hunter_tools = HunterToolsFacade(HUNTER_DIR)
 _workspace = OpenTgtyLabWorkspaceAdapter()
+_adaptive_cache = ReconCache(HUNTER_DIR / "evidence" / "adaptive_cache")
+_adaptive_engine = AdaptiveEngine(_adaptive_cache, HUNTER_DIR / "evidence" / "adaptive_raw")
 
 def _reset_workspace_adapter(root: Optional[str | Path] = None) -> OpenTgtyLabWorkspaceAdapter:
     """Re-discover workspace after environment/config changes (also useful for tests)."""
@@ -559,91 +563,84 @@ async def hunter_scan(
     mode: str = "standard",
     phases: Optional[List[str]] = None,
 ) -> str:
-    """
-    Run full pentest pipeline on target.
+    """Run a budgeted, cache-aware adaptive scan. Modes: fast/standard/deep; quick/aggressive remain aliases."""
+    async def adaptive_runner(agent_name: str, scan_target: str, **kwargs) -> Dict[str, Any]:
+        execution = await _execute_agent_async(agent_name, scan_target, **kwargs)
+        execution.update(_discover_evidence_attachments(agent_name, scan_target))
+        execution.update(_build_submission_metadata(agent_name, execution))
+        agent_def = AGENTS.get(agent_name)
+        execution.setdefault("agent", agent_name)
+        if agent_def:
+            execution.setdefault("display_name", agent_def.display_name)
+        return execution
 
-    Args:
-        target: Target domain or IP (e.g. "example.com")
-        mode: Scan intensity - "quick" (5min), "standard" (30min), "aggressive" (60min+)
-        phases: Specific phases to run. Default: all 5 phases.
-                Options: ["pre-recon", "recon", "vulnerability-analysis", "exploitation", "reporting"]
-
-    Returns:
-        JSON with session_id, findings, and summary.
-    """
-    session_id = f"hunter-{int(time.time())}"
+    try:
+        result = await _adaptive_engine.execute(target, mode=mode, phases=phases, runner=adaptive_runner)
+    except ValueError as exc:
+        return _json_dumps({"status": "error", "error": str(exc), "target": target, "mode": mode})
+    session_id = f"hunter-{int(time.time() * 1000)}"
     session = AuditSession(session_id, target)
     _sessions[session_id] = session
-
-    session.log_event("scan_start", {"target": target, "mode": mode})
-
-    if phases is None:
-        phase_names = [p.value for p in PhaseName]
-    else:
-        phase_names = phases
-
-    # Build agent list from selected phases
-    agents_to_run = []
-    for phase_name in phase_names:
-        try:
-            pn = PhaseName(phase_name)
-            config = PHASES[pn]
-            agents_to_run.extend(config.agents)
-        except (ValueError, KeyError):
-            return json.dumps({"error": f"Unknown phase: {phase_name}"})
-
-    # Execute agents through the local tool runner
-    results = []
-    for agent_name in agents_to_run:
-        agent_def = AGENTS.get(agent_name)
-        if not agent_def:
-            continue
-
-        session.log_agent_start(agent_name)
-        start = time.time()
-        execution = await _execute_agent_async(agent_name, target, mode=mode)
-        execution.update(_discover_evidence_attachments(agent_name, target))
-        execution.update(_build_submission_metadata(agent_name, execution))
-        result = {
-            "agent": agent_name,
-            "display_name": agent_def.display_name,
-            **execution,
-        }
-        results.append(result)
-
-        duration = time.time() - start
-        session.log_agent_end(agent_name, execution.get("status") != "error", duration)
-
-    session.log_event("scan_complete", {
-        "target": target,
-        "agents_run": len(results),
-        "mode": mode,
-    })
-    reportable_findings = [_result_to_report_item(item) for item in results if item.get("reportable")]
-    lead_findings = [_result_to_report_item(item) for item in results if not item.get("reportable")]
-    summary = {
-        "total": len(results),
-        "reportable_count": len(reportable_findings),
-        "lead_count": len(lead_findings),
-        "mode": mode,
-    }
+    session.log_event("adaptive_scan_complete", result.get("metrics", {}))
+    raw_results = result.get("results", [])
+    reportable_findings = [_result_to_report_item(item) for item in raw_results if item.get("reportable")]
+    lead_findings = [_result_to_report_item(item) for item in raw_results if not item.get("reportable")]
+    summary = dict(result.get("compact", {}).get("summary", {}))
+    summary.update(result.get("metrics", {}))
     session.set_report_data(reportable_findings=reportable_findings, lead_findings=lead_findings, summary=summary)
-
+    compact = result.get("compact", {})
     output = {
         "session_id": session_id,
         "target": target,
-        "mode": mode,
-        "phases": phase_names,
-        "agents_run": len(results),
-        "results": results,
-        "status": "complete",
-        "reportable_findings": reportable_findings,
-        "lead_findings": lead_findings,
-        "summary": summary,
-        "note": "Executed through the local Hunter tool runner (subfinder/httpx/naabu/ffuf/nuclei/sqlmap/dalfox/etc.).",
+        "mode": result.get("profile"),
+        "status": result.get("status"),
+        "summary": compact.get("summary", {}),
+        "signals": compact.get("signals", []),
+        "top_findings": compact.get("top_findings", []),
+        "artifact_path": compact.get("artifact_path"),
+        "bytes": compact.get("bytes", {}),
+        "metrics": result.get("metrics", {}),
+        "plan": result.get("plan", {}),
     }
+    return _json_dumps(output)
 
-    return json.dumps(output, indent=2, ensure_ascii=False)
+
+@mcp.tool()
+async def hunter_fast_scan(target: str, phases: Optional[List[str]] = None, use_cache: bool = True) -> str:
+    """Run the low-cost fast adaptive profile and return a compact evidence envelope."""
+    result = await _adaptive_engine.execute(target, mode="fast", phases=phases, runner=_execute_agent_async, use_cache=use_cache)
+    compact = result.get("compact", {})
+    return _json_dumps({"status": result.get("status"), "target": target, "profile": "fast", "summary": compact.get("summary", {}), "signals": compact.get("signals", []), "top_findings": compact.get("top_findings", []), "artifact_path": compact.get("artifact_path"), "bytes": compact.get("bytes", {}), "metrics": result.get("metrics", {}), "plan": result.get("plan", {})})
+
+
+@mcp.tool()
+async def hunter_scan_plan(target: str, mode: str = "fast", phases: Optional[List[str]] = None) -> str:
+    """Preview adaptive DAG layers, limits, TTL and selected agents without executing them."""
+    try:
+        plan = _adaptive_engine.plan(target, mode, phases)
+        profile = get_mode_profile(mode)
+        return _json_dumps({"tool": "hunter_scan_plan", "status": "ok", "data": {"target": target, "profile": {**plan["profile_data"], "layers": [list(layer) for layer in profile.layers]}, "layers": [list(layer) for layer in plan["layers"]], "agents": plan["agents"]}})
+    except ValueError as exc:
+        return _json_dumps({"tool": "hunter_scan_plan", "status": "error", "error": str(exc)})
+
+
+@mcp.tool()
+async def hunter_scan_benchmark(agent_delay_ms: int = 50, payload_bytes: int = 10000) -> str:
+    """Benchmark simulated serial vs DAG execution, cache reuse, and result compaction."""
+    result = await _adaptive_engine.benchmark(max(1, agent_delay_ms) / 1000.0, max(256, payload_bytes))
+    return _json_dumps({"tool": "hunter_scan_benchmark", "status": "ok", "data": result})
+
+
+@mcp.tool()
+async def hunter_cache_status() -> str:
+    """Inspect target/profile adaptive recon cache entries and size."""
+    return _json_dumps({"tool": "hunter_cache_status", "status": "ok", "data": _adaptive_cache.status()})
+
+
+@mcp.tool()
+async def hunter_cache_clear(target: str = "", profile: str = "") -> str:
+    """Clear adaptive recon cache globally or for a normalized target/profile."""
+    return _json_dumps({"tool": "hunter_cache_clear", "status": "ok", "data": _adaptive_cache.clear(target, profile)})
 
 
 @mcp.tool()
@@ -1096,6 +1093,7 @@ async def hunter_healthcheck() -> str:
         "hunter_auto_cors", "hunter_auto_jwt", "hunter_auto_graphql", "hunter_auto_websocket",
         "hunter_auto_race", "hunter_auto_access_control", "hunter_unified_scan",
         "hunter_healthcheck", "hunter_capabilities", "hunter_recommend_next",
+        "hunter_fast_scan", "hunter_scan_plan", "hunter_scan_benchmark", "hunter_cache_status", "hunter_cache_clear",
         "hunter_kb_list", "hunter_kb_search", "hunter_kb_read", "hunter_kb_recommend",
         "hunter_burp_bridge", "hunter_burp_repeater", "hunter_burp_proxy_search",
         "hunter_burp_scanner_issues", "hunter_burp_collaborator_workflow",
@@ -1133,6 +1131,7 @@ async def hunter_healthcheck() -> str:
         "hunter_tools": _hunter_tools.health().get("data", {}),
         "workspace": _workspace.health().get("data", {}),
         "integration_v2": _doctor().run()["data"]["checks"],
+        "adaptive_engine": {"profiles": ["fast", "standard", "deep"], "cache": _adaptive_cache.status()},
         "notes": [
             "网络型扫描依赖外部 CLI；缺失时仍可使用 payload/meta/report 工具。",
             "所有 auto 工具经 safe wrapper 返回 JSON，不应把异常泄漏到 MCP 层。",
@@ -1148,6 +1147,11 @@ async def hunter_capabilities() -> str:
         "hunter_recon": ("pipeline", "Recon pipeline"),
         "hunter_vuln_scan": ("pipeline", "Recon + vulnerability-analysis pipeline"),
         "hunter_scan": ("pipeline", "Configurable full pipeline"),
+        "hunter_fast_scan": ("adaptive", "Low-cost fast adaptive DAG scan"),
+        "hunter_scan_plan": ("adaptive", "Preview adaptive DAG and budget"),
+        "hunter_scan_benchmark": ("adaptive", "Benchmark parallelism, cache and compaction"),
+        "hunter_cache_status": ("adaptive", "Inspect target/profile recon cache"),
+        "hunter_cache_clear": ("adaptive", "Clear adaptive recon cache"),
         "hunter_subdomain": ("recon", "Subdomain enumeration"),
         "hunter_port_scan": ("recon", "Port scanning"),
         "hunter_tech_detect": ("recon", "Technology fingerprinting"),
