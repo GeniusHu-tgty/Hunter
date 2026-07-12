@@ -19,6 +19,7 @@ import ipaddress
 import inspect
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -1374,12 +1375,31 @@ def _reverse_pipeline_class(sample_path: str | Path, sample_type: str = "auto"):
 
 
 def _load_reverse_pipeline(pipeline_id: str):
-    state_path = REVERSE_PIPELINE_ROOT / pipeline_id / "state.json"
+    if (
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", pipeline_id)
+        or ".." in pipeline_id
+    ):
+        raise ValueError("pipeline_id must be a safe relative identifier")
+    root = REVERSE_PIPELINE_ROOT.expanduser().resolve()
+    state_path = root / pipeline_id / "state.json"
     if not state_path.is_file():
+        state_path = next(
+            (
+                candidate
+                for candidate in root.rglob("state.json")
+                if json.loads(candidate.read_text(encoding="utf-8")).get("pipeline_id")
+                == pipeline_id
+            ),
+            None,
+        )
+    if state_path is None or not state_path.is_file():
         raise KeyError(f"reverse pipeline not found: {pipeline_id}")
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    resolved_state = state_path.resolve()
+    if root not in resolved_state.parents:
+        raise ValueError("pipeline state resolves outside reverse pipeline root")
+    state = json.loads(resolved_state.read_text(encoding="utf-8"))
     pipeline_class = AndroidPipeline if state.get("pipeline_kind") == "android" else BinaryPipeline
-    return pipeline_class.load(pipeline_id, output_root=REVERSE_PIPELINE_ROOT)
+    return pipeline_class.load(pipeline_id, output_root=root)
 
 
 @mcp.tool()

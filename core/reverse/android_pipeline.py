@@ -529,10 +529,24 @@ class AndroidPipeline(BinaryPipeline):
             for entry in archive.infolist():
                 if remaining <= 0 or entry.file_size > 2 * 1024 * 1024:
                     continue
+                if entry.filename == "AndroidManifest.xml":
+                    continue
                 payload = archive.read(entry)
                 remaining -= len(payload)
                 values.extend(item["value"] for item in extract_strings(payload))
-        strings = [{"value": str(value)} for value in dict.fromkeys(values) if value]
+        normalized_values = []
+        for value in dict.fromkeys(values):
+            text = str(value).strip()
+            if not text:
+                continue
+            urls = re.findall(r"https?://[^\s\"'<>]+", text)
+            normalized_values.extend(urls)
+            if not urls or (" " not in text and "\t" not in text):
+                normalized_values.append(text)
+        strings = [
+            {"value": value}
+            for value in dict.fromkeys(normalized_values)
+        ]
         static = {
             "strings": strings,
             "string_groups": group_strings(strings),

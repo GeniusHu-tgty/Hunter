@@ -191,6 +191,20 @@ def test_backend_error_marks_step_failed_instead_of_completed(tmp_path):
     assert pipeline.state["handoffs"][0]["status"] == "failed"
 
 
+def test_backend_error_without_status_is_not_treated_as_success(tmp_path):
+    sample = tmp_path / "implicit-error.exe"
+    sample.write_bytes(b"MZ\x00")
+
+    pipeline = BinaryPipeline(
+        sample,
+        output_root=tmp_path / "implicit-error-output",
+        backend_runner=lambda server, tool, arguments: {"error": "backend timed out"},
+    )
+
+    with pytest.raises(RuntimeError, match="backend timed out"):
+        pipeline.run_step("triage")
+
+
 def test_pipeline_rejects_changed_sample_on_reload(tmp_path):
     sample = tmp_path / "mutable.exe"
     sample.write_bytes(b"MZ\x00first")
@@ -203,6 +217,18 @@ def test_pipeline_rejects_changed_sample_on_reload(tmp_path):
             pipeline.pipeline_id,
             output_root=tmp_path / "mutable-output",
         )
+
+
+def test_concurrent_pipeline_instances_detect_revision_conflict(tmp_path):
+    sample = tmp_path / "concurrent.exe"
+    sample.write_bytes(b"MZ\x00")
+    output_root = tmp_path / "concurrent-output"
+    first = BinaryPipeline(sample, output_root=output_root)
+    first.run_step("triage")
+    BinaryPipeline.load(first.pipeline_id, output_root=output_root)
+
+    with pytest.raises(RuntimeError, match="concurrent pipeline modification"):
+        first.run_step("static")
 
 
 def test_pipeline_id_cannot_escape_output_root(tmp_path):
@@ -226,6 +252,23 @@ def test_report_json_contains_final_produce_state(tmp_path):
 
     assert produce["status"] == "completed"
     assert report["artifacts"]["report_json"] == state["artifacts"]["report_json"]
+    assert report["ioc_summary"]["dynamic_capture_present"] is False
+
+
+def test_capture_step_runs_dependencies_before_dynamic_handoff(tmp_path):
+    sample = tmp_path / "ordered.exe"
+    sample.write_bytes(b"MZ\x00CryptEncrypt\x00")
+    state = BinaryPipeline(
+        sample,
+        output_root=tmp_path / "ordered-output",
+    ).run_step("capture")
+
+    statuses = {step["name"]: step["status"] for step in state["steps"]}
+    assert statuses["triage"] == "completed"
+    assert statuses["static"] == "awaiting-external"
+    assert statuses["identify"] == "completed"
+    assert statuses["plan"] == "completed"
+    assert statuses["capture"] == "awaiting-external"
 
 
 def test_captured_crypto_material_generates_decrypt_script(tmp_path):
@@ -294,6 +337,32 @@ def test_android_pipeline_extracts_manifest_surface_and_generates_hooks(tmp_path
     assert "javax.crypto.Cipher" in hook_text
     assert "android.webkit.WebView" in hook_text
     assert "android.util.Base64" in hook_text
+    assert not any(
+        item["tool"] == "triage_pe"
+        for item in state["results"]["triage"]["handoffs"]
+    )
+
+
+def test_android_fresh_decrypt_plan_resolves_package_and_iocs(tmp_path):
+    apk = tmp_path / "fresh.apk"
+    manifest = """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+package="lab.fresh"><application><activity android:name=".Main" android:exported="true">
+<intent-filter><data android:scheme="https" android:host="api.fresh.test" /></intent-filter>
+</activity></application></manifest>"""
+    with zipfile.ZipFile(apk, "w") as archive:
+        archive.writestr("AndroidManifest.xml", manifest)
+        archive.writestr(
+            "classes.dex",
+            b"dex\n035\x00https://api.fresh.test/v1 javax.crypto.Cipher okhttp3.OkHttpClient",
+        )
+
+    pipeline = AndroidPipeline(apk, output_root=tmp_path / "fresh-output")
+    decrypt_plan = pipeline.decrypt_plan()
+    iocs = pipeline.extract_iocs()
+
+    assert "<package-name>" not in decrypt_plan["content"]
+    assert "lab.fresh" in decrypt_plan["content"]
+    assert "https://api.fresh.test/v1" in iocs["urls"]
 
 
 def test_reverse_mcp_tools_create_and_reopen_pipeline(tmp_path, monkeypatch):
