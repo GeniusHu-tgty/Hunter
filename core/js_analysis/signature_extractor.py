@@ -411,10 +411,10 @@ def extract_signatures(source: str, parameter_name: str | None = None, observati
         unresolved.append({"type": "canonicalization", "reason": "No faithful canonicalization IR was recovered"})
     if best["algorithm"] not in replayable_algorithms and best["algorithm"] != "unknown":
         unresolved.append({"type": "replay_blocked", "reason": f"{best['algorithm']} requires recovered mode, padding, key, IV, and encoding details"})
+    signature_ir = best.get("signature_ir")
     missing_inputs = []
     if best["algorithm"] in replayable_algorithms and signature_ir and not request_context:
         missing_inputs.append("request_context")
-    signature_ir = best.get("signature_ir")
     secret_source = signature_ir.get("secret_source") if signature_ir else None
     if signature_ir and signature_ir["secret_mode"] != "none":
         if not secret_source:
