@@ -8,7 +8,16 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from .binary_pipeline import BinaryPipeline
+from .binary_pipeline import (
+    BinaryPipeline,
+    compute_hashes,
+    detect_binary_type,
+    detect_compiler_language,
+    detect_packers,
+    extract_strings,
+    group_imports,
+    group_strings,
+)
 
 
 ANDROID_NAMESPACE = "{http://schemas.android.com/apk/res/android}"
@@ -138,7 +147,10 @@ Java.perform(function () {
       emit('okhttp_request', {
         method: String(request.method()),
         url: String(request.url()),
-        headers: String(request.headers())
+        headers: String(request.headers()).replace(
+          /^(Authorization|Cookie|Set-Cookie|X-Api-Key):.*$/gim,
+          '$1: <redacted>'
+        )
       });
       return request;
     };
@@ -152,6 +164,7 @@ Java.perform(function () {
       overload.implementation = function () {
         var result = overload.apply(this, arguments);
         emit('cipher_init', {
+          sensitive: true,
           algorithm: String(this.getAlgorithm()),
           mode: arguments.length ? String(arguments[0]) : '',
           key: arguments.length > 1 && arguments[1] && arguments[1].getEncoded
@@ -165,6 +178,7 @@ Java.perform(function () {
         var input = arguments.length && arguments[0] ? bytesToHex(arguments[0]) : null;
         var output = overload.apply(this, arguments);
         emit('cipher_do_final', {
+          sensitive: true,
           algorithm: String(this.getAlgorithm()),
           input: input,
           output: bytesToHex(output)
@@ -242,6 +256,39 @@ class AndroidPipeline(BinaryPipeline):
     def _apk_entries(self) -> list[str]:
         with zipfile.ZipFile(self.sample_path) as archive:
             return archive.namelist()
+
+    def _step_triage(self) -> dict[str, Any]:
+        data = self.sample_path.read_bytes()
+        strings = extract_strings(data)
+        protectors = [
+            marker
+            for marker in (
+                "Bangcle",
+                "ijiami",
+                "libjiagu",
+                "libsecexe",
+                "libprotect",
+                "DexClassLoader",
+            )
+            if marker.lower() in data.decode("latin-1", errors="ignore").lower()
+        ]
+        packers = detect_packers(data, protectors)
+        hash_handoff = self._external_handoff(
+            "reverse_lab_tools",
+            "hash_file",
+            {"path": str(self.sample_path)},
+            "Validate APK hashes with the reverse backend.",
+        )
+        return {
+            "binary_type": detect_binary_type(self.sample_path),
+            "size": len(data),
+            "hashes": compute_hashes(self.sample_path),
+            "packers": packers,
+            "detected_packers": sorted(set(packers["detected"] + protectors)),
+            "requires_unpacking": bool(packers["requires_unpacking"] or protectors),
+            "compiler_language": detect_compiler_language(data, [], strings),
+            "handoffs": [hash_handoff],
+        }
 
     def _run_static_tool(self, executable: str, arguments: list[str], timeout: int = 300) -> dict[str, Any]:
         resolved = shutil.which(executable) or shutil.which(f"{executable}.bat") or shutil.which(f"{executable}.exe")
@@ -429,7 +476,94 @@ class AndroidPipeline(BinaryPipeline):
             "handoffs": handoffs,
         }
 
+    def _ensure_android_static_projection(self) -> dict[str, Any]:
+        for step_name in ("android_frontend", "dex_java", "native"):
+            if self._step_record(step_name)["status"] == "pending":
+                self.run_step(step_name)
+        frontend = self.state["results"].get("android_frontend", {})
+        dex_java = self.state["results"].get("dex_java", {})
+        native = self.state["results"].get("native", {})
+        values = []
+        values.extend(
+            item
+            for item in (
+                frontend.get("package", ""),
+                frontend.get("application", ""),
+                *frontend.get("permissions", []),
+            )
+            if item
+        )
+        for component in frontend.get("components", []):
+            values.extend(
+                item
+                for item in (
+                    component.get("name", ""),
+                    component.get("qualified_name", ""),
+                    component.get("permission", ""),
+                )
+                if item
+            )
+            for intent_filter in component.get("intent_filters", []):
+                values.extend(intent_filter.get("actions", []))
+                values.extend(intent_filter.get("categories", []))
+                for data_item in intent_filter.get("data", []):
+                    values.extend(str(value) for value in data_item.values())
+        imports = []
+        for category, matches in dex_java.get("matches", {}).items():
+            for match in matches:
+                marker = match if isinstance(match, str) else match.get("marker", "")
+                if marker:
+                    values.append(marker)
+                    imports.append(
+                        {
+                            "name": marker,
+                            "category": category,
+                            "source": "jadx-or-dex-marker",
+                        }
+                    )
+        for library in native.get("libraries", []):
+            values.extend(library.get("jni", []))
+            values.extend(library.get("signals", []))
+        with zipfile.ZipFile(self.sample_path) as archive:
+            remaining = 16 * 1024 * 1024
+            for entry in archive.infolist():
+                if remaining <= 0 or entry.file_size > 2 * 1024 * 1024:
+                    continue
+                payload = archive.read(entry)
+                remaining -= len(payload)
+                values.extend(item["value"] for item in extract_strings(payload))
+        strings = [{"value": str(value)} for value in dict.fromkeys(values) if value]
+        static = {
+            "strings": strings,
+            "string_groups": group_strings(strings),
+            "imports": imports,
+            "import_groups": group_imports(imports),
+            "exports": [
+                {"name": name, "source": library.get("path", "")}
+                for library in native.get("libraries", [])
+                for name in library.get("jni", [])
+            ],
+            "entry_point": frontend.get("application", ""),
+            "functions": [],
+            "call_graph": {},
+            "api_annotations": {
+                item["name"]: f"android {item['category']} indicator"
+                for item in imports
+            },
+            "analysis_mode": "android-manifest+jadx-markers+native-signals",
+        }
+        self.state["results"]["static"] = static
+        self._persist_state()
+        return static
+
+    def extract_iocs(self) -> dict[str, Any]:
+        self._ensure_android_static_projection()
+        result = self._build_iocs()
+        self._rewrite_report_json()
+        return result
+
     def _step_identify(self) -> dict[str, Any]:
+        self._ensure_android_static_projection()
         result = super()._step_identify()
         candidates = list(result.get("key_functions", result.get("candidates", [])))
         dex_matches = self.state["results"].get("dex_java", {}).get("matches", {})
@@ -472,20 +606,6 @@ class AndroidPipeline(BinaryPipeline):
             "plans/android_hooks.js",
             generate_android_frida_hooks(),
         )
-        result.setdefault("handoffs", []).append(
-            self._external_handoff(
-                "reverse_lab_tools",
-                "android_frida_run_script",
-                {
-                    "target": "<package-or-process>",
-                    "script_source": generate_android_frida_hooks(),
-                    "mode": "spawn",
-                    "duration_seconds": 10,
-                },
-                "Capture OkHttp, Cipher, WebView, and Base64 activity in an authorized Android sandbox.",
-                execute=False,
-            )
-        )
         result["android_frida_hooks"] = str(hook_path)
         result["handoff_ids"] = [
             item["handoff_id"] for item in result["handoffs"]
@@ -501,10 +621,17 @@ class AndroidPipeline(BinaryPipeline):
         hook_path = self.state.get("artifacts", {}).get("android_frida_hooks")
         frontend = self.state["results"].get("android_frontend", {})
         target = frontend.get("package") or "<package-or-process>"
+        native_architectures = self.state["results"].get("native", {}).get("architectures", [])
+        frida_arch = {
+            "arm64-v8a": "android-arm64",
+            "armeabi-v7a": "android-arm",
+            "x86": "android-x86",
+            "x86_64": "android-x86_64",
+        }.get(native_architectures[0] if native_architectures else "", "android-x86_64")
         ensure_server = self._external_handoff(
             "reverse_lab_tools",
             "android_frida_ensure_server",
-            {},
+            {"arch": frida_arch},
             "Deploy and verify the matching Frida Server on the authorized Android device.",
         )
         http_recipe = self._external_handoff(
@@ -526,8 +653,9 @@ class AndroidPipeline(BinaryPipeline):
                 "target_process": target,
                 "launch": False,
                 "observe_seconds": 15,
+                "output_path": str(self.output_dir / "captures" / "android-crypto.json"),
             },
-            "Capture Cipher key/IV, digest, dynamic DEX, dlopen, mmap, and JNI registration evidence.",
+            "Capture Android crypto and unpacking evidence with the maintained ReverseLabTools templates.",
         )
         custom_hook = self._external_handoff(
             "reverse_lab_tools",
@@ -537,6 +665,7 @@ class AndroidPipeline(BinaryPipeline):
                 "script_source": Path(hook_path).read_text(encoding="utf-8") if hook_path else generate_android_frida_hooks(),
                 "mode": "spawn",
                 "duration_seconds": 10,
+                "output_path": str(self.output_dir / "captures" / "android-custom-hooks.json"),
             },
             "Deploy Frida Server, inject the generated hooks, and return structured send() observations.",
         )
@@ -567,6 +696,8 @@ class AndroidPipeline(BinaryPipeline):
     def decrypt_plan(self) -> dict[str, Any]:
         if self._step_record("triage")["status"] != "completed":
             self.run_step("triage")
+        if self._step_record("android_frontend")["status"] == "pending":
+            self.run_step("android_frontend")
         frontend = self.state["results"].get("android_frontend", {})
         package_name = frontend.get("package") or "<package-name>"
         content = "\n".join(
