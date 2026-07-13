@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hunter-security-framework"
+version = "8.0.0"
+dependencies = ["dnspython>=2.4"]
+
+[project.optional-dependencies]
+stealth = ["curl_cffi>=0.6.0"]
+
+[tool.setuptools]
+py-modules = ["mcp_server", "hunter_tools_mcp"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "payloads*", "wordlists*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+wordlists = ["*.txt"]

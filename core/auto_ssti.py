@@ -34,6 +34,26 @@ class AutoSSTI:
         self.engine = None
         self.working_payload = None
         self.findings = []
+        self.baseline_response = None
+        self.evidence = None
+
+
+    def _build_evidence(self, payload: str, response: dict, expected: str, reproduction_count: int) -> dict:
+        baseline = self.baseline_response or {}
+        return {
+            "request": {"method": self.method, "url": self.base_url, "headers": {}, "body": {self.param: payload}},
+            "response": {"status_code": response.get("status", 0), "headers": response.get("headers", {}), "body": response.get("body", "")},
+            "baseline_response": {"status_code": baseline.get("status", 0), "headers": baseline.get("headers", {}), "body": baseline.get("body", "")},
+            "payload": payload,
+            "reproduction_count": reproduction_count,
+            "metadata": {"expected_template_result": expected},
+        }
+
+    def _confirm_evidence(self, payload: str, expected: str, first_response: dict) -> dict:
+        responses = [first_response, self._send(payload), self._send(payload)]
+        confirmed = sum(expected in response.get("body", "") and expected not in (self.baseline_response or {}).get("body", "") for response in responses)
+        self.evidence = self._build_evidence(payload, first_response, expected, confirmed)
+        return self.evidence
 
     def _send(self, payload: str) -> dict:
         """Send payload and return response."""
@@ -62,6 +82,7 @@ class AutoSSTI:
     def detect_math_expressions(self) -> dict:
         """Test if math expressions are evaluated server-side."""
         baseline = self._get_baseline()
+        self.baseline_response = baseline
         base_len = len(baseline.get("body", ""))
 
         # Math expression payloads grouped by engine
@@ -120,6 +141,7 @@ class AutoSSTI:
                 self.vulnerable = True
                 self.engine = engine_name
                 self.working_payload = config["payload"]
+                self.evidence = self._confirm_evidence(config["payload"], config["expected"], result)
 
                 # Try RCE verification
                 rce_result = self._send(config["rce_payload"])
@@ -261,6 +283,8 @@ class AutoSSTI:
         results["engine"] = self.engine
         results["working_payload"] = self.working_payload
         results["findings"] = self.findings
+        if self.evidence:
+            results["evidence"] = self.evidence
         results["elapsed_ms"] = int((time.time() - start) * 1000)
 
         return results

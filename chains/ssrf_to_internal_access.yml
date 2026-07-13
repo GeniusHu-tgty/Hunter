@@ -1,7 +1,45 @@
+# 用途: 验证 SSRF 注入点，并生成有界的内部服务与云元数据访问计划。
+# 前置条件: 需要明确的 SSRF 参数和已授权的内部目标范围。
+# 期望结果: 确认支持协议、识别内部服务，并形成受控元数据访问证据。
 name: ssrf_to_internal_access
-description: SSRF validation and bounded internal-service discovery plan.
+description: SSRF validation plan with runtime target, parameter, session, and internal-host context.
 parameters:
-  probe_path: /
+  target_url:
+    description: "目标根URL"
+    required: true
+    default: ""
+  session_cookie:
+    description: "会话Cookie（如JSESSIONID=xxx）"
+    required: false
+    default: ""
+  csrf_token:
+    description: "CSRF令牌值"
+    required: false
+    default: ""
+  probe_path:
+    description: "SSRF注入端点路径"
+    required: false
+    default: "/"
+  url_parameter:
+    description: "承载目标URL的参数名"
+    required: false
+    default: "url"
+  request_method:
+    description: "SSRF探测请求方法"
+    required: false
+    default: "GET"
+  callback_url:
+    description: "授权的回连或探测URL"
+    required: false
+    default: ""
+  internal_host:
+    description: "授权测试的内部主机"
+    required: false
+    default: "127.0.0.1"
+  metadata_url:
+    description: "授权测试的云元数据URL"
+    required: false
+    default: "http://169.254.169.254/latest/meta-data/"
 start: probe-ssrf
 steps:
   - step_id: probe-ssrf
@@ -12,6 +50,12 @@ steps:
       vuln_type: ssrf
       confirmed: false
       action: probe_ssrf
+      endpoint: "${target_url}${probe_path}"
+      parameter: "${url_parameter}"
+      method: "${request_method}"
+      callback_url: "${callback_url}"
+      session_cookie: "${session_cookie}"
+      csrf_token: "${csrf_token}"
     on_success: confirm-protocols
     on_failure: ""
   - step_id: confirm-protocols
@@ -24,6 +68,9 @@ steps:
       capabilities:
         - internal_access
       action: confirm_protocol_support
+      endpoint: "${target_url}${probe_path}"
+      parameter: "${url_parameter}"
+      internal_host: "${internal_host}"
     on_success: scan-common-ports
     on_failure: ""
   - step_id: scan-common-ports
@@ -35,6 +82,7 @@ steps:
       capabilities:
         - internal_access
       action: scan_common_internal_ports
+      internal_host: "${internal_host}"
       ports:
         - 80
         - 443
@@ -54,6 +102,7 @@ steps:
       capabilities:
         - internal_access
       action: identify_unauthenticated_services
+      internal_host: "${internal_host}"
     on_success: extract-sensitive-data
     on_failure: ""
   - step_id: extract-sensitive-data
@@ -66,4 +115,5 @@ steps:
       capabilities:
         - metadata_access
       action: access_cloud_metadata
+      metadata_url: "${metadata_url}"
     critical: true

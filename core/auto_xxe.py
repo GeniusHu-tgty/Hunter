@@ -35,6 +35,31 @@ class AutoXXE:
         self.vulnerable = False
         self.xxe_type = None
         self.findings = []
+        self.baseline_response = None
+        self.evidence = None
+
+
+    def _build_evidence(self, payload: str, response: dict, reproduction_count: int) -> dict:
+        baseline = self.baseline_response or {}
+        return {
+            "request": {"method": self.method, "url": self.base_url, "headers": {"Content-Type": "application/xml"}, "body": payload},
+            "response": {"status_code": response.get("status", 0), "headers": response.get("headers", {}), "body": response.get("body", "")},
+            "baseline_response": {"status_code": baseline.get("status", 0), "headers": baseline.get("headers", {}), "body": baseline.get("body", "")},
+            "payload": payload,
+            "reproduction_count": reproduction_count,
+            "metadata": {},
+        }
+
+    def _confirm_evidence(self, payload: str, first_response: dict) -> dict:
+        from core.evidence.verdict_engine import Verdict, VerdictEngine, VulnType
+        responses = [first_response, self._send_xml(payload), self._send_xml(payload)]
+        confirmed = 0
+        for response in responses:
+            item = self._build_evidence(payload, response, 1)
+            if VerdictEngine().assess(VulnType.XXE, item).verdict is Verdict.LIKELY:
+                confirmed += 1
+        self.evidence = self._build_evidence(payload, first_response, confirmed)
+        return self.evidence
 
     def _send_xml(self, xml_body: str, extra_headers: dict = None) -> dict:
         """Send XML payload."""
@@ -97,6 +122,7 @@ class AutoXXE:
             if found:
                 self.vulnerable = True
                 self.xxe_type = "basic_file_read"
+                self.evidence = self._confirm_evidence(payload, result)
                 self.findings.append({
                     "type": "xxe_file_read",
                     "technique": name,
@@ -356,6 +382,7 @@ class AutoXXE:
         """Run complete automated XXE scan."""
         start = time.time()
         results = {"target": self.base_url, "steps": []}
+        self.baseline_response = self._get_baseline()
 
         # Step 1: Basic file read XXE
         basic = self.test_basic_xxe()
@@ -389,6 +416,8 @@ class AutoXXE:
         results["vulnerable"] = self.vulnerable
         results["xxe_type"] = self.xxe_type
         results["findings"] = self.findings
+        if self.evidence:
+            results["evidence"] = self.evidence
         results["elapsed_ms"] = int((time.time() - start) * 1000)
 
         return results

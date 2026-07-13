@@ -1210,3 +1210,25 @@ def test_facade_capabilities_advertise_attack_session_surface():
     } <= set(tools)
     assert result["data"]["attack_session"]["schema_version"] == "1.0"
     assert result["data"]["attack_session"]["templates"] == 6
+
+
+def test_redact_sensitive_masks_all_hidden_and_extra_field_values():
+    from core.session.attack_session import redact_sensitive
+
+    value = {
+        "extra_fields": {
+            "execution": "flow-secret",
+            "RelayState": "relay-secret",
+            "ordinary_hidden": "hidden-secret",
+        },
+        "hidden": {"lt": "lt-secret"},
+    }
+
+    assert redact_sensitive(value) == {
+        "extra_fields": {
+            "execution": "[REDACTED]",
+            "RelayState": "[REDACTED]",
+            "ordinary_hidden": "[REDACTED]",
+        },
+        "hidden": {"lt": "[REDACTED]"},
+    }

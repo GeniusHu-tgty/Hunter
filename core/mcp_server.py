@@ -8,8 +8,35 @@ import subprocess
 import json
 import os
 import sys
+import socket
+import threading
+import time
+import uuid
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    wait,
+)
 from pathlib import Path
 from datetime import datetime
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+try:
+    import dns.exception as dns_exception
+    import dns.resolver as dns_resolver
+except ImportError:
+    dns_exception = None
+    dns_resolver = None
+
+
+CRT_SH_TIMEOUT_SECONDS = 10
+DNS_QUERY_TIMEOUT_SECONDS = 3
+SUBDOMAIN_ENUM_TIMEOUT_SECONDS = 120
+DNS_BRUTE_WORKERS = 32
+DNS_BRUTE_MAX_PREFIXES = 256
+CRT_SH_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
 class HunterMCPServer:
     def __init__(self):
@@ -55,10 +82,444 @@ class HunterMCPServer:
         if severity:
             args += f" -severity {severity}"
         return self.run_tool("nuclei", args, timeout=600)
-    
+
+    @staticmethod
+    def _valid_subdomain(name, domain):
+        candidate = str(name or "").strip().lower().rstrip(".")
+        if candidate.startswith("*."):
+            candidate = candidate[2:]
+        if not candidate or candidate == domain:
+            return ""
+        if not candidate.endswith(f".{domain}"):
+            return ""
+        labels = candidate.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(not (char.isalnum() or char == "-") for char in label)
+            for label in labels
+        ):
+            return ""
+        return candidate
+
+    def _crtsh_enum(self, domain, timeout=CRT_SH_TIMEOUT_SECONDS):
+        """Query crt.sh certificate transparency logs with a strict timeout."""
+        started = time.monotonic()
+
+        def fetch():
+            query = quote(f"%.{domain}", safe="")
+            request = Request(
+                f"https://crt.sh/?q={query}&output=json",
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Hunter/8.2 subdomain-enumerator",
+                },
+            )
+            with urlopen(request, timeout=timeout) as response:
+                body = response.read(CRT_SH_MAX_RESPONSE_BYTES + 1)
+            if len(body) > CRT_SH_MAX_RESPONSE_BYTES:
+                raise ValueError("crt.sh response exceeded 5 MiB")
+            records = json.loads(body.decode("utf-8"))
+            if not isinstance(records, list):
+                raise ValueError("crt.sh returned a non-list JSON response")
+
+            subdomains = set()
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                for field in ("name_value", "common_name"):
+                    for raw_name in str(record.get(field, "")).splitlines():
+                        name = self._valid_subdomain(raw_name, domain)
+                        if name:
+                            subdomains.add(name)
+            return sorted(subdomains)
+
+        executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="hunter-crtsh",
+        )
+        future = executor.submit(fetch)
+        try:
+            subdomains = future.result(timeout=max(0.001, float(timeout)))
+            return {
+                "status": "success" if subdomains else "empty",
+                "subdomains": subdomains,
+                "error": "" if subdomains else "crt.sh returned no usable subdomains",
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        except (FutureTimeoutError, socket.timeout) as exc:
+            future.cancel()
+            return {
+                "status": "timeout",
+                "subdomains": [],
+                "error": f"crt.sh timed out after {timeout:g}s: {exc}",
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        except HTTPError as exc:
+            return {
+                "status": "error",
+                "subdomains": [],
+                "error": f"crt.sh HTTP error {exc.code}: {exc.reason}",
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        except URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            status = (
+                "timeout"
+                if isinstance(reason, (TimeoutError, socket.timeout))
+                else "error"
+            )
+            return {
+                "status": status,
+                "subdomains": [],
+                "error": f"crt.sh request failed: {reason}",
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return {
+                "status": "error",
+                "subdomains": [],
+                "error": f"crt.sh response could not be parsed: {exc}",
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "subdomains": [],
+                "error": f"crt.sh request failed: {exc}",
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _resolve_dns_name(self, host, timeout=DNS_QUERY_TIMEOUT_SECONDS):
+        """Resolve one candidate through the system DNS configuration."""
+        if dns_resolver is None:
+            return [], "dnspython is required for bounded DNS queries"
+
+        resolver_local = getattr(self, "_dns_resolver_local", None)
+        if resolver_local is None:
+            resolver_local = threading.local()
+            self._dns_resolver_local = resolver_local
+        resolver = getattr(resolver_local, "resolver", None)
+        if resolver is None:
+            resolver = dns_resolver.Resolver(configure=True)
+            resolver_local.resolver = resolver
+        resolver.timeout = timeout
+        resolver.lifetime = timeout
+        addresses = set()
+        errors = []
+        for record_type in ("A", "AAAA"):
+            try:
+                answer = resolver.resolve(
+                    host,
+                    record_type,
+                    lifetime=timeout,
+                    search=False,
+                    raise_on_no_answer=False,
+                )
+                addresses.update(
+                    str(item).strip()
+                    for item in answer
+                    if str(item).strip()
+                )
+                if addresses:
+                    break
+            except dns_resolver.NXDOMAIN:
+                break
+            except dns_resolver.NoAnswer:
+                continue
+            except dns_resolver.NoNameservers as exc:
+                errors.append(str(exc))
+                break
+            except dns_exception.Timeout as exc:
+                errors.append(f"DNS query timed out after {timeout:g}s: {exc}")
+                break
+            except Exception as exc:
+                errors.append(str(exc))
+                break
+        return sorted(addresses), "; ".join(errors)
+
+    def _subdomain_words(self):
+        wordlist = self.wordlist_dir / "subdomains_edu.txt"
+        if not wordlist.exists():
+            return wordlist, []
+        words = []
+        seen = set()
+        for raw_line in wordlist.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        ).splitlines():
+            word = raw_line.split("#", 1)[0].strip().lower().strip(".")
+            if (
+                not word
+                or word in seen
+                or any(
+                    not (char.isalnum() or char in {"-", "."})
+                    for char in word
+                )
+            ):
+                continue
+            seen.add(word)
+            words.append(word)
+            if len(words) >= DNS_BRUTE_MAX_PREFIXES:
+                break
+        return wordlist, words
+
+    def _dns_brute_enum(
+        self,
+        domain,
+        timeout,
+        query_timeout=DNS_QUERY_TIMEOUT_SECONDS,
+    ):
+        """Resolve common prefixes concurrently within the remaining budget."""
+        started = time.monotonic()
+        wordlist, words = self._subdomain_words()
+        if not words:
+            return {
+                "status": "error",
+                "subdomains": [],
+                "error": f"DNS wordlist is missing or empty: {wordlist}",
+                "queries": 0,
+                "timed_out": False,
+                "wordlist": str(wordlist),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+
+        deadline = started + max(0.0, float(timeout))
+        wildcard_host = f"hunter-{uuid.uuid4().hex[:12]}.{domain}"
+        wildcard_addresses, wildcard_error = self._resolve_dns_name(
+            wildcard_host,
+            query_timeout,
+        )
+        wildcard_address_set = set(wildcard_addresses)
+        workers = max(1, min(DNS_BRUTE_WORKERS, len(words)))
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="hunter-dns",
+        )
+        future_hosts = {
+            executor.submit(
+                self._resolve_dns_name,
+                f"{word}.{domain}",
+                query_timeout,
+            ): f"{word}.{domain}"
+            for word in words
+        }
+        completed, pending = wait(
+            future_hosts,
+            timeout=max(0.0, deadline - time.monotonic()),
+        )
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+        subdomains = set()
+        errors = []
+        wildcard_matches = 0
+        for future in completed:
+            host = future_hosts[future]
+            try:
+                addresses, error = future.result()
+            except Exception as exc:
+                addresses, error = [], str(exc)
+            if addresses:
+                if (
+                    wildcard_address_set
+                    and set(addresses) == wildcard_address_set
+                ):
+                    wildcard_matches += 1
+                else:
+                    subdomains.add(host)
+            elif error:
+                errors.append(f"{host}: {error}")
+
+        timed_out = bool(pending) or time.monotonic() >= deadline
+        if subdomains:
+            status = "success"
+            error = ""
+        elif timed_out:
+            status = "timeout"
+            error = (
+                f"DNS brute force reached the {timeout:g}s budget "
+                "without resolving a subdomain"
+            )
+        elif errors and len(errors) == len(completed):
+            status = "error"
+            error = "DNS brute force failed: " + "; ".join(errors[:3])
+        elif wildcard_matches:
+            status = "error"
+            error = (
+                "DNS wildcard detected; all resolved candidates matched "
+                "the wildcard baseline"
+            )
+        else:
+            status = "error"
+            error = "DNS brute force completed but no names resolved"
+
+        return {
+            "status": status,
+            "subdomains": sorted(subdomains),
+            "error": error,
+            "queries": len(future_hosts),
+            "completed_queries": len(completed),
+            "query_errors": errors[:20],
+            "timed_out": timed_out,
+            "wordlist": str(wordlist),
+            "wildcard_detected": bool(wildcard_address_set),
+            "wildcard_probe": wildcard_host,
+            "wildcard_addresses": sorted(wildcard_address_set),
+            "wildcard_error": wildcard_error,
+            "wildcard_matches": wildcard_matches,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+
     def subfinder_enum(self, domain):
-        """Enumerate subdomains"""
-        return self.run_tool("subfinder", f"-d {domain} -silent -timeout 10 -max-time 1", timeout=90)
+        """Enumerate through crt.sh, then bounded local DNS brute force."""
+        started = time.monotonic()
+        normalized = str(domain or "").strip().lower().rstrip(".")
+        if (
+            not normalized
+            or len(normalized) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or label.startswith("-")
+                or label.endswith("-")
+                or any(
+                    not (char.isalnum() or char == "-")
+                    for char in label
+                )
+                for label in normalized.split(".")
+            )
+        ):
+            message = f"Invalid domain for subdomain enumeration: {domain!r}"
+            return {
+                "status": "error",
+                "stdout": "",
+                "stderr": message,
+                "error": message,
+                "returncode": 1,
+                "source": "",
+                "attempts": [],
+            }
+
+        crt_result = self._crtsh_enum(
+            normalized,
+            timeout=CRT_SH_TIMEOUT_SECONDS,
+        )
+        attempts = [
+            {
+                "source": "crt.sh",
+                "status": crt_result.get("status", "error"),
+                "count": len(crt_result.get("subdomains", [])),
+                "timeout_seconds": CRT_SH_TIMEOUT_SECONDS,
+                "elapsed_seconds": crt_result.get("elapsed_seconds"),
+                "error": crt_result.get("error", ""),
+            }
+        ]
+        if crt_result.get("subdomains"):
+            subdomains = sorted(set(crt_result["subdomains"]))
+            return {
+                "status": "success",
+                "stdout": "\n".join(subdomains),
+                "stderr": "",
+                "error": "",
+                "returncode": 0,
+                "source": "crt.sh",
+                "attempts": attempts,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+
+        elapsed = time.monotonic() - started
+        remaining = max(
+            0.0,
+            SUBDOMAIN_ENUM_TIMEOUT_SECONDS - elapsed,
+        )
+        dns_budget = min(
+            remaining,
+            SUBDOMAIN_ENUM_TIMEOUT_SECONDS - CRT_SH_TIMEOUT_SECONDS,
+        )
+        if dns_budget <= 0:
+            dns_result = {
+                "status": "timeout",
+                "subdomains": [],
+                "error": "No enumeration budget remained for DNS brute force",
+                "queries": 0,
+                "timed_out": True,
+                "wordlist": str(self.wordlist_dir / "subdomains_edu.txt"),
+            }
+        else:
+            dns_result = self._dns_brute_enum(
+                normalized,
+                timeout=dns_budget,
+                query_timeout=DNS_QUERY_TIMEOUT_SECONDS,
+            )
+        attempts.append(
+            {
+                "source": "dns-brute",
+                "status": dns_result.get("status", "error"),
+                "count": len(dns_result.get("subdomains", [])),
+                "timeout_seconds": round(dns_budget, 3),
+                "query_timeout_seconds": DNS_QUERY_TIMEOUT_SECONDS,
+                "queries": dns_result.get("queries", 0),
+                "timed_out": dns_result.get("timed_out", False),
+                "elapsed_seconds": dns_result.get("elapsed_seconds"),
+                "error": dns_result.get("error", ""),
+            }
+        )
+        if dns_result.get("subdomains"):
+            subdomains = sorted(set(dns_result["subdomains"]))
+            fallback_reason = crt_result.get(
+                "error",
+                "crt.sh returned no usable subdomains",
+            )
+            partial = bool(dns_result.get("timed_out", False))
+            warning = (
+                "DNS fallback returned partial results after reaching "
+                "the enumeration budget"
+                if partial
+                else ""
+            )
+            return {
+                "status": "success",
+                "stdout": "\n".join(subdomains),
+                "stderr": f"{fallback_reason}; used local DNS fallback",
+                "error": "",
+                "returncode": 0,
+                "source": "dns-brute",
+                "attempts": attempts,
+                "wordlist": dns_result.get("wordlist", ""),
+                "partial": partial,
+                "timed_out": partial,
+                "warning": warning,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+
+        errors = [
+            item
+            for item in (
+                crt_result.get("error", ""),
+                dns_result.get("error", ""),
+            )
+            if item
+        ]
+        message = "Subdomain enumeration failed"
+        if errors:
+            message += ": " + "; ".join(errors)
+        return {
+            "status": "error",
+            "stdout": "",
+            "stderr": message,
+            "error": message,
+            "returncode": 1,
+            "source": "",
+            "attempts": attempts,
+            "wordlist": dns_result.get("wordlist", ""),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
     
     def httpx_probe(self, targets):
         """Probe HTTP services"""

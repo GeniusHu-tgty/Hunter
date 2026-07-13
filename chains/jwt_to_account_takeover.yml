@@ -1,9 +1,45 @@
+# 用途: 获取或接收 JWT，验证常见签名弱点，并测试受保护路由的授权边界。
+# 前置条件: 需要合法会话或已知 JWT；伪造令牌的实际使用必须经过审批。
+# 期望结果: 形成 JWT 弱点证据，并验证受保护资源是否错误接受测试令牌。
 name: jwt_to_account_takeover
-description: JWT weakness validation with explicit approval before forged-token use.
+description: JWT validation flow with runtime-configurable token source, headers, paths, and session values.
 parameters:
-  token_path: /
-  protected_path: /admin
-  forged_jwt: ""
+  target_url:
+    description: "目标根URL"
+    required: true
+    default: ""
+  session_cookie:
+    description: "会话Cookie（如JSESSIONID=xxx）"
+    required: false
+    default: ""
+  csrf_token:
+    description: "CSRF令牌值"
+    required: false
+    default: ""
+  token_path:
+    description: "返回JWT的页面或接口路径"
+    required: false
+    default: "/"
+  protected_path:
+    description: "需要验证授权边界的受保护路径"
+    required: false
+    default: "/admin"
+  jwt_token:
+    description: "已知JWT；留空时从响应中提取"
+    required: false
+    default: ""
+  forged_jwt:
+    description: "经过审批后用于验证的测试JWT"
+    required: false
+    default: ""
+  authorization_header:
+    description: "承载JWT的HTTP头字段名"
+    required: false
+    default: "Authorization"
+  authorization_scheme:
+    description: "JWT认证方案前缀"
+    required: false
+    default: "Bearer"
 start: obtain-jwt
 steps:
   - step_id: obtain-jwt
@@ -11,16 +47,19 @@ steps:
     action: request
     request:
       method: GET
-      path: ${token_path}
+      url: "${target_url}${token_path}"
+      headers:
+        Cookie: "${session_cookie}"
+        X-CSRF-Token: "${csrf_token}"
     on_success: extract-jwt
     critical: true
   - step_id: extract-jwt
     name: Extract JWT
     action: extract
     extract_rules:
-      - name: jwt
+      - name: jwt_token
         pattern: 'regex:(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)'
-        store_as: jwt
+        store_as: jwt_token
     on_success: decode-header
     critical: true
   - step_id: decode-header
@@ -28,7 +67,7 @@ steps:
     action: extract
     extract_rules:
       - name: jwt_claims
-        pattern: jwt:${jwt}
+        pattern: "jwt:${jwt_token}"
         store_as: jwt_claims
     on_success: test-none
   - step_id: test-none
@@ -39,6 +78,7 @@ steps:
       vuln_type: jwt
       confirmed: true
       action: test_none_algorithm
+      token: "${jwt_token}"
     on_success: test-weak-key
     on_failure: ""
   - step_id: test-weak-key
@@ -48,6 +88,7 @@ steps:
       vuln_type: jwt
       confirmed: true
       action: test_weak_signing_key
+      token: "${jwt_token}"
     on_success: test-kid
     on_failure: ""
   - step_id: test-kid
@@ -57,6 +98,7 @@ steps:
       vuln_type: jwt
       confirmed: true
       action: test_kid_injection
+      token: "${jwt_token}"
     on_success: access-with-forged-token
     on_failure: ""
   - step_id: access-with-forged-token
@@ -65,9 +107,10 @@ steps:
     state: exploit
     request:
       method: GET
-      path: ${protected_path}
+      url: "${target_url}${protected_path}"
       headers:
-        Authorization: Bearer ${forged_jwt}
+        Cookie: "${session_cookie}"
+        "${authorization_header}": "${authorization_scheme} ${forged_jwt}"
     on_success: verify-authorization
     critical: true
   - step_id: verify-authorization

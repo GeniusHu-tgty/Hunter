@@ -45,6 +45,48 @@ class AutoSSRF:
         self.internal_access = False
         self.cloud_metadata = False
         self.findings = []
+        self.baseline_response = None
+        self.evidence = None
+
+    def _request_record(self, payload: str) -> dict:
+        if self.method == "GET":
+            from urllib.parse import quote
+            return {"method": "GET", "url": f"{self.base_url}?{self.param}={quote(payload)}", "headers": dict(getattr(self, "extra_headers", {})), "body": ""}
+        return {"method": self.method, "url": self.base_url, "headers": dict(getattr(self, "extra_headers", {})), "body": {self.param: payload}}
+
+    def _build_evidence(self, payload: str, response: dict, reproduction_count: int) -> dict:
+        baseline = self.baseline_response or {}
+        metadata = {
+            "response_time": response.get("time", 0),
+            "baseline_response_time": baseline.get("time", 0),
+        }
+        return {
+            "request": self._request_record(payload),
+            "response": {"status_code": response.get("status", 0), "headers": response.get("headers", {}), "body": response.get("body", "")},
+            "baseline_response": {"status_code": baseline.get("status", 0), "headers": baseline.get("headers", {}), "body": baseline.get("body", "")},
+            "payload": payload,
+            "reproduction_count": reproduction_count,
+            "metadata": metadata,
+        }
+
+    def _ensure_baseline(self) -> dict:
+        if self.baseline_response is None:
+            self.baseline_response = self._test_payload("http://example.com")
+        return self.baseline_response
+
+    def _confirm_evidence(self, payload: str, first_response: dict) -> dict:
+        from core.evidence.verdict_engine import Verdict, VerdictEngine, VulnType
+
+        responses = [first_response]
+        responses.extend(self._test_payload(payload) for _ in range(2))
+        confirmed = 0
+        for response in responses:
+            item = self._build_evidence(payload, response, 1)
+            if VerdictEngine().assess(VulnType.SSRF, item).verdict in {Verdict.LIKELY, Verdict.VERIFIED}:
+                confirmed += 1
+        evidence = self._build_evidence(payload, first_response, confirmed)
+        self.evidence = evidence
+        return evidence
 
     def _test_payload(self, payload: str) -> dict:
         """Send SSRF payload and analyze response."""
@@ -385,6 +427,7 @@ class AutoSSRF:
             "method": self.method,
             "steps": [],
         }
+        self._ensure_baseline()
 
         # Step 1: Internal access
         internal = self.test_internal_access()
@@ -426,6 +469,17 @@ class AutoSSRF:
             network = self.test_internal_network_scan(base_ip=internal_base_ip)
             results["internal_network"] = network
             results["steps"].append({"step": "internal_network", "result": network})
+
+        from core.evidence.verdict_engine import Verdict, VerdictEngine, VulnType
+        for finding in self.findings:
+            candidate = finding.get("payload")
+            if not candidate:
+                continue
+            first_response = self._test_payload(candidate)
+            item = self._build_evidence(candidate, first_response, 1)
+            if VerdictEngine().assess(VulnType.SSRF, item).verdict is Verdict.LIKELY:
+                results["evidence"] = self._confirm_evidence(candidate, first_response)
+                break
 
         results["vulnerable"] = self.vulnerable
         results["internal_access"] = self.internal_access

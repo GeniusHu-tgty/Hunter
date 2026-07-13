@@ -1,10 +1,65 @@
+# 用途: 使用可配置的登录表单完成认证，并验证管理页面访问权限。
+# 前置条件: 需要授权测试账号；已有 Cookie 或 CSRF 令牌可按需传入。
+# 期望结果: 建立经响应证据确认的登录状态，并提取首个管理功能链接。
 name: login_to_admin
-description: Stateful login flow with CSRF, cookie, token, and admin-link extraction.
+description: Stateful login flow with runtime-configurable paths, fields, cookies, and CSRF data.
 parameters:
-  login_path: /login
-  admin_path: /admin
-  username: ""
-  password: ""
+  target_url:
+    description: "目标根URL"
+    required: true
+    default: ""
+  session_cookie:
+    description: "会话Cookie（如JSESSIONID=xxx）"
+    required: false
+    default: ""
+  csrf_token:
+    description: "CSRF令牌值；留空时从登录页自动提取"
+    required: false
+    default: ""
+  login_path:
+    description: "登录页面路径"
+    required: false
+    default: "/login"
+  request_method:
+    description: "Login form submission method"
+    required: false
+    default: "POST"
+  admin_path:
+    description: "管理页面路径"
+    required: false
+    default: "/admin"
+  username:
+    description: "授权测试账号用户名"
+    required: true
+    default: ""
+  password:
+    description: "授权测试账号密码"
+    required: true
+    default: ""
+  username_field:
+    description: "登录表单用户名字段名"
+    required: false
+    default: "username"
+  password_field:
+    description: "登录表单密码字段名"
+    required: false
+    default: "password"
+  csrf_field:
+    description: "登录表单CSRF字段名"
+    required: false
+    default: "csrf_token"
+  extra_fields:
+    description: "登录表单隐藏字段"
+    required: false
+    default: {}
+  auth_body_regex:
+    description: "登录成功页面正文验证正则"
+    required: false
+    default: "(admin|dashboard|管理)"
+  reject_url_regex:
+    description: "仍处于登录页面时的URL拒绝正则"
+    required: false
+    default: "/login(?:[/?#]|$)"
 start: visit-login
 steps:
   - step_id: visit-login
@@ -13,7 +68,9 @@ steps:
     state: auth
     request:
       method: GET
-      path: ${login_path}
+      url: "${target_url}${login_path}"
+      headers:
+        Cookie: "${session_cookie}"
     on_success: extract-csrf
     max_retries: 1
     critical: true
@@ -21,36 +78,41 @@ steps:
     name: Extract CSRF token
     action: extract
     extract_rules:
-      - name: csrf
-        pattern: 'regex:name=["''](?:csrf_token|_token)["''][^>]*value=["'']([^"'']+)'
-        store_as: csrf
+      - name: csrf_token
+        pattern: 'regex:name=["''](?:csrf_token|xsrf_token|_token|token|authenticity_token|execution|lt)["''][^>]*value=["'']([^"'']+)'
+        store_as: csrf_token
     on_success: submit-login
-    critical: true
+    on_failure: submit-login
+    critical: false
   - step_id: submit-login
     name: Submit credentials
     action: request
     request:
-      method: POST
-      path: ${login_path}
+      method: "${request_method}"
+      url: "${target_url}${login_path}"
+      extra_fields: "${extra_fields}"
+      headers:
+        Cookie: "${session_cookie}"
+        X-CSRF-Token: "${csrf_token}"
       data:
-        username: ${username}
-        password: ${password}
-        csrf_token: ${csrf}
+        "${username_field}": "${username}"
+        "${password_field}": "${password}"
+        "${csrf_field}": "${csrf_token}"
     on_success: visit-admin
     max_retries: 1
     critical: true
   - step_id: visit-admin
     name: Visit admin home
     action: request
-    preconditions:
-      - authenticated
     request:
       method: GET
-      path: ${admin_path}
+      url: "${target_url}${admin_path}"
+      headers:
+        Cookie: "${session_cookie}"
     options:
       authentication_proof:
-        body_regex: '(admin|dashboard|管理)'
-        reject_url_regex: '/login(?:[/?#]|$)'
+        body_regex: "${auth_body_regex}"
+        reject_url_regex: "${reject_url_regex}"
     on_success: verify-admin
     critical: true
   - step_id: verify-admin

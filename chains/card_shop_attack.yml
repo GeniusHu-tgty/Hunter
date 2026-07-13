@@ -1,7 +1,49 @@
+# 用途: 对授权卡密商城执行金额、竞态和对象授权的业务逻辑验证计划。
+# 前置条件: 需要有效商城会话，并限定测试商品、订单和并发规模。
+# 期望结果: 提取业务端点并生成有界、可审计的业务逻辑证据。
 name: card_shop_attack
-description: Business-logic assessment flow for an explicitly authorized card shop.
+description: Business-logic assessment flow with runtime target, session, field, and bounded-test parameters.
 parameters:
-  home_path: /
+  target_url:
+    description: "目标根URL"
+    required: true
+    default: ""
+  session_cookie:
+    description: "会话Cookie（如JSESSIONID=xxx）"
+    required: false
+    default: ""
+  csrf_token:
+    description: "CSRF令牌值"
+    required: false
+    default: ""
+  home_path:
+    description: "商城首页路径"
+    required: false
+    default: "/"
+  amount_field:
+    description: "金额字段名"
+    required: false
+    default: "amount"
+  product_id_field:
+    description: "商品ID字段名"
+    required: false
+    default: "product_id"
+  order_id_field:
+    description: "订单ID字段名"
+    required: false
+    default: "order_id"
+  test_amount:
+    description: "金额篡改测试值"
+    required: false
+    default: "0"
+  race_concurrency:
+    description: "竞态测试并发数"
+    required: false
+    default: 5
+  evidence_limit:
+    description: "最多提取的卡密证据条数"
+    required: false
+    default: 10
 start: visit-shop
 steps:
   - step_id: visit-shop
@@ -10,7 +52,10 @@ steps:
     state: discovery
     request:
       method: GET
-      path: ${home_path}
+      url: "${target_url}${home_path}"
+      headers:
+        Cookie: "${session_cookie}"
+        X-CSRF-Token: "${csrf_token}"
     on_success: identify-recharge
     critical: true
   - step_id: identify-recharge
@@ -45,6 +90,12 @@ steps:
       vuln_type: business_logic
       confirmed: true
       action: test_amount_tampering
+      endpoint: "${target_url}${recharge_endpoint}"
+      amount_field: "${amount_field}"
+      product_id_field: "${product_id_field}"
+      test_amount: "${test_amount}"
+      session_cookie: "${session_cookie}"
+      csrf_token: "${csrf_token}"
     on_success: test-race
     on_failure: ""
   - step_id: test-race
@@ -54,6 +105,9 @@ steps:
       vuln_type: business_logic
       confirmed: true
       action: test_race_condition
+      endpoint: "${target_url}${recharge_endpoint}"
+      concurrency: "${race_concurrency}"
+      session_cookie: "${session_cookie}"
     on_success: test-authorization
     on_failure: ""
   - step_id: test-authorization
@@ -63,6 +117,9 @@ steps:
       vuln_type: business_logic
       confirmed: true
       action: test_object_authorization
+      endpoint: "${target_url}${query_endpoint}"
+      order_id_field: "${order_id_field}"
+      session_cookie: "${session_cookie}"
     on_success: extract-card-data
     on_failure: ""
   - step_id: extract-card-data
@@ -73,4 +130,7 @@ steps:
       vuln_type: business_logic
       confirmed: true
       action: extract_card_evidence
+      endpoint: "${target_url}${use_endpoint}"
+      evidence_limit: "${evidence_limit}"
+      session_cookie: "${session_cookie}"
     critical: true

@@ -1,0 +1,48 @@
+{
+  "status": "success",
+  "source": "dns-brute",
+  "elapsed_seconds": 43.86,
+  "count": 30,
+  "required_found": [
+    "www.gnnu.edu.cn",
+    "jw.gnnu.edu.cn",
+    "jwc.gnnu.edu.cn",
+    "jwgl.gnnu.edu.cn",
+    "lib.gnnu.edu.cn",
+    "cas.gnnu.edu.cn",
+    "my.gnnu.edu.cn",
+    "yjs.gnnu.edu.cn",
+    "xg.gnnu.edu.cn",
+    "jy.gnnu.edu.cn",
+    "hq.gnnu.edu.cn",
+    "wxy.gnnu.edu.cn",
+    "vpn.gnnu.edu.cn",
+    "mail.gnnu.edu.cn"
+  ],
+  "required_missing": [],
+  "partial": false,
+  "timed_out": false,
+  "warning": "",
+  "attempts": [
+    {
+      "source": "crt.sh",
+      "status": "timeout",
+      "count": 0,
+      "timeout_seconds": 10,
+      "elapsed_seconds": 10.0,
+      "error": "forced crt.sh timeout after 10s"
+    },
+    {
+      "source": "dns-brute",
+      "status": "success",
+      "count": 30,
+      "timeout_seconds": 110,
+      "query_timeout_seconds": 3,
+      "queries": 256,
+      "timed_out": false,
+      "elapsed_seconds": 43.86,
+      "error": ""
+    }
+  ],
+  "error": ""
+}

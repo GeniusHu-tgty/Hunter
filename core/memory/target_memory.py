@@ -46,17 +46,33 @@ def _domain_for(value: str) -> str:
 class TargetMemory:
     """Store target-scoped observations in a local SQLite database."""
 
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
+    def __init__(
+        self,
+        db_path: str | Path = DEFAULT_DB_PATH,
+        *,
+        initialize: bool = True,
+        read_only: bool = False,
+    ):
         self.db_path = Path(db_path).expanduser().resolve()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize_schema()
+        self.read_only = bool(read_only)
+        if initialize and not self.read_only:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.db_path,
-            timeout=30,
-            factory=_ClosingConnection,
-        )
+        if self.read_only:
+            connection = sqlite3.connect(
+                f"{self.db_path.as_uri()}?mode=ro",
+                timeout=30,
+                factory=_ClosingConnection,
+                uri=True,
+            )
+        else:
+            connection = sqlite3.connect(
+                self.db_path,
+                timeout=30,
+                factory=_ClosingConnection,
+            )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
@@ -711,3 +727,19 @@ class TargetMemory:
                 for table in table_names
             }
         return {"database_path": str(self.db_path), **counts}
+
+    def reset(self) -> dict[str, Any]:
+        """Clear target observations while preserving the initialized schema."""
+
+        if self.read_only:
+            raise RuntimeError("cannot reset read-only target memory")
+        with self._connect() as connection:
+            for table in (
+                "attack_history",
+                "vulnerabilities",
+                "endpoints",
+                "fingerprints",
+                "targets",
+            ):
+                connection.execute(f"DELETE FROM {table}")
+        return self.stats()

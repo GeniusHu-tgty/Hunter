@@ -17,6 +17,7 @@ class _ParameterPattern:
     names: tuple[str, ...]
     vulnerability_types: tuple[str, ...]
     description: str
+    confidence: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -179,6 +180,13 @@ def _normalise_parameter(value: str) -> tuple[str, tuple[str, ...]]:
 
 
 def _normalise_feature(value: Any) -> str:
+    if isinstance(value, Mapping):
+        value = (
+            value.get("name")
+            or value.get("product")
+            or value.get("value")
+            or ""
+        )
     if isinstance(value, (list, tuple, set)):
         value = " ".join(str(item) for item in value)
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
@@ -186,6 +194,156 @@ def _normalise_feature(value: Any) -> str:
 
 def _unique(items: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(items))
+
+
+_DATABASE_COMPONENTS = {
+    "mysql",
+    "mariadb",
+    "postgresql",
+    "postgres",
+    "sql server",
+    "mssql",
+    "oracle",
+    "mongodb",
+    "mongo",
+    "redis",
+    "couchdb",
+    "elasticsearch",
+    "sqlite",
+}
+
+_SERVER_COMPONENTS = {
+    "apache",
+    "nginx",
+    "caddy",
+    "iis",
+    "tomcat",
+    "jetty",
+    "gunicorn",
+    "uwsgi",
+    "uvicorn",
+    "node.js",
+    "nodejs",
+    "kestrel",
+    "openresty",
+    "puma",
+}
+
+_RUNTIME_COMPONENTS = {
+    "go",
+    "java",
+    "php",
+    "python",
+    "elixir",
+    "rust",
+}
+
+_EDU_PRODUCT_COMPONENTS = {
+    "正方教务",
+    "强智教务",
+    "青果教务",
+    "金智 cas",
+    "艾卡 cas",
+    "正方统一身份认证",
+    "博达 cms/vsb portal",
+    "超星智慧门户",
+}
+
+
+def _load_seed_parameter_patterns() -> tuple[_ParameterPattern, ...]:
+    try:
+        from scripts.seed_memory import PARAMETER_SEEDS
+    except (ImportError, ModuleNotFoundError):
+        return ()
+
+    patterns = []
+    for record in PARAMETER_SEEDS:
+        normalised, _ = _normalise_parameter(record.get("param_pattern", ""))
+        issue_type = str(record.get("related_issue_type") or "").strip().lower()
+        if not normalised or not issue_type:
+            continue
+        patterns.append(
+            _ParameterPattern(
+                (normalised,),
+                (issue_type,),
+                f"Seeded parameter association for {record['param_pattern']}.",
+                float(record.get("confidence") or 0.0),
+            )
+        )
+    return tuple(patterns)
+
+
+def _stack_requirements(stack_pattern: str) -> dict[str, tuple[str, ...]]:
+    requirements: dict[str, tuple[str, ...]] = {}
+    runtime_components: list[str] = []
+    components = [
+        re.sub(r"\s+", " ", part.strip().lower())
+        for part in str(stack_pattern or "").split("+")
+        if part.strip()
+    ]
+    edu_products = [
+        component
+        for component in components
+        if component in _EDU_PRODUCT_COMPONENTS
+    ]
+    if edu_products:
+        requirements["product"] = (edu_products[0],)
+        for component in components:
+            if component in _EDU_PRODUCT_COMPONENTS:
+                continue
+            if component in _DATABASE_COMPONENTS:
+                requirements["database"] = (component,)
+            elif component in _SERVER_COMPONENTS:
+                requirements["server"] = (component,)
+            elif component in _RUNTIME_COMPONENTS:
+                requirements["runtime"] = (component,)
+            elif "framework" not in requirements:
+                requirements["framework"] = (component,)
+        return requirements
+
+    for component in components:
+        if component in _DATABASE_COMPONENTS:
+            requirements["database"] = (component,)
+        elif component in _SERVER_COMPONENTS and "server" not in requirements:
+            requirements["server"] = (component,)
+        elif component in _RUNTIME_COMPONENTS:
+            runtime_components.append(component)
+        elif "framework" not in requirements:
+            requirements["framework"] = (component,)
+        elif "server" not in requirements:
+            requirements["server"] = (component,)
+    if "framework" not in requirements and runtime_components:
+        requirements["framework"] = (runtime_components[0],)
+    return requirements
+
+
+def _load_seed_stack_strategies() -> tuple[_StackStrategy, ...]:
+    try:
+        from scripts.seed_memory import STACK_SEEDS
+    except (ImportError, ModuleNotFoundError):
+        return ()
+
+    strategies = []
+    for record in STACK_SEEDS:
+        name = str(record.get("stack_pattern") or "").strip()
+        requirements = _stack_requirements(name)
+        if not name or not requirements:
+            continue
+        issues = tuple(str(item) for item in record.get("common_issues", ()))
+        follow_ups = tuple(str(item) for item in record.get("assessment_focus", ()))
+        strategies.append(
+            _StackStrategy(
+                name,
+                requirements,
+                (
+                    "Common assessment issues: "
+                    + ", ".join(issues)
+                    + "."
+                ),
+                follow_ups,
+            )
+        )
+    return tuple(strategies)
 
 
 class PatternEngine:
@@ -197,9 +355,21 @@ class PatternEngine:
         response_patterns: Iterable[_ResponsePattern] | None = None,
         stack_strategies: Iterable[_StackStrategy] | None = None,
     ) -> None:
-        self._parameter_patterns = tuple(parameter_patterns or _PARAMETER_PATTERNS)
-        self._response_patterns = tuple(response_patterns or _RESPONSE_PATTERNS)
-        self._stack_strategies = tuple(stack_strategies or _STACK_STRATEGIES)
+        self._parameter_patterns = (
+            tuple(parameter_patterns)
+            if parameter_patterns is not None
+            else _PARAMETER_PATTERNS + _load_seed_parameter_patterns()
+        )
+        self._response_patterns = (
+            tuple(response_patterns)
+            if response_patterns is not None
+            else _RESPONSE_PATTERNS
+        )
+        self._stack_strategies = (
+            tuple(stack_strategies)
+            if stack_strategies is not None
+            else _STACK_STRATEGIES + _load_seed_stack_strategies()
+        )
 
     def match_parameter(self, parameter: str, context: str = "") -> dict[str, Any]:
         """Return likely vulnerability classes for a parameter name."""
@@ -223,7 +393,14 @@ class PatternEngine:
             matched_names = _unique(
                 ([normalised] if exact else []) + token_hits + compound_hits
             )
-            base_confidence = 0.9 if exact else 0.72
+            if pattern.confidence:
+                base_confidence = (
+                    pattern.confidence
+                    if exact
+                    else max(0.5, pattern.confidence - 0.12)
+                )
+            else:
+                base_confidence = 0.9 if exact else 0.72
             if compound_hits:
                 base_confidence = max(base_confidence, 0.84)
             context_boost = 0.0
@@ -327,6 +504,15 @@ class PatternEngine:
             ),
             "database": _normalise_feature(
                 supplied.get("database") or supplied.get("db")
+            ),
+            "product": _normalise_feature(
+                supplied.get("edu_system")
+                or supplied.get("product")
+                or supplied.get("edu")
+                or supplied.get("cms")
+            ),
+            "runtime": _normalise_feature(
+                supplied.get("runtime") or supplied.get("language")
             ),
         }
         ranked: list[dict[str, Any]] = []

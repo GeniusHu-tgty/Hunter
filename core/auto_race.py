@@ -24,12 +24,15 @@ def _get_session():
 
 
 def detect_rate_limit(url: str, param: str = "username", method: str = "POST",
-                      attempts: int = 5, delay: float = 0.1) -> dict:
+                      attempts: int = 5, delay: float = 0.1,
+                      session_cookie: str = "") -> dict:
     """
     Detect if endpoint has rate limiting.
     Returns dict with: rate_limited, limit_count, lockout_window
     """
     session = _get_session()
+    if session_cookie:
+        session.headers["Cookie"] = session_cookie
     results = {
         "url": url,
         "rate_limited": False,

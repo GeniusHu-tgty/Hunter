@@ -1,4 +1,7 @@
 from pathlib import Path
+
+import pytest
+
 from core.stealth.fingerprint_manager import FingerprintManager
 from core.stealth.proxy_pool import ProxyPool
 from core.stealth.rate_limiter import AdaptiveRateLimiter
@@ -11,6 +14,34 @@ def test_fingerprint_pool_session_consistency_rotation_and_uniqueness():
     assert len({x['id'] for x in pool})==len(pool)
     assert manager.for_session('a')['id']==manager.for_session('a')['id']
     first=manager.choose('round-robin')['id']; second=manager.choose('round-robin')['id']; assert first!=second
+
+
+def test_for_session_never_silently_replaces_existing_fingerprint():
+    manager=FingerprintManager(seed=5)
+    firefox=next(
+        item for item in manager.fingerprints()
+        if item['browser']=='Firefox'
+    )
+    manager.bind_session('stealth-fixed',firefox['id'])
+
+    assert manager.for_session('stealth-fixed')['id']==firefox['id']
+    with pytest.raises(RuntimeError,match='rotate_fingerprint'):
+        manager.for_session('stealth-fixed',require_impersonate=True)
+    assert manager.for_session('stealth-fixed')['id']==firefox['id']
+
+
+def test_rotate_fingerprint_changes_browser_family_and_binding():
+    manager=FingerprintManager(seed=7)
+    first=manager.for_session('stealth-rotate')
+
+    second=manager.rotate_fingerprint(
+        'stealth-rotate',
+        current_fingerprint_id=first['id'],
+    )
+
+    assert second['id']!=first['id']
+    assert second['browser']!=first['browser']
+    assert manager.for_session('stealth-rotate')['id']==second['id']
 
 
 def test_import_browser_and_freshness_pruning():

@@ -13,6 +13,8 @@ Tools:
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import http.client
 import ipaddress
@@ -24,13 +26,14 @@ import shutil
 import socket
 import ssl
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from mcp.server.fastmcp import FastMCP
@@ -56,6 +59,7 @@ from core.recon_cache import ReconCache
 from core.workflow import UnifiedOrchestrator, WorkflowKernel, WorkflowPolicy
 from core.workflow.locking import WorkflowFileLock
 from core.session import AttackChain, AttackSessionStore, PostExploitation
+from core.session.auto_form_extractor import prepare_auto_login
 from core.browser import (
     BrowserController,
     BrowserSessionStore,
@@ -97,6 +101,7 @@ JS_REPLAY_DIR = Path(os.getenv("OPEN_TGTYLAB_ROOT", r"D:\Open-tgtylab")) / "expo
 JS_ANALYSIS_MAX_BYTES = 10 * 1024 * 1024
 JS_ANALYSIS_MAX_SCRIPTS = 32
 JS_ANALYSIS_TIMEOUT_SECONDS = 15
+BROWSER_MCP_CALL_TIMEOUT_SECONDS = 30.0
 REVERSE_PIPELINE_ROOT = Path(os.getenv("OPEN_TGTYLAB_ROOT", r"D:\Open-tgtylab")) / "exports" / "reverse"
 
 def _reset_workspace_adapter(root: Optional[str | Path] = None) -> OpenTgtyLabWorkspaceAdapter:
@@ -280,6 +285,7 @@ _attack_session_store = None
 _attack_http_clients = {}
 _post_exploitation = PostExploitation()
 _browser_store = None
+_browser_mcp_caller = None
 _target_memory = None
 _technique_memory = None
 _pattern_engine = PatternEngine()
@@ -318,8 +324,63 @@ def _get_browser_store():
     return _browser_store or _reset_browser_store()
 
 
+def _set_browser_mcp_caller(call_mcp_tool=None):
+    global _browser_mcp_caller
+    _browser_mcp_caller = call_mcp_tool
+    return _browser_mcp_caller
+
+
+def _threadsafe_browser_mcp_caller(owner_loop=None):
+    caller = _browser_mcp_caller
+    if caller is None:
+        return None
+    loop = owner_loop
+
+    async def invoke(backend_name, tool_name, arguments):
+        result = caller(backend_name, tool_name, arguments)
+        return await result if inspect.isawaitable(result) else result
+
+    async def proxy(backend_name, tool_name, arguments):
+        current_loop = asyncio.get_running_loop()
+        timeout = max(
+            0.001,
+            float(BROWSER_MCP_CALL_TIMEOUT_SECONDS),
+        )
+        if loop is None or current_loop is loop:
+            return await asyncio.wait_for(
+                invoke(backend_name, tool_name, arguments),
+                timeout=timeout,
+            )
+        coroutine = invoke(backend_name, tool_name, arguments)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except Exception:
+            coroutine.close()
+            raise
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            future.cancel()
+            raise
+
+    return proxy
+
+
+def _orchestration_services(call_mcp_tool=None):
+    services = {"stealth_http_client": _get_stealth_client()}
+    if call_mcp_tool is not None:
+        services["call_mcp_tool"] = call_mcp_tool
+    return services
+
+
 def _browser_controller() -> BrowserController:
-    return BrowserController(artifact_dir=_get_browser_store().storage_dir)
+    return BrowserController(
+        artifact_dir=_get_browser_store().storage_dir,
+        call_mcp_tool=_browser_mcp_caller,
+    )
 
 
 def _reset_memory_store(db_path: Optional[str | Path] = None):
@@ -533,6 +594,152 @@ def _parse_json_lines(text: str) -> List[Dict[str, Any]]:
     return records
 
 
+def _decode_base64_text(value: str) -> Optional[str]:
+    token = unquote(str(value or "")).strip()
+    if (
+        len(token) < 4
+        or not re.fullmatch(r"[A-Za-z0-9+/_-]+={0,2}", token)
+    ):
+        return None
+
+    padded = token + ("=" * (-len(token) % 4))
+    for altchars in (None, b"-_"):
+        try:
+            decoded = base64.b64decode(
+                padded,
+                altchars=altchars,
+                validate=True,
+            )
+            text = decoded.decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+
+        standard = base64.b64encode(decoded).decode("ascii").rstrip("=")
+        urlsafe = (
+            base64.urlsafe_b64encode(decoded)
+            .decode("ascii")
+            .rstrip("=")
+        )
+        if token.rstrip("=") not in {standard, urlsafe}:
+            continue
+        if text.strip() and all(char.isprintable() for char in text):
+            return text
+    return None
+
+
+def _replace_url_path_value(path: str, encoded: str, decoded: str) -> Optional[str]:
+    for candidate in (encoded, quote(encoded, safe="")):
+        index = path.find(candidate)
+        if index < 0:
+            continue
+        replacement = decoded
+        end = index + len(candidate)
+        if index and path[index - 1] == "/" and replacement.startswith("/"):
+            replacement = replacement[1:]
+        if end < len(path) and path[end] == "/" and replacement.endswith("/"):
+            replacement = replacement[:-1]
+        return path[:index] + replacement + path[end:]
+    return None
+
+
+def _decode_ffuf_url(url: str, input_values: Optional[List[str]] = None) -> str:
+    raw_url = str(url or "")
+    if not raw_url:
+        return raw_url
+
+    parts = urlsplit(raw_url)
+    candidates = [
+        str(value)
+        for value in (input_values or [])
+        if isinstance(value, str) and value
+    ]
+    for candidate in candidates:
+        decoded = _decode_base64_text(candidate)
+        if decoded is None:
+            continue
+        path = _replace_url_path_value(parts.path, candidate, decoded)
+        if path is not None:
+            return urlunsplit(parts._replace(path=path))
+
+    segments = parts.path.split("/")
+    for index, segment in enumerate(segments):
+        decoded = _decode_base64_text(segment)
+        if decoded is None:
+            continue
+        replacement = decoded.split("/")
+        if replacement and replacement[0] == "":
+            replacement = replacement[1:]
+        segments[index:index + 1] = replacement
+        return urlunsplit(parts._replace(path="/".join(segments)))
+    return raw_url
+
+
+def _normalize_ffuf_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(record)
+    raw_url = str(record.get("url") or "")
+    normalized["raw_url"] = raw_url
+    input_data = record.get("input")
+    input_values: List[str] = []
+    if isinstance(input_data, dict):
+        fuzz_value = input_data.get("FUZZ")
+        if isinstance(fuzz_value, str):
+            input_values.append(fuzz_value)
+        input_values.extend(
+            value
+            for key, value in input_data.items()
+            if key != "FUZZ" and isinstance(value, str)
+        )
+    normalized["url"] = _decode_ffuf_url(raw_url, input_values)
+    return normalized
+
+
+def _ffuf_status(value: Any) -> Any:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        text = str(value or "").strip()
+        return text or "unknown"
+
+
+def _summarize_ffuf_results(records: List[Dict[str, Any]]) -> str:
+    visible = (
+        list(records)
+        if len(records) < 20
+        else [
+            record
+            for record in records
+            if _ffuf_status(record.get("status")) != 404
+        ]
+    )
+    visible = visible[:200]
+    grouped: Dict[Any, List[Dict[str, Any]]] = {}
+    for record in visible:
+        grouped.setdefault(
+            _ffuf_status(record.get("status")),
+            [],
+        ).append(record)
+
+    def sort_key(status: Any) -> tuple:
+        return (0, status) if isinstance(status, int) else (1, str(status))
+
+    lines: List[str] = []
+    for status in sorted(grouped, key=sort_key):
+        status_records = grouped[status]
+        lines.append(f"HTTP {status} ({len(status_records)}个):")
+        for record in status_records:
+            url = str(record.get("url") or record.get("raw_url") or "")
+            redirect = str(
+                record.get("redirectlocation")
+                or record.get("location")
+                or ""
+            )
+            if redirect:
+                lines.append(f"  {url} -> {urljoin(url, redirect)}")
+            else:
+                lines.append(f"  {url}")
+    return "\n".join(lines)
+
+
 def _tool_payload(
     tool: str,
     raw: Dict[str, Any],
@@ -612,11 +819,11 @@ def _build_submission_metadata(agent_name: str, execution: Dict[str, Any]) -> Di
         "reportable": False,
         "lead_only": True,
         "proof_strength": ProofStrength.NONE.value if not success else ProofStrength.WEAK.value,
-        "why_not_reportable": "当前结果属于自动化发现线索，缺少稳定复现和业务影响证明。",
-        "review_notes": "默认按 SRC 严审模式降为线索，需人工进一步验证。",
+        "why_not_reportable": "Automated discovery lead lacks stable reproduction and business-impact proof.",
+        "review_notes": "Requires manual validation before SRC submission.",
         "business_impact": "",
         "impact_scope": execution.get("target", ""),
-        "lead_reason": "自动化资产/漏洞线索默认不直接进入正式报告。",
+        "lead_reason": "Automated scanner output is retained as a lead pending reproducible proof.",
         "src_score": 10.0 if success else 0.0,
     }
 
@@ -624,7 +831,7 @@ def _build_submission_metadata(agent_name: str, execution: Dict[str, Any]) -> Di
         return metadata
 
     if status == "timeout":
-        metadata["why_not_reportable"] = execution.get("message", "执行超时，缺少验证结果。")
+        metadata["why_not_reportable"] = execution.get("message", "Scanner timed out without proof.")
         metadata["lead_reason"] = metadata["why_not_reportable"]
         metadata["proof_strength"] = ProofStrength.NONE.value
         metadata["src_score"] = 0.0
@@ -633,7 +840,7 @@ def _build_submission_metadata(agent_name: str, execution: Dict[str, Any]) -> Di
     if execution.get("count", 0) or execution.get("findings"):
         metadata["proof_strength"] = ProofStrength.WEAK.value
         metadata["src_score"] = 20.0 if success else 5.0
-        metadata["why_not_reportable"] = "扫描器命中或异常回显不足以直接进入正式漏洞报告。"
+        metadata["why_not_reportable"] = "Candidate findings require reproducible request, response, and impact evidence."
         metadata["lead_reason"] = metadata["why_not_reportable"]
 
     return metadata
@@ -728,11 +935,25 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
     if agent_name == "subdomain":
         raw = _hunter.subfinder_enum(host)
         subdomains = _dedupe(_nonempty_lines(raw.get("stdout", "")))
-        return _tool_payload("subfinder", raw, {
-            "target": host,
-            "subdomains": subdomains,
-            "count": len(subdomains),
-        })
+        return _tool_payload(
+            "subfinder",
+            raw,
+            {
+                "target": host,
+                "subdomains": subdomains,
+                "count": len(subdomains),
+            },
+            {
+                "source": raw.get("source", ""),
+                "attempts": raw.get("attempts", []),
+                "wordlist": raw.get("wordlist", ""),
+                "error": raw.get("error", ""),
+                "partial": raw.get("partial", False),
+                "timed_out": raw.get("timed_out", False),
+                "warning": raw.get("warning", ""),
+                "elapsed_seconds": raw.get("elapsed_seconds"),
+            },
+        )
 
     if agent_name == "port-scan":
         ports = kwargs.get("ports", "top-1000")
@@ -767,10 +988,13 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
         wordlist = _resolve_wordlist(kwargs.get("wordlist", "default"))
         raw = _hunter.ffuf_fuzz(url, wordlist=wordlist)
         records = _parse_json_lines(raw.get("stdout", ""))
+        parsed_records = [_normalize_ffuf_record(record) for record in records]
         return _tool_payload("ffuf", raw, {
             "target": url,
             "wordlist": wordlist,
             "results": records[:200],
+            "parsed_results": parsed_records[:200],
+            "human_readable": _summarize_ffuf_results(parsed_records),
             "count": len(records),
         })
 
@@ -897,7 +1121,12 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
 async def _execute_agent_async(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
     timeout = kwargs.pop("timeout", None)
     if timeout is None:
-        timeout = 150 if agent_name in {"js-analyze", "api-discover", "param-discover", "endpoint-map"} else 90
+        if agent_name == "subdomain":
+            timeout = 120
+        elif agent_name in {"js-analyze", "api-discover", "param-discover", "endpoint-map"}:
+            timeout = 150
+        else:
+            timeout = 90
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(_execute_agent, agent_name, target, **kwargs),
@@ -1746,6 +1975,109 @@ async def _safe_json_tool(tool_name: str, func, *args, timeout: int = 120, **kwa
         })
 
 
+_auto_session_context = threading.local()
+_auto_session_dispatchers: Dict[str, Any] = {}
+_auto_session_dispatch_lock = threading.Lock()
+
+
+def _install_auto_session_dispatcher(module):
+    """Install a thread-local override around a module's legacy session factory."""
+    module_name = module.__name__
+    with _auto_session_dispatch_lock:
+        if module_name in _auto_session_dispatchers:
+            return
+        original = getattr(module, "_get_session", None)
+        if original is None:
+            raise RuntimeError(f"{module_name} does not expose _get_session")
+
+        def dispatch():
+            factory = getattr(_auto_session_context, "factory", None)
+            return factory() if factory is not None else original()
+
+        module._get_session = dispatch
+        _auto_session_dispatchers[module_name] = original
+
+
+def _call_auto_with_session(module, func, session_id, args, kwargs):
+    _install_auto_session_dispatcher(module)
+    detection_session = _get_stealth_client().detection_session(session_id)
+    previous = getattr(_auto_session_context, "factory", None)
+    _auto_session_context.factory = lambda: detection_session
+    try:
+        return _call_with_supported_kwargs(func, *args, **kwargs)
+    finally:
+        if previous is None:
+            try:
+                del _auto_session_context.factory
+            except AttributeError:
+                pass
+        else:
+            _auto_session_context.factory = previous
+
+
+_AUTO_VERDICT_TYPES = {
+    "hunter_auto_sqli": "sqli",
+    "hunter_auto_xss": "xss",
+    "hunter_auto_ssrf": "ssrf",
+    "hunter_auto_xxe": "xxe",
+    "hunter_auto_csrf": "csrf",
+    "hunter_auto_ssti": "ssti",
+    "hunter_auto_cmd": "rce",
+    "hunter_auto_idor": "idor",
+    "hunter_auto_access_control": "auth_bypass",
+}
+
+
+def _assess_auto_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach a centralized verdict without trusting legacy booleans."""
+    vuln_name = _AUTO_VERDICT_TYPES.get(tool_name)
+    if not vuln_name:
+        return result
+
+    from core.evidence.verdict_engine import Evidence, Verdict, VerdictEngine, VulnType
+
+    raw_evidence = result.get("evidence")
+    if isinstance(raw_evidence, Evidence):
+        evidence = raw_evidence
+    elif isinstance(raw_evidence, dict):
+        evidence = Evidence.from_mapping(raw_evidence)
+    else:
+        evidence = Evidence({}, {}, {}, "", 0, {})
+
+    verdict = VerdictEngine().assess(VulnType(vuln_name), evidence)
+    if "vulnerable" in result:
+        result["legacy_vulnerable"] = bool(result["vulnerable"])
+    result["verdict"] = verdict.to_dict()
+    result["vulnerable"] = verdict.verdict is Verdict.VERIFIED
+    return result
+
+async def _safe_auto_json_tool(
+    tool_name: str,
+    module,
+    func,
+    *args,
+    session_id: Optional[str] = None,
+    timeout: int = 120,
+    **kwargs,
+) -> str:
+    """Run an auto scanner and attach a centralized evidence verdict."""
+    def invoke():
+        if session_id is None:
+            result = _call_with_supported_kwargs(func, *args, **kwargs)
+        else:
+            result = _call_auto_with_session(
+                module,
+                func,
+                session_id,
+                args,
+                kwargs,
+            )
+        if not isinstance(result, dict):
+            result = {"result": result}
+        return _assess_auto_result(tool_name, result)
+
+    return await _safe_json_tool(tool_name, invoke, timeout=timeout)
+
 def _join_endpoint(target: str, endpoint: str = "") -> str:
     if not endpoint:
         return target
@@ -1755,122 +2087,227 @@ def _join_endpoint(target: str, endpoint: str = "") -> str:
 
 
 @mcp.tool()
-async def hunter_auto_sqli(target: str, param: str = "category", method: str = "GET") -> str:
+async def hunter_auto_sqli(target: str, param: str = "category", method: str = "GET",
+                           session_id: Optional[str] = None) -> str:
     """Automated SQL injection scanner."""
-    from core.auto_sqli import auto_sqli_impl
-    return await _safe_json_tool("hunter_auto_sqli", auto_sqli_impl, target, param=param, method=method)
-
-
-@mcp.tool()
-async def hunter_auto_xss(target: str, param: str = "q", method: str = "GET") -> str:
-    """Automated XSS scanner."""
-    from core.auto_xss import auto_xss_impl
-    return await _safe_json_tool("hunter_auto_xss", auto_xss_impl, target, param=param, method=method)
-
-
-@mcp.tool()
-async def hunter_auto_ssrf(target: str, param: str = "url", method: str = "GET", collaborator: str = "") -> str:
-    """Automated SSRF scanner."""
-    from core.auto_ssrf import auto_ssrf_impl
-    return await _safe_json_tool(
-        "hunter_auto_ssrf",
-        auto_ssrf_impl,
+    from core import auto_sqli
+    return await _safe_auto_json_tool(
+        "hunter_auto_sqli",
+        auto_sqli,
+        auto_sqli.auto_sqli_impl,
         target,
         param=param,
         method=method,
-        collaborator=collaborator,
+        session_id=session_id,
     )
 
 
 @mcp.tool()
-async def hunter_auto_xxe(target: str, param: str = "", method: str = "POST", collaborator: str = "") -> str:
+async def hunter_auto_xss(target: str, param: str = "q", method: str = "GET",
+                          session_id: Optional[str] = None) -> str:
+    """Automated XSS scanner."""
+    from core import auto_xss
+    return await _safe_auto_json_tool(
+        "hunter_auto_xss",
+        auto_xss,
+        auto_xss.auto_xss_impl,
+        target,
+        param=param,
+        method=method,
+        session_id=session_id,
+    )
+
+
+@mcp.tool()
+async def hunter_auto_ssrf(target: str, param: str = "url", method: str = "GET",
+                           collaborator: str = "",
+                           session_id: Optional[str] = None) -> str:
+    """Automated SSRF scanner."""
+    from core import auto_ssrf
+    return await _safe_auto_json_tool(
+        "hunter_auto_ssrf",
+        auto_ssrf,
+        auto_ssrf.auto_ssrf_impl,
+        target,
+        param=param,
+        method=method,
+        collaborator=collaborator,
+        session_id=session_id,
+    )
+
+
+@mcp.tool()
+async def hunter_auto_xxe(target: str, param: str = "", method: str = "POST",
+                          collaborator: str = "",
+                          session_id: Optional[str] = None) -> str:
     """Automated XXE scanner."""
-    from core.auto_xxe import auto_xxe_impl
-    return await _safe_json_tool(
+    from core import auto_xxe
+    return await _safe_auto_json_tool(
         "hunter_auto_xxe",
-        auto_xxe_impl,
+        auto_xxe,
+        auto_xxe.auto_xxe_impl,
         target,
         param=param,
         method=method,
         oob_domain=collaborator,
         collaborator=collaborator,
+        session_id=session_id,
     )
 
 
 @mcp.tool()
-async def hunter_auto_csrf(target: str, cookie: str = "") -> str:
+async def hunter_auto_csrf(target: str, cookie: str = "",
+                           session_id: Optional[str] = None) -> str:
     """Automated CSRF vulnerability detection and exploit generation."""
-    from core.auto_csrf import scan
-    return await _safe_json_tool("hunter_auto_csrf", scan, target, cookie=cookie)
+    from core import auto_csrf
+    return await _safe_auto_json_tool(
+        "hunter_auto_csrf",
+        auto_csrf,
+        auto_csrf.scan,
+        target,
+        cookie=cookie,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_graphql(target: str) -> str:
+async def hunter_auto_graphql(target: str,
+                              session_id: Optional[str] = None) -> str:
     """Automated GraphQL vulnerability scanner."""
-    from core.auto_graphql import full_scan
-    return await _safe_json_tool("hunter_auto_graphql", full_scan, target)
+    from core import auto_graphql
+    return await _safe_auto_json_tool(
+        "hunter_auto_graphql",
+        auto_graphql,
+        auto_graphql.full_scan,
+        target,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_websocket(target: str) -> str:
+async def hunter_auto_websocket(target: str,
+                                session_id: Optional[str] = None) -> str:
     """Automated WebSocket vulnerability scanner."""
-    from core.auto_websocket import full_scan
-    return await _safe_json_tool("hunter_auto_websocket", full_scan, target)
+    from core import auto_websocket
+    return await _safe_auto_json_tool(
+        "hunter_auto_websocket",
+        auto_websocket,
+        auto_websocket.full_scan,
+        target,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_ssti(target: str, param: str = "q", method: str = "GET") -> str:
+async def hunter_auto_ssti(target: str, param: str = "q", method: str = "GET",
+                           session_id: Optional[str] = None) -> str:
     """Automated SSTI vulnerability scanner with engine detection."""
-    from core.auto_ssti import auto_ssti_impl
-    return await _safe_json_tool("hunter_auto_ssti", auto_ssti_impl, target, param=param, method=method)
+    from core import auto_ssti
+    return await _safe_auto_json_tool(
+        "hunter_auto_ssti",
+        auto_ssti,
+        auto_ssti.auto_ssti_impl,
+        target,
+        param=param,
+        method=method,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_cmd(target: str, param: str = "cmd", method: str = "GET") -> str:
+async def hunter_auto_cmd(target: str, param: str = "cmd", method: str = "GET",
+                          session_id: Optional[str] = None) -> str:
     """Automated command injection scanner."""
-    from core.auto_cmd import auto_cmd_impl
-    return await _safe_json_tool("hunter_auto_cmd", auto_cmd_impl, target, param=param, method=method)
+    from core import auto_cmd
+    return await _safe_auto_json_tool(
+        "hunter_auto_cmd",
+        auto_cmd,
+        auto_cmd.auto_cmd_impl,
+        target,
+        param=param,
+        method=method,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_idor(target: str, endpoint: str = "", cookie: str = "") -> str:
+async def hunter_auto_idor(target: str, endpoint: str = "", cookie: str = "",
+                           session_id: Optional[str] = None) -> str:
     """Automated IDOR vulnerability scanner."""
-    from core.auto_idor import auto_idor_impl
+    from core import auto_idor
     url = _join_endpoint(target, endpoint)
-    return await _safe_json_tool("hunter_auto_idor", auto_idor_impl, url=url, cookie=cookie)
+    return await _safe_auto_json_tool(
+        "hunter_auto_idor",
+        auto_idor,
+        auto_idor.auto_idor_impl,
+        url=url,
+        cookie=cookie,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_race(target: str, cookie: str = "") -> str:
+async def hunter_auto_race(target: str, cookie: str = "",
+                           session_id: Optional[str] = None) -> str:
     """Automated race-condition scanner."""
-    from core.auto_race import full_scan
-    return await _safe_json_tool("hunter_auto_race", full_scan, target, session_cookie=cookie, cookie=cookie)
+    from core import auto_race
+    return await _safe_auto_json_tool(
+        "hunter_auto_race",
+        auto_race,
+        auto_race.full_scan,
+        target,
+        session_cookie=cookie,
+        cookie=cookie,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_cors(target: str, cookie: str = "") -> str:
+async def hunter_auto_cors(target: str, cookie: str = "",
+                           session_id: Optional[str] = None) -> str:
     """Automated CORS misconfiguration scanner."""
-    from core.auto_cors import scan
-    return await _safe_json_tool("hunter_auto_cors", scan, target, cookie=cookie)
+    from core import auto_cors
+    return await _safe_auto_json_tool(
+        "hunter_auto_cors",
+        auto_cors,
+        auto_cors.scan,
+        target,
+        cookie=cookie,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_jwt(target: str, token: str = "", cookie: str = "") -> str:
+async def hunter_auto_jwt(target: str, token: str = "", cookie: str = "",
+                          session_id: Optional[str] = None) -> str:
     """Automated JWT vulnerability scanner."""
-    from core.auto_jwt import AutoJWT
+    from core import auto_jwt
 
     def _scan():
-        jwt = AutoJWT(target, token, cookie)
+        jwt = auto_jwt.AutoJWT(target, token, cookie)
         return jwt.scan()
 
-    return await _safe_json_tool("hunter_auto_jwt", _scan)
+    return await _safe_auto_json_tool(
+        "hunter_auto_jwt",
+        auto_jwt,
+        _scan,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
-async def hunter_auto_access_control(target: str, cookie: str = "") -> str:
+async def hunter_auto_access_control(target: str, cookie: str = "",
+                                     session_id: Optional[str] = None) -> str:
     """Automated access-control scanner."""
-    from core.auto_access_control import scan
-    return await _safe_json_tool("hunter_auto_access_control", scan, target, cookie=cookie)
+    from core import auto_access_control
+    return await _safe_auto_json_tool(
+        "hunter_auto_access_control",
+        auto_access_control,
+        auto_access_control.scan,
+        target,
+        cookie=cookie,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()
@@ -1878,12 +2315,17 @@ async def hunter_unified_scan(target: str, cookie: str = "", collaborator: str =
                                phases: Optional[List[str]] = None) -> str:
     """Unified scan engine - runs selected phases automatically."""
     from core.unified_scanner import UnifiedScanner
+    call_mcp_tool = _threadsafe_browser_mcp_caller(
+        asyncio.get_running_loop()
+    )
 
     def _scan():
         scanner = UnifiedScanner(
             target=target,
             session_cookie=cookie,
             collaborator_domain=collaborator,
+            services=_orchestration_services(call_mcp_tool),
+            call_mcp_tool=call_mcp_tool,
         )
         return scanner.run_full_scan(phases=phases)
 
@@ -2033,8 +2475,8 @@ async def hunter_healthcheck() -> str:
         "integration_v2": _doctor().run()["data"]["checks"],
         "adaptive_engine": {"profiles": ["fast", "standard", "deep"], "cache": _adaptive_cache.status()},
         "notes": [
-            "网络型扫描依赖外部 CLI；缺失时仍可使用 payload/meta/report 工具。",
-            "所有 auto 工具经 safe wrapper 返回 JSON，不应把异常泄漏到 MCP 层。",
+            "Network scans depend on external CLIs; payload, metadata, and report tools remain available when CLIs are missing.",
+            "All auto tools use safe JSON wrappers and do not leak exceptions through MCP.",
         ],
     })
 
@@ -2194,38 +2636,38 @@ async def hunter_recommend_next(target: str = "", signals: Optional[List[str]] =
             "proof_goal": proof_goal,
         })
 
-    if any(token in raw for token in ["idor", "user_id", "userid", "uid", "object", "越权", "x-id-token", "authorization"]):
-        add("hunter_auto_idor", "ID/对象/token 信号提示可能存在直接对象引用或横向越权。", "用两个授权身份或 ID 差分证明可读取/修改非本人数据。", 10)
-        add("hunter_auto_access_control", "认证/角色/对象信号需要访问控制矩阵验证。", "对比无 token、低权 token、高权 token 的状态码与敏感字段差异。", 9)
+    if any(token in raw for token in ["idor", "user_id", "userid", "uid", "object", "瓒婃潈", "x-id-token", "authorization"]):
+        add("hunter_auto_idor", "Object identifiers suggest possible IDOR.", "Use two authorized identities to prove cross-user data access or modification.", 10)
+        add("hunter_auto_access_control", "Authorization signals suggest an access-control boundary.", "Compare anonymous, low-privilege, and authorized responses for the same resource.", 9)
     if any(token in raw for token in ["jwt", "token", "idtoken", "secret", "hs256", "hs512", "kid"]):
-        add("hunter_auto_jwt", "发现 JWT/token/secret 信号，应验证算法、kid、弱密钥和服务端信任边界。", "只用授权测试账号验证后端是否接受伪造/篡改 token。", 8)
+        add("hunter_auto_jwt", "JWT or token signals warrant signature and claim validation.", "Confirm a bounded token weakness without exposing live secrets.", 8)
     if "cors" in raw or "origin" in raw or "access-control" in raw:
-        add("hunter_auto_cors", "CORS/Origin 信号需要确认是否能跨域读取受保护数据。", "证明 ACAO/ACAC 与凭据模式组合能读到敏感响应，而不只是配置异常。", 7)
+        add("hunter_auto_cors", "CORS or Origin signals warrant cross-origin validation.", "Confirm attacker-origin read access with credentials where applicable.", 7)
     if "graphql" in raw or "introspection" in raw:
-        add("hunter_auto_graphql", "GraphQL 信号需要 schema、权限和批量/深度限制验证。", "证明 introspection/private query 可访问敏感字段或绕过授权。", 7)
+        add("hunter_auto_graphql", "GraphQL signals warrant schema and authorization checks.", "Confirm unauthorized introspection or private query access with bounded evidence.", 7)
     if "websocket" in raw or "ws://" in raw or "wss://" in raw:
-        add("hunter_auto_websocket", "WebSocket 信号需要 Origin、鉴权和消息篡改验证。", "证明跨站连接或消息篡改能读取/执行受保护动作。", 6)
+        add("hunter_auto_websocket", "WebSocket signals warrant handshake and message authorization checks.", "Capture an unauthorized handshake or message action with reproducible traffic.", 6)
     if any(token in raw for token in ["csrf", "form", "state-changing", "referer"]):
-        add("hunter_auto_csrf", "表单/状态变更/Referer 信号提示 CSRF 或流程绕过。", "生成最小 PoC 并证明授权用户状态发生可重复变化。", 6)
+        add("hunter_auto_csrf", "State-changing form or Referer signals warrant CSRF validation.", "Produce a bounded proof that a state change succeeds without a valid anti-CSRF control.", 6)
     if any(token in raw for token in ["sqli", "sql", "mysql", "oracle", "postgres", "error near", "union"]):
-        add("hunter_auto_sqli", "SQL/数据库错误信号需要注入确认。", "提取数据库 banner 或低敏证明数据，避免只报报错。", 5)
+        add("hunter_auto_sqli", "SQL error or database signals warrant injection validation.", "Confirm a stable error, structured-data, or timing signal without bulk extraction.", 5)
     if any(token in raw for token in ["xss", "script", "dom", "innerhtml", "reflect"]):
-        add("hunter_auto_xss", "反射/DOM sink 信号需要上下文化 XSS 验证。", "证明 payload 在浏览器运行态执行，保存 request/response/screenshot。", 5)
+        add("hunter_auto_xss", "Reflection or DOM sink signals warrant XSS validation.", "Capture reproducible request, response, and executable browser context evidence.", 5)
     if any(token in raw for token in ["ssrf", "url=", "callback", "metadata", "169.254"]):
-        add("hunter_auto_ssrf", "URL/callback/metadata 信号需要 SSRF 路径验证。", "证明服务端发起请求或可访问授权内网资源。", 5)
+        add("hunter_auto_ssrf", "URL, callback, or metadata signals warrant SSRF validation.", "Confirm an authorized collaborator callback or internal-service fingerprint.", 5)
     if any(token in raw for token in ["xml", "xxe", "svg", "doctype"]):
-        add("hunter_auto_xxe", "XML/SVG/DOCTYPE 信号需要 XXE/XInclude 验证。", "证明文件读取或 OOB 回连，不只证明解析 XML。", 5)
+        add("hunter_auto_xxe", "XML, SVG, or DOCTYPE signals warrant XXE validation.", "Confirm file disclosure or an authorized out-of-band interaction.", 5)
     if any(token in raw for token in ["ssti", "template", "jinja", "freemarker", "thymeleaf"]):
-        add("hunter_auto_ssti", "模板语法/报错信号需要 SSTI 引擎识别。", "证明表达式执行结果或受控命令输出。", 5)
+        add("hunter_auto_ssti", "Template-engine signals warrant SSTI validation.", "Confirm harmless expression evaluation before higher-impact actions.", 5)
     if any(token in raw for token in ["cmd", "command", "ping", "whoami", "shell"]):
-        add("hunter_auto_cmd", "命令参数/系统调用信号需要命令注入验证。", "证明可控命令结果或 OOB 回连。", 5)
-    if any(token in raw for token in ["race", "coupon", "payment", "balance", "concurrent", "并发", "竞态"]):
-        add("hunter_auto_race", "支付/优惠/余额/并发信号优先验证竞态和重放。", "证明并发导致一次以上的授权外状态变化。", 8)
+        add("hunter_auto_cmd", "Command-like parameters warrant injection validation.", "Confirm harmless output or an authorized out-of-band marker.", 5)
+    if any(token in raw for token in ["race", "coupon", "payment", "balance", "concurrent", "parallel", "race-condition"]):
+        add("hunter_auto_race", "Concurrency-sensitive business actions warrant race testing.", "Confirm a reproducible invariant violation with bounded concurrency.", 8)
     if any(token in raw for token in ["swagger", "openapi", "api-docs", "js", "endpoint"]):
-        add("hunter_js_analyze", "API 文档或 JS 暴露信号应先扩展端点图。", "提取端点、参数、token 使用点，转入针对性 proof。", 4)
+        add("hunter_js_analyze", "API documentation or JavaScript signals warrant endpoint discovery.", "Extract endpoints and parameters, then route only evidence-backed checks.", 4)
 
     if not recommendations:
-        add("hunter_recon", "缺少明确漏洞信号，先做低噪侦察建立资产/端点基线。", "获得存活服务、技术栈、JS/API 端点后再选择 auto_*。", 1)
+        add("hunter_recon", "No specific vulnerability signal is available.", "Build an authorized asset and endpoint inventory before targeted checks.", 1)
 
     recommendations.sort(key=lambda item: item["priority"], reverse=True)
     hunter_tools_rec = _hunter_tools.kb_recommend(signals=signals or [], finding=finding, target=target, limit=5)
@@ -2238,7 +2680,7 @@ async def hunter_recommend_next(target: str = "", signals: Optional[List[str]] =
         "proof_goals": [item["proof_goal"] for item in recommendations[:5]],
         "hunter_tools": hunter_tools_rec.get("data", {}),
         "workspace": workspace_rec.get("data", {}),
-        "routing_rule": "逻辑漏洞/认证边界优先；每个结论必须有可重复请求、响应差异和影响数据。",
+        "routing_rule": "Prioritize logic and authorization boundaries; require reproducible request, response, and impact evidence.",
     })
 
 
@@ -2686,6 +3128,7 @@ async def hunter_session_execute_chain(
     session_id: str,
     chain_name: str,
     params: Optional[Dict[str, Any]] = None,
+    auto_extract: bool = True,
 ) -> str:
     """Execute a bounded attack chain and persist state after every step."""
     def run_chain():
@@ -2695,7 +3138,21 @@ async def hunter_session_execute_chain(
             request_executor=_attack_request_executor,
             exploit_executor=_attack_exploit_executor,
         )
-        return chain.execute(session, params=params or {})
+        runtime_params = dict(params or {})
+        auto_summary = None
+        if auto_extract:
+            runtime_params, auto_summary, terminal = prepare_auto_login(
+                session,
+                chain,
+                runtime_params,
+                _attack_request_executor,
+            )
+            if terminal is not None:
+                return terminal
+        result = chain.execute(session, params=runtime_params)
+        if auto_summary is not None:
+            result["auto_extract"] = auto_summary
+        return result
 
     try:
         result = await asyncio.to_thread(run_chain)
@@ -2777,24 +3234,88 @@ async def hunter_post_exploit(
     )
 
 
+async def _resolve_browser_operation(value):
+    return await value if inspect.isawaitable(value) else value
+
+
+def _browser_tool_response(
+    tool: str,
+    data: Dict[str, Any],
+    status: str = "ok",
+    error: str = "",
+) -> str:
+    payload = {
+        "tool": tool,
+        "status": status,
+        "data": data,
+        "evidence": {},
+        "next_actions": [],
+    }
+    if error:
+        payload["error"] = error
+    return _json_dumps(payload)
+
+
 @mcp.tool()
 async def hunter_browser_navigate(
     target_url: str,
     wait_for: Optional[Dict[str, Any]] = None,
+    execute: bool = False,
 ) -> str:
-    """Create a browser session and emit a deferred Playwright navigation plan."""
-    def operate() -> Dict[str, Any]:
+    """Create a browser session and optionally execute its Playwright plan."""
+    try:
         store = _get_browser_store()
         session = store.create(target_url)
-        plan = _browser_controller().navigate_and_wait(target_url, wait_for or {})
+        controller = _browser_controller()
+        plan = await _resolve_browser_operation(
+            controller.navigate_and_wait(
+                target_url,
+                wait_for or {},
+                execute=execute,
+            )
+        )
+        if execute and controller.execution_adapter is not None:
+            status = str(plan.get("status", "error"))
+            data = {
+                "browser_session_id": session["session_id"],
+                "status": status,
+                "target_url": target_url,
+                "url": str(plan.get("url", target_url)),
+                "title": str(plan.get("title", "")),
+                "html_length": int(plan.get("html_length", 0) or 0),
+                "has_form": bool(plan.get("has_form", False)),
+                "has_login": bool(plan.get("has_login", False)),
+                "has_websocket": bool(plan.get("has_websocket", False)),
+                "plan": plan,
+            }
+            store.update(
+                session["session_id"],
+                current_url=data["url"],
+                title=data["title"],
+                last_plan=plan,
+            )
+            return _browser_tool_response(
+                "hunter_browser_navigate",
+                data,
+                status=status if status in {"ok", "timeout", "error"} else "error",
+                error=str(plan.get("error", "")),
+            )
         store.update(session["session_id"], current_url=target_url, last_plan=plan)
-        return {
-            "browser_session_id": session["session_id"],
-            "target_url": target_url,
-            "plan": plan,
-        }
-
-    return _workflow_result("hunter_browser_navigate", operate)
+        return _browser_tool_response(
+            "hunter_browser_navigate",
+            {
+                "browser_session_id": session["session_id"],
+                "target_url": target_url,
+                "plan": plan,
+            },
+        )
+    except Exception as exc:
+        return _browser_tool_response(
+            "hunter_browser_navigate",
+            {},
+            status="error",
+            error=str(exc),
+        )
 
 
 @mcp.tool()
@@ -2802,9 +3323,10 @@ async def hunter_browser_interact(
     browser_session_id: str,
     action: str,
     params: Optional[Dict[str, Any]] = None,
+    execute: bool = False,
 ) -> str:
-    """Build a deferred browser interaction plan for a stored browser session."""
-    def operate() -> Dict[str, Any]:
+    """Build or execute a browser interaction for a stored browser session."""
+    try:
         store = _get_browser_store()
         session = store.get(browser_session_id)
         controller = _browser_controller()
@@ -2814,58 +3336,102 @@ async def hunter_browser_interact(
             plan = controller.click_and_capture(
                 options.get("selector") or options.get("target") or options.get("text", ""),
                 capture_network=bool(options.get("capture_network", True)),
+                execute=execute,
             )
         elif normalized in {"fill", "form", "submit"}:
             plan = controller.fill_form_and_submit(
                 options.get("form_fields") or options.get("fields") or {},
                 options.get("submit_button") or options.get("submit") or "",
+                execute=execute,
             )
         elif normalized in {"scroll", "scroll_load_more"}:
-            plan = controller.scroll_and_load_more(options.get("scroll_times", 1))
+            plan = controller.scroll_and_load_more(
+                options.get("scroll_times", 1),
+                execute=execute,
+            )
         elif normalized in {"login", "auto_login"}:
             plan = controller.auto_login(
                 options.get("url") or session["target"],
                 options.get("username", ""),
                 options.get("password", ""),
                 options.get("login_button_selector"),
+                execute=execute,
             )
         elif normalized in {"spa", "navigate_spa"}:
             plan = controller.auto_navigate_spa(
                 options.get("base_url") or session["target"],
                 options.get("target_state", ""),
+                execute=execute,
             )
         elif normalized in {"trigger_api", "api"}:
             plan = controller.auto_trigger_api(
                 options.get("url") or session["target"],
                 options.get("action_description", ""),
+                execute=execute,
             )
         elif normalized in {"execute", "evaluate", "execute_in_context"}:
             plan = controller.execute_in_context(options.get("js_code", ""))
             plan["requires_confirmation"] = True
+            plan = controller.execute_plan(plan, execute=execute)
         else:
             raise ValueError(
                 "action must be click, fill, scroll, login, spa, trigger_api, or execute"
             )
+        plan = await _resolve_browser_operation(plan)
         store.update(browser_session_id, last_plan=plan)
-        return {"browser_session_id": browser_session_id, "plan": plan}
-
-    return _workflow_result("hunter_browser_interact", operate)
+        status = (
+            str(plan.get("status", "ok"))
+            if execute and controller.execution_adapter is not None
+            else "ok"
+        )
+        return _browser_tool_response(
+            "hunter_browser_interact",
+            {"browser_session_id": browser_session_id, "plan": plan},
+            status=status,
+            error=str(plan.get("error", "")),
+        )
+    except Exception as exc:
+        return _browser_tool_response(
+            "hunter_browser_interact",
+            {},
+            status="error",
+            error=str(exc),
+        )
 
 
 @mcp.tool()
 async def hunter_browser_capture_network(
     browser_session_id: str,
     duration: float = 5.0,
+    execute: bool = False,
 ) -> str:
-    """Build a deferred plan that collects browser network traffic."""
-    def operate() -> Dict[str, Any]:
+    """Build or execute a plan that collects browser network traffic."""
+    try:
         store = _get_browser_store()
         store.get(browser_session_id)
-        plan = _browser_controller().capture_network_traffic(duration)
+        controller = _browser_controller()
+        plan = await _resolve_browser_operation(
+            controller.capture_network_traffic(duration, execute=execute)
+        )
         store.update(browser_session_id, last_plan=plan)
-        return {"browser_session_id": browser_session_id, "plan": plan}
-
-    return _workflow_result("hunter_browser_capture_network", operate)
+        status = (
+            str(plan.get("status", "ok"))
+            if execute and controller.execution_adapter is not None
+            else "ok"
+        )
+        return _browser_tool_response(
+            "hunter_browser_capture_network",
+            {"browser_session_id": browser_session_id, "plan": plan},
+            status=status,
+            error=str(plan.get("error", "")),
+        )
+    except Exception as exc:
+        return _browser_tool_response(
+            "hunter_browser_capture_network",
+            {},
+            status="error",
+            error=str(exc),
+        )
 
 
 @mcp.tool()
@@ -2874,63 +3440,180 @@ async def hunter_browser_inject_hooks(
     hooks: Optional[List[str]] = None,
     strategy: str = "preload",
     refresh_interval_ms: int = 5000,
+    execute: bool = False,
 ) -> str:
-    """Build a deferred plan to install JavaScript observation hooks."""
-    def operate() -> Dict[str, Any]:
+    """Build or execute JavaScript observation-hook injection."""
+    try:
         store = _get_browser_store()
-        store.get(browser_session_id)
+        session = store.get(browser_session_id)
+        controller = _browser_controller()
         injector = DynamicHookInjector()
-        plan = injector.build_plan(
-            hooks or ["xhr", "fetch", "crypto", "storage", "cookie", "websocket"],
+        selected = hooks or ["xhr", "fetch", "crypto", "storage", "cookie", "websocket"]
+        deferred_plan = injector.build_plan(
+            selected,
             strategy=strategy,
             refresh_interval_ms=refresh_interval_ms,
         )
+        if execute and controller.execution_adapter is not None:
+            sources = {hook: injector.read_template(hook) for hook in selected}
+            plan = await _resolve_browser_operation(
+                controller.inject_hooks(
+                    sources,
+                    expected_url=session.get("current_url", ""),
+                    execute=True,
+                )
+            )
+            plan["requested_strategy"] = deferred_plan["strategy"]
+            plan["effective_strategy"] = "postload"
+            plan["strategy"] = "postload"
+            current_url = str(plan.get("current_url") or session.get("current_url", ""))
+            store.update(
+                browser_session_id,
+                current_url=current_url,
+                last_plan=plan,
+            )
+            status = str(plan.get("status", "error"))
+            return _browser_tool_response(
+                "hunter_browser_inject_hooks",
+                {
+                    "browser_session_id": browser_session_id,
+                    "status": status,
+                    "hook_statuses": plan.get("hook_statuses", []),
+                    "requested_strategy": plan["requested_strategy"],
+                    "effective_strategy": plan["effective_strategy"],
+                    "expected_url": plan.get("expected_url", ""),
+                    "current_url": current_url,
+                    "plan": plan,
+                },
+                status=status,
+                error=str(plan.get("error", "")),
+            )
+        plan = deferred_plan
         store.update(browser_session_id, last_plan=plan)
-        return {"browser_session_id": browser_session_id, "plan": plan}
-
-    return _workflow_result("hunter_browser_inject_hooks", operate)
+        return _browser_tool_response(
+            "hunter_browser_inject_hooks",
+            {"browser_session_id": browser_session_id, "plan": plan},
+        )
+    except Exception as exc:
+        return _browser_tool_response(
+            "hunter_browser_inject_hooks",
+            {},
+            status="error",
+            error=str(exc),
+        )
 
 
 @mcp.tool()
 async def hunter_browser_get_hook_results(
     browser_session_id: str,
     console_messages: Optional[List[str]] = None,
+    execute: bool = False,
 ) -> str:
-    """Ingest prefixed hook console records and return the redacted session view."""
-    def operate() -> Dict[str, Any]:
+    """Fetch, ingest, classify, and return redacted browser hook records."""
+    try:
         store = _get_browser_store()
+        controller = _browser_controller()
+        if execute and controller.execution_adapter is not None:
+            result = await _resolve_browser_operation(
+                controller.get_hook_results(execute=True)
+            )
+            status = str(result.get("status", "error"))
+            if status != "ok":
+                return _browser_tool_response(
+                    "hunter_browser_get_hook_results",
+                    {
+                        "browser_session_id": browser_session_id,
+                        **result,
+                    },
+                    status=status,
+                    error=str(result.get("error", "")),
+                )
+            messages = [
+                "__HUNTER_HOOK__" + json.dumps(item, ensure_ascii=False)
+                for item in result.get("hook_results", [])
+            ]
+            ingested = store.ingest_console(browser_session_id, messages)
+            persisted_messages = [
+                "__HUNTER_HOOK__" + json.dumps(item, ensure_ascii=False)
+                for item in ingested.get("hook_results", [])
+            ]
+            classified = controller.classify_hook_messages(persisted_messages)
+            data = {
+                "browser_session_id": browser_session_id,
+                "accepted": ingested["accepted"],
+                "rejected": result.get("rejected", 0) + ingested["rejected"],
+                "total": ingested["total"],
+                "hook_results": ingested["hook_results"],
+                "network_requests": classified["network_requests"],
+                "crypto_operations": classified["crypto_operations"],
+                "storage_operations": classified["storage_operations"],
+                "websocket_messages": classified["websocket_messages"],
+            }
+            return _browser_tool_response(
+                "hunter_browser_get_hook_results",
+                data,
+            )
         if console_messages:
-            return store.ingest_console(browser_session_id, console_messages)
-        session = store.get(browser_session_id)
-        return {
-            "browser_session_id": browser_session_id,
-            "accepted": 0,
-            "rejected": 0,
-            "total": len(session.get("hook_results", [])),
-            "hook_results": session.get("hook_results", []),
-        }
-
-    return _workflow_result("hunter_browser_get_hook_results", operate)
+            data = store.ingest_console(browser_session_id, console_messages)
+        else:
+            session = store.get(browser_session_id)
+            data = {
+                "browser_session_id": browser_session_id,
+                "accepted": 0,
+                "rejected": 0,
+                "total": len(session.get("hook_results", [])),
+                "hook_results": session.get("hook_results", []),
+            }
+        return _browser_tool_response("hunter_browser_get_hook_results", data)
+    except Exception as exc:
+        return _browser_tool_response(
+            "hunter_browser_get_hook_results",
+            {},
+            status="error",
+            error=str(exc),
+        )
 
 
 @mcp.tool()
 async def hunter_browser_snapshot(
     browser_session_id: str,
     include_network: bool = False,
+    execute: bool = False,
 ) -> str:
-    """Return a deferred browser snapshot plan for a stored browser session."""
-    def operate() -> Dict[str, Any]:
+    """Build or execute a browser snapshot operation."""
+    try:
         store = _get_browser_store()
         session = store.get(browser_session_id)
-        plan = _browser_controller().snapshot(include_network=include_network)
+        controller = _browser_controller()
+        plan = await _resolve_browser_operation(
+            controller.snapshot(
+                include_network=include_network,
+                execute=execute,
+            )
+        )
         store.update(browser_session_id, last_plan=plan)
-        return {
-            "browser_session_id": browser_session_id,
-            "current_url": session.get("current_url", ""),
-            "plan": plan,
-        }
-
-    return _workflow_result("hunter_browser_snapshot", operate)
+        status = (
+            str(plan.get("status", "ok"))
+            if execute and controller.execution_adapter is not None
+            else "ok"
+        )
+        return _browser_tool_response(
+            "hunter_browser_snapshot",
+            {
+                "browser_session_id": browser_session_id,
+                "current_url": session.get("current_url", ""),
+                "plan": plan,
+            },
+            status=status,
+            error=str(plan.get("error", "")),
+        )
+    except Exception as exc:
+        return _browser_tool_response(
+            "hunter_browser_snapshot",
+            {},
+            status="error",
+            error=str(exc),
+        )
 
 
 @mcp.tool()
@@ -3145,7 +3828,9 @@ async def hunter_fingerprint_detect(
 ) -> str:
     """Match passive headers/body/path observations against local fingerprints."""
     def operate() -> Dict[str, Any]:
-        result = _fingerprint_database.detect(observations or {})
+        passive_observations = dict(observations or {})
+        passive_observations.setdefault("target_url", target_url)
+        result = _fingerprint_database.detect(passive_observations)
         if observations is None:
             result["plan"] = {
                 "mode": "passive-observation-handoff",
@@ -3231,6 +3916,33 @@ def _workflow_result(tool: str, func, *args, **kwargs) -> str:
     except Exception as exc:
         return _json_dumps({"tool": tool, "status": "error", "error_type": type(exc).__name__, "error": str(exc), "data": {}, "evidence": {}, "next_actions": []})
 
+
+async def _async_workflow_result(tool: str, func, *args, **kwargs) -> str:
+    try:
+        data = await asyncio.to_thread(func, *args, **kwargs)
+        return _json_dumps(
+            {
+                "tool": tool,
+                "status": "ok",
+                "data": data,
+                "evidence": {},
+                "next_actions": [],
+            }
+        )
+    except Exception as exc:
+        return _json_dumps(
+            {
+                "tool": tool,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "data": {},
+                "evidence": {},
+                "next_actions": [],
+            }
+        )
+
+
 @mcp.tool()
 async def hunter_workflow_create(case_slug: str, objective: str, inputs: Optional[List[Dict[str, Any]]] = None, mode: str = "interactive", success_conditions: Optional[List[str]] = None, proof_types: Optional[List[str]] = None) -> str:
     return _workflow_result("hunter_workflow_create", _workflow_kernel().create, case_slug, objective, inputs or [], mode, success_conditions or [], proof_types or [])
@@ -3264,6 +3976,9 @@ async def hunter_workflow_run(
         raw_modules = config.get("modules", ["all"])
         modules = [raw_modules] if isinstance(raw_modules, str) else list(raw_modules)
         mode = config.get("mode", "interactive")
+        call_mcp_tool = _threadsafe_browser_mcp_caller(
+            asyncio.get_running_loop()
+        )
         def orchestrate():
             kernel = _workflow_kernel()
             resolved_target = target_url
@@ -3285,7 +4000,10 @@ async def hunter_workflow_run(
                 profile=profile,
                 modules=modules,
             )
-            return UnifiedOrchestrator(kernel).orchestrate(
+            return UnifiedOrchestrator(
+                kernel,
+                services=_orchestration_services(call_mcp_tool),
+            ).orchestrate(
                 slug,
                 target_url=resolved_target,
                 modules=modules,
@@ -3295,7 +4013,10 @@ async def hunter_workflow_run(
                 approval=config.get("approval"),
                 checkpoint_id=config.get("checkpoint_id", ""),
             )
-        return _workflow_result("hunter_workflow_run", orchestrate)
+        return await _async_workflow_result(
+            "hunter_workflow_run",
+            orchestrate,
+        )
 
     def execute_native(action):
         return {"status": "deferred", "summary": "Native MCP dispatch is emitted as a bounded action for the Codex orchestrator.", "action": action}
@@ -3306,9 +4027,24 @@ async def hunter_workflow_run(
 async def hunter_auto_pentest(
     target_url: str,
     options: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Run the bounded seven-stage unified orchestrator."""
     config = dict(options or {})
+    if session_id is not None:
+        try:
+            _get_stealth_client().detection_session(session_id)
+        except Exception as exc:
+            return _json_dumps({
+                "tool": "hunter_auto_pentest",
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "data": {},
+                "evidence": {},
+                "next_actions": [],
+            })
+        config["session_id"] = session_id
     profile = str(config.get("policy", "standard")).strip().lower()
     raw_modules = config.get("modules", ["all"])
     modules = [raw_modules] if isinstance(raw_modules, str) else list(raw_modules)
@@ -3334,6 +4070,9 @@ async def hunter_auto_pentest(
             "next_actions": [],
         })
     base_slug = f"auto-pentest-{hashlib.sha256(target_url.encode('utf-8')).hexdigest()[:16]}"
+    call_mcp_tool = _threadsafe_browser_mcp_caller(
+        asyncio.get_running_loop()
+    )
 
     def orchestrate():
         kernel = _workflow_kernel()
@@ -3346,7 +4085,10 @@ async def hunter_auto_pentest(
             profile=profile,
             modules=modules,
         )
-        result = UnifiedOrchestrator(kernel).orchestrate(
+        result = UnifiedOrchestrator(
+            kernel,
+            services=_orchestration_services(call_mcp_tool),
+        ).orchestrate(
             slug,
             target_url=target_url,
             modules=modules,
@@ -3356,6 +4098,22 @@ async def hunter_auto_pentest(
             approval=config.get("approval"),
             checkpoint_id=config.get("checkpoint_id", ""),
         )
+        if session_id is not None:
+            def bind_session(value):
+                if isinstance(value, dict):
+                    tool = str(value.get("tool", ""))
+                    if tool.startswith("hunter_auto_") and tool != "hunter_auto_pentest":
+                        value.setdefault("arguments", {}).setdefault(
+                            "session_id",
+                            session_id,
+                        )
+                    for child in value.values():
+                        bind_session(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        bind_session(child)
+
+            bind_session(result)
         return {
             "target_url": target_url,
             "workflow_slug": slug,
@@ -3363,7 +4121,10 @@ async def hunter_auto_pentest(
             **result,
         }
 
-    return _workflow_result("hunter_auto_pentest", orchestrate)
+    return await _async_workflow_result(
+        "hunter_auto_pentest",
+        orchestrate,
+    )
 
 @mcp.tool()
 async def hunter_workflow_transition(case_slug: str, phase: str, deliverables: Optional[Dict[str, Any]] = None) -> str:

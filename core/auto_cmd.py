@@ -34,6 +34,49 @@ class AutoCMD:
         self.injection_type = None
         self.working_payload = None
         self.findings = []
+        self.baseline_response = None
+        self.evidence = None
+
+    def _request_record(self, payload: str) -> dict:
+        if self.method == "GET":
+            from urllib.parse import quote
+            return {"method": "GET", "url": f"{self.base_url}?{self.param}={quote(payload)}", "headers": dict(getattr(self, "extra_headers", {})), "body": ""}
+        return {"method": self.method, "url": self.base_url, "headers": dict(getattr(self, "extra_headers", {})), "body": {self.param: payload}}
+
+    def _build_evidence(self, payload: str, response: dict, reproduction_count: int) -> dict:
+        baseline = self.baseline_response or {}
+        metadata = {
+            "response_time": response.get("time", 0),
+            "baseline_response_time": baseline.get("time", 0),
+            "command": payload,
+        }
+        return {
+            "request": self._request_record(payload),
+            "response": {"status_code": response.get("status", 0), "headers": response.get("headers", {}), "body": response.get("body", "")},
+            "baseline_response": {"status_code": baseline.get("status", 0), "headers": baseline.get("headers", {}), "body": baseline.get("body", "")},
+            "payload": payload,
+            "reproduction_count": reproduction_count,
+            "metadata": metadata,
+        }
+
+    def _ensure_baseline(self) -> dict:
+        if self.baseline_response is None:
+            self.baseline_response = self._send("127.0.0.1")
+        return self.baseline_response
+
+    def _confirm_evidence(self, payload: str, first_response: dict) -> dict:
+        from core.evidence.verdict_engine import Verdict, VerdictEngine, VulnType
+
+        responses = [first_response]
+        responses.extend(self._send(payload) for _ in range(2))
+        confirmed = 0
+        for response in responses:
+            item = self._build_evidence(payload, response, 1)
+            if VerdictEngine().assess(VulnType.RCE, item).verdict in {Verdict.LIKELY, Verdict.VERIFIED}:
+                confirmed += 1
+        evidence = self._build_evidence(payload, first_response, confirmed)
+        self.evidence = evidence
+        return evidence
 
     def _send(self, payload: str) -> dict:
         """Send payload and return response."""
@@ -271,6 +314,7 @@ class AutoCMD:
         """Run complete automated command injection scan."""
         start = time.time()
         results = {"target": self.base_url, "param": self.param, "steps": []}
+        self._ensure_baseline()
 
         # Step 1: Operator-based injection
         op_result = self.test_operator_injection()
@@ -294,6 +338,10 @@ class AutoCMD:
             bypass_result = self.test_bypass()
             results["bypass"] = bypass_result
             results["steps"].append({"step": "bypass", "result": bypass_result})
+
+        if self.working_payload:
+            first_response = self._send(self.working_payload)
+            results["evidence"] = self._confirm_evidence(self.working_payload, first_response)
 
         results["vulnerable"] = self.vulnerable
         results["injection_type"] = self.injection_type

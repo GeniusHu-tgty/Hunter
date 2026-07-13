@@ -1,4 +1,4 @@
-"""Build deferred Playwright MCP plans without controlling a browser directly."""
+"""Build or execute auditable Playwright MCP browser operations."""
 
 from __future__ import annotations
 
@@ -6,12 +6,18 @@ import json
 import re
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping
 from urllib.parse import urlparse
 
 
 PLAYWRIGHT_BACKEND = "playwright-mcp"
 PLAYWRIGHT_MODE = "external-mcp-handoff"
+HOOK_PREFIX = "__HUNTER_HOOK__"
+
+CallMCPTool = Callable[
+    [str, str, Dict[str, Any]],
+    Awaitable[Dict[str, Any]],
+]
 
 
 def _call(tool: str, **arguments: Any) -> Dict[str, Any]:
@@ -39,6 +45,194 @@ def _normalized(value: Any) -> str:
 
 def _css_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _error_status(error: str) -> str:
+    normalized = str(error or "").casefold()
+    timeout_markers = ("timeout", "timed out", "deadline exceeded", "gateway timeout")
+    return "timeout" if any(marker in normalized for marker in timeout_markers) else "error"
+
+
+def _result_text(result: Any) -> str:
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, Mapping):
+        for key in ("error", "message", "detail", "text"):
+            value = result.get(key)
+            if value:
+                return str(value).strip()
+        for key in ("content", "structuredContent", "data", "result", "value"):
+            nested = result.get(key)
+            text = _result_text(nested)
+            if text:
+                return text
+    if isinstance(result, list):
+        for item in result:
+            text = _result_text(item)
+            if text:
+                return text
+    return ""
+
+
+def _result_error(result: Any, depth: int = 0) -> str:
+    if not isinstance(result, Mapping):
+        return ""
+    status = str(result.get("status", "")).casefold()
+    error = result.get("error")
+    if error or result.get("isError") is True or status in {
+        "error",
+        "failed",
+        "failure",
+        "timeout",
+        "cancelled",
+        "canceled",
+    }:
+        return str(
+            error
+            or _result_text(result)
+            or status
+        )
+    if depth < 6:
+        for key in ("structuredContent", "data", "result", "value"):
+            nested = result.get(key)
+            nested_error = _result_error(nested, depth + 1)
+            if nested_error:
+                return nested_error
+    return ""
+
+
+def _json_mapping_from_text(value: str) -> Dict[str, Any]:
+    text = str(value or "").strip()
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1]).strip()
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _structured_mapping(value: Any, depth: int = 0) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    if depth >= 8:
+        return dict(value)
+    for key in ("structuredContent", "data", "result", "value"):
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            return _structured_mapping(nested, depth + 1)
+        if isinstance(nested, str):
+            parsed = _json_mapping_from_text(nested)
+            if parsed:
+                return _structured_mapping(parsed, depth + 1)
+    content = value.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, Mapping):
+                parsed = _json_mapping_from_text(item.get("text", ""))
+                if parsed:
+                    return _structured_mapping(parsed, depth + 1)
+            elif isinstance(item, str):
+                parsed = _json_mapping_from_text(item)
+                if parsed:
+                    return _structured_mapping(parsed, depth + 1)
+    return dict(value)
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"", "0", "false", "no", "off", "none", "null"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
+def _url_identity(value: str) -> tuple[str, str, int | None, str, str]:
+    parsed = urlparse(str(value or "").strip())
+    scheme = parsed.scheme.casefold()
+    hostname = (parsed.hostname or "").casefold()
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme in {"https", "wss"} else 80 if scheme in {"http", "ws"} else None
+    return (scheme, hostname, port, parsed.path or "/", parsed.query)
+
+
+class ExecutionAdapter:
+    """Forward browser descriptors to an injected MCP tool caller."""
+
+    def __init__(self, call_mcp_tool: CallMCPTool) -> None:
+        self.call_mcp_tool = call_mcp_tool
+
+    async def execute_call(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        try:
+            result = await self.call_mcp_tool(
+                PLAYWRIGHT_BACKEND,
+                str(tool_name),
+                dict(arguments or {}),
+            )
+            if isinstance(result, Mapping):
+                return dict(result)
+            return {"result": result}
+        except Exception as exc:
+            message = str(exc).strip() or type(exc).__name__
+            return {"error": message}
+
+    async def _execute_failure_calls(
+        self,
+        plan: Mapping[str, Any],
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for call in plan.get("on_failure", []) or []:
+            tool_name = str(call.get("tool", ""))
+            result = await self.execute_call(
+                tool_name,
+                call.get("arguments", {}),
+            )
+            results.append({"tool": tool_name, "result": result})
+        return results
+
+    async def execute_plan(self, plan: Mapping[str, Any]) -> Dict[str, Any]:
+        merged = dict(plan)
+        results: List[Dict[str, Any]] = []
+        for call in plan.get("calls", []) or []:
+            tool_name = str(call.get("tool", ""))
+            arguments = dict(call.get("arguments", {}) or {})
+            result = await self.execute_call(tool_name, arguments)
+            results.append({"tool": tool_name, "result": result})
+            error = _result_error(result)
+            if error:
+                failure_results = await self._execute_failure_calls(plan)
+                merged.update(
+                    {
+                        "status": _error_status(error),
+                        "execution": "failed",
+                        "execution_results": results,
+                        "failure_results": failure_results,
+                        "error": error,
+                    }
+                )
+                return merged
+        merged.update(
+            {
+                "status": "ok",
+                "execution": "completed",
+                "execution_results": results,
+            }
+        )
+        return merged
 
 
 class _ControlParser(HTMLParser):
@@ -358,9 +552,13 @@ class BrowserController:
         self,
         artifact_dir: str | Path | None = None,
         attack_session: Any | None = None,
+        call_mcp_tool: CallMCPTool | None = None,
     ) -> None:
         self.artifact_dir = Path(artifact_dir).resolve() if artifact_dir else None
         self.attack_session = attack_session
+        self.execution_adapter = (
+            ExecutionAdapter(call_mcp_tool) if call_mcp_tool is not None else None
+        )
 
     @staticmethod
     def _absolute_url(url: str, schemes: Iterable[str] = ("http", "https")) -> str:
@@ -416,11 +614,303 @@ class BrowserController:
     def _run_code(code: str, **arguments: Any) -> Dict[str, Any]:
         return _call("browser_run_code", code=code, **arguments)
 
+    def _maybe_execute(
+        self,
+        plan: Dict[str, Any],
+        execute: bool,
+        executor: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]] | None = None,
+    ) -> Any:
+        if not execute or self.execution_adapter is None:
+            return plan
+        return (executor or self.execution_adapter.execute_plan)(plan)
+
+    def execute_plan(
+        self,
+        plan: Dict[str, Any],
+        execute: bool = False,
+    ) -> Any:
+        return self._maybe_execute(plan, execute)
+
+    @staticmethod
+    def _navigation_summary_code() -> str:
+        return (
+            "() => {\n"
+            "  const root = document.documentElement;\n"
+            "  const html = root ? root.outerHTML : '';\n"
+            "  const loginSelector = [\n"
+            "    'input[type=\"password\"]',\n"
+            "    'input[autocomplete=\"current-password\"]',\n"
+            "    'form[action*=\"login\" i]',\n"
+            "    'form[action*=\"signin\" i]'\n"
+            "  ].join(',');\n"
+            "  const sockets = window.__hunterWebSockets;\n"
+            "  const hookSockets = Array.isArray(sockets)\n"
+            "    ? sockets.length > 0\n"
+            "    : Boolean(sockets && Object.keys(sockets).length);\n"
+            "  const performanceSockets = typeof performance !== 'undefined'\n"
+            "    && performance.getEntries().some(entry => /^wss?:/i.test(entry.name || ''));\n"
+            "  return {\n"
+            "    url: window.location.href,\n"
+            "    title: document.title || '',\n"
+            "    html_length: html.length,\n"
+            "    has_form: Boolean(document.querySelector('form')),\n"
+            "    has_login: Boolean(document.querySelector(loginSelector)),\n"
+            "    has_websocket: Boolean(hookSockets || performanceSockets)\n"
+            "  };\n"
+            "}"
+        )
+
+    async def _execute_navigation(
+        self,
+        plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        assert self.execution_adapter is not None
+        result = await self.execution_adapter.execute_plan(plan)
+        defaults = {
+            "url": str(plan.get("target_url", "")),
+            "title": "",
+            "html_length": 0,
+            "has_form": False,
+            "has_login": False,
+            "has_websocket": False,
+        }
+        if result.get("status") != "ok":
+            result.update(defaults)
+            return result
+
+        summary_result = await self.execution_adapter.execute_call(
+            "browser_evaluate",
+            {"function": self._navigation_summary_code()},
+        )
+        result.setdefault("execution_results", []).append(
+            {"tool": "browser_evaluate", "result": summary_result}
+        )
+        summary_error = _result_error(summary_result)
+        if summary_error:
+            error = summary_error
+            result.update(
+                {
+                    **defaults,
+                    "status": _error_status(error),
+                    "execution": "failed",
+                    "error": error,
+                }
+            )
+            return result
+
+        summary = _structured_mapping(summary_result)
+        summary_keys = {
+            "url",
+            "title",
+            "html_length",
+            "has_form",
+            "has_login",
+            "has_websocket",
+        }
+        if not summary_keys.intersection(summary):
+            error = "navigation summary was not returned by browser_evaluate"
+            result.update(
+                {
+                    **defaults,
+                    "status": "error",
+                    "execution": "failed",
+                    "error": error,
+                }
+            )
+            return result
+        try:
+            html_length = max(0, int(summary.get("html_length", 0)))
+        except (TypeError, ValueError):
+            html_length = 0
+        result.update(
+            {
+                "url": str(summary.get("url") or defaults["url"]),
+                "title": str(summary.get("title") or ""),
+                "html_length": html_length,
+                "has_form": _as_bool(summary.get("has_form", False)),
+                "has_login": _as_bool(summary.get("has_login", False)),
+                "has_websocket": _as_bool(summary.get("has_websocket", False)),
+            }
+        )
+        return result
+
+    @staticmethod
+    def _console_messages(result: Any) -> List[str]:
+        if isinstance(result, Mapping):
+            for key in (
+                "logs",
+                "messages",
+                "console_logs",
+                "console_messages",
+            ):
+                value = result.get(key)
+                if isinstance(value, list):
+                    return BrowserController._console_messages(value)
+            for key in ("structuredContent", "data", "result", "value", "content"):
+                nested = result.get(key)
+                if nested is not None and nested is not result:
+                    messages = BrowserController._console_messages(nested)
+                    if messages:
+                        return messages
+            text = result.get("text") or result.get("message")
+            return [str(text)] if text is not None else []
+        if isinstance(result, list):
+            messages: List[str] = []
+            for item in result:
+                if isinstance(item, str):
+                    messages.extend(item.splitlines() or [item])
+                elif isinstance(item, Mapping):
+                    text = item.get("text") or item.get("message")
+                    if text is not None:
+                        messages.extend(str(text).splitlines() or [str(text)])
+                    else:
+                        messages.extend(BrowserController._console_messages(item))
+            return messages
+        if isinstance(result, str):
+            return result.splitlines() or [result]
+        return []
+
+    @staticmethod
+    def classify_hook_messages(messages: Iterable[str]) -> Dict[str, Any]:
+        records: List[Dict[str, Any]] = []
+        rejected = 0
+        for message in messages:
+            text = str(message)
+            marker = text.find(HOOK_PREFIX)
+            if marker < 0:
+                continue
+            try:
+                parsed = json.loads(text[marker + len(HOOK_PREFIX):])
+                if not isinstance(parsed, Mapping):
+                    raise ValueError("hook record must be an object")
+                records.append(dict(parsed))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                rejected += 1
+
+        network = [
+            item for item in records if str(item.get("hook", "")).casefold() in {"xhr", "fetch"}
+        ]
+        crypto = [
+            item for item in records if str(item.get("hook", "")).casefold() == "crypto"
+        ]
+        storage = [
+            item
+            for item in records
+            if str(item.get("hook", "")).casefold() in {"storage", "cookie"}
+        ]
+        websocket = [
+            item for item in records if str(item.get("hook", "")).casefold() == "websocket"
+        ]
+        return {
+            "accepted": len(records),
+            "rejected": rejected,
+            "hook_results": records,
+            "network_requests": network,
+            "crypto_operations": crypto,
+            "storage_operations": storage,
+            "websocket_messages": websocket,
+        }
+
+    async def _execute_hook_results(
+        self,
+        plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        assert self.execution_adapter is not None
+        console_result = await self.execution_adapter.execute_call(
+            "browser_console_logs",
+            {},
+        )
+        console_error = _result_error(console_result)
+        if console_error:
+            error = console_error
+            return {
+                **plan,
+                "status": _error_status(error),
+                "execution": "failed",
+                "execution_results": [
+                    {"tool": "browser_console_logs", "result": console_result}
+                ],
+                "error": error,
+                **self.classify_hook_messages([]),
+            }
+        classified = self.classify_hook_messages(self._console_messages(console_result))
+        return {
+            **plan,
+            "status": "ok",
+            "execution": "completed",
+            "execution_results": [
+                {"tool": "browser_console_logs", "result": console_result}
+            ],
+            **classified,
+        }
+
+    async def _execute_hooks(
+        self,
+        plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        assert self.execution_adapter is not None
+        expected_url = str(plan.get("expected_url", ""))
+        hook_statuses: List[Dict[str, Any]] = []
+        execution_results: List[Dict[str, Any]] = []
+        current_url = expected_url
+        navigation_changed = False
+        errors: List[str] = []
+
+        for hook, call in zip(plan.get("hooks", []), plan.get("calls", [])):
+            result = await self.execution_adapter.execute_call(
+                str(call.get("tool", "")),
+                call.get("arguments", {}),
+            )
+            execution_results.append({"tool": call.get("tool", ""), "result": result})
+            payload = _structured_mapping(result)
+            result_error = _result_error(result)
+            if result_error:
+                error = result_error
+                errors.append(error)
+                hook_statuses.append(
+                    {"hook": hook, "status": _error_status(error), "error": error}
+                )
+                continue
+            if payload.get("url"):
+                current_url = str(payload["url"])
+                if expected_url and _url_identity(current_url) != _url_identity(expected_url):
+                    navigation_changed = True
+            installed = payload.get("installed")
+            hook_statuses.append(
+                {
+                    "hook": hook,
+                    "status": (
+                        "unconfirmed"
+                        if installed is None
+                        else "installed"
+                        if _as_bool(installed)
+                        else "not_installed"
+                    ),
+                }
+            )
+
+        status = "ok"
+        if errors:
+            status = "timeout" if all(_error_status(item) == "timeout" for item in errors) else "error"
+        elif navigation_changed:
+            status = "navigation_changed"
+        return {
+            **plan,
+            "status": status,
+            "execution": "failed" if errors else "completed",
+            "execution_results": execution_results,
+            "hook_statuses": hook_statuses,
+            "expected_url": expected_url,
+            "current_url": current_url,
+            **({"error": "; ".join(errors)} if errors else {}),
+        }
+
     def navigate_and_wait(
         self,
         target_url: str,
         wait_for: str | Mapping[str, Any] | None = None,
-    ) -> Dict[str, Any]:
+        execute: bool = False,
+    ) -> Any:
         url = self._authorize("GET", target_url)
         waits: Dict[str, Any]
         if isinstance(wait_for, str):
@@ -484,13 +974,20 @@ class BrowserController:
                 )
             )
         calls.append(_call("browser_snapshot"))
-        return self._plan("navigate_and_wait", calls, target_url=url, wait_for=waits)
+        plan = self._plan(
+            "navigate_and_wait",
+            calls,
+            target_url=url,
+            wait_for=waits,
+        )
+        return self._maybe_execute(plan, execute, self._execute_navigation)
 
     def click_and_capture(
         self,
         selector: str | Mapping[str, Any],
         capture_network: bool = True,
-    ) -> Dict[str, Any]:
+        execute: bool = False,
+    ) -> Any:
         target = dict(selector) if isinstance(selector, Mapping) else {"selector": str(selector)}
         calls = [
             _call("browser_snapshot"),
@@ -498,18 +995,20 @@ class BrowserController:
         ]
         if capture_network:
             calls.append(_call("browser_network_requests", include_static=False))
-        return self._plan(
+        plan = self._plan(
             "click_and_capture",
             calls,
             target=target,
             capture_network=bool(capture_network),
         )
+        return self._maybe_execute(plan, execute)
 
     def fill_form_and_submit(
         self,
         form_fields: Mapping[str, Any],
         submit_button: str | Mapping[str, Any],
-    ) -> Dict[str, Any]:
+        execute: bool = False,
+    ) -> Any:
         fields: List[Dict[str, Any]] = []
         for name, raw_spec in form_fields.items():
             spec = dict(raw_spec) if isinstance(raw_spec, Mapping) else {"value": raw_spec}
@@ -531,14 +1030,19 @@ class BrowserController:
             _call("browser_fill_form", fields=fields),
             _call("browser_click", target=submit),
         ]
-        return self._plan(
+        plan = self._plan(
             "fill_form_and_submit",
             calls,
             form_fields=fields,
             submit_button=submit,
         )
+        return self._maybe_execute(plan, execute)
 
-    def scroll_and_load_more(self, scroll_times: int = 1) -> Dict[str, Any]:
+    def scroll_and_load_more(
+        self,
+        scroll_times: int = 1,
+        execute: bool = False,
+    ) -> Any:
         times = max(1, min(int(scroll_times), 100))
         code = (
             "async (page) => {\n"
@@ -550,13 +1054,18 @@ class BrowserController:
             "  return {scrollTimes};\n"
             "}"
         )
-        return self._plan(
+        plan = self._plan(
             "scroll_and_load_more",
             [self._run_code(code, scroll_times=times)],
             scroll_times=times,
         )
+        return self._maybe_execute(plan, execute)
 
-    def intercept_websocket(self, url_pattern: str = "*") -> Dict[str, Any]:
+    def intercept_websocket(
+        self,
+        url_pattern: str = "*",
+        execute: bool = False,
+    ) -> Any:
         pattern = str(url_pattern or "*")
         if urlparse(pattern).scheme.casefold() in {"ws", "wss"}:
             pattern = self._authorize_websocket(pattern)
@@ -572,32 +1081,82 @@ class BrowserController:
             "  return {installed: true, pattern};\n"
             "}"
         )
-        return self._plan(
+        plan = self._plan(
             "intercept_websocket",
             [self._run_code(code, url_pattern=pattern)],
             url_pattern=pattern,
         )
+        return self._maybe_execute(plan, execute)
 
-    def capture_network_traffic(self, duration: float = 5.0) -> Dict[str, Any]:
+    def capture_network_traffic(
+        self,
+        duration: float = 5.0,
+        execute: bool = False,
+    ) -> Any:
         duration_ms = max(0, min(int(float(duration) * 1000), 300000))
         calls = [
             _call("browser_wait_for", time=duration_ms / 1000),
             _call("browser_network_requests", include_static=True),
         ]
-        return self._plan(
+        plan = self._plan(
             "capture_network_traffic",
             calls,
             duration_ms=duration_ms,
         )
+        return self._maybe_execute(plan, execute)
 
-    def execute_in_context(self, js_code: str) -> Dict[str, Any]:
+    def inject_hooks(
+        self,
+        hook_sources: Mapping[str, str],
+        expected_url: str = "",
+        execute: bool = False,
+    ) -> Any:
+        selected = [
+            (str(hook).strip().casefold(), str(source))
+            for hook, source in hook_sources.items()
+        ]
+        if not selected:
+            raise ValueError("at least one hook is required")
+        calls = []
+        for hook, source in selected:
+            function = (
+                "() => {\n"
+                f"{source}\n"
+                "  return {\n"
+                f"    installed: Boolean(window.__hunterHooks && window.__hunterHooks[{_json(hook)}]),\n"
+                "    url: window.location.href\n"
+                "  };\n"
+                "}"
+            )
+            calls.append(_call("browser_evaluate", function=function))
+        plan = self._plan(
+            "inject_hooks",
+            calls,
+            hooks=[hook for hook, _ in selected],
+            expected_url=str(expected_url or ""),
+        )
+        return self._maybe_execute(plan, execute, self._execute_hooks)
+
+    def get_hook_results(self, execute: bool = False) -> Any:
+        plan = self._plan(
+            "get_hook_results",
+            [_call("browser_console_logs")],
+        )
+        return self._maybe_execute(plan, execute, self._execute_hook_results)
+
+    def execute_in_context(
+        self,
+        js_code: str,
+        execute: bool = False,
+    ) -> Any:
         source = str(js_code or "")
         if not source.strip():
             raise ValueError("js_code must not be empty")
-        return self._plan(
+        plan = self._plan(
             "execute_in_context",
             [_call("browser_evaluate", function=source)],
         )
+        return self._maybe_execute(plan, execute)
 
     def auto_login(
         self,
@@ -605,7 +1164,8 @@ class BrowserController:
         username: str,
         password: str,
         login_button_selector: str | Mapping[str, Any] | None = None,
-    ) -> Dict[str, Any]:
+        execute: bool = False,
+    ) -> Any:
         target = self._authorize("GET", url)
         button = login_button_selector or {"role": "button", "text": "Login"}
         submit = dict(button) if isinstance(button, Mapping) else {"selector": str(button)}
@@ -623,7 +1183,7 @@ class BrowserController:
             ),
             _call("browser_snapshot"),
         ]
-        return self._plan(
+        plan = self._plan(
             "auto_login",
             calls,
             target_url=target,
@@ -631,8 +1191,14 @@ class BrowserController:
             password_field="auto",
             submit_button=submit,
         )
+        return self._maybe_execute(plan, execute)
 
-    def auto_navigate_spa(self, base_url: str, target_state: str) -> Dict[str, Any]:
+    def auto_navigate_spa(
+        self,
+        base_url: str,
+        target_state: str,
+        execute: bool = False,
+    ) -> Any:
         target = self._authorize("GET", base_url)
         desired_state = str(target_state or "").strip()
         if not desired_state:
@@ -647,7 +1213,7 @@ class BrowserController:
             "  return {targetState, url: page.url()};\n"
             "}"
         )
-        return self._plan(
+        plan = self._plan(
             "auto_navigate_spa",
             [
                 _call("browser_navigate", url=target),
@@ -658,8 +1224,14 @@ class BrowserController:
             base_url=target,
             target_state=desired_state,
         )
+        return self._maybe_execute(plan, execute)
 
-    def auto_trigger_api(self, url: str, action_description: str) -> Dict[str, Any]:
+    def auto_trigger_api(
+        self,
+        url: str,
+        action_description: str,
+        execute: bool = False,
+    ) -> Any:
         target = self._authorize("GET", url)
         description = str(action_description or "").strip()
         if not description:
@@ -673,7 +1245,7 @@ class BrowserController:
             "  return {triggered: true, description};\n"
             "}"
         )
-        return self._plan(
+        plan = self._plan(
             "auto_trigger_api",
             [
                 _call("browser_navigate", url=target),
@@ -684,17 +1256,23 @@ class BrowserController:
             target_url=target,
             action_description=description,
         )
+        return self._maybe_execute(plan, execute)
 
-    def snapshot(self, include_network: bool = False) -> Dict[str, Any]:
+    def snapshot(
+        self,
+        include_network: bool = False,
+        execute: bool = False,
+    ) -> Any:
         calls = [_call("browser_snapshot")]
         if include_network:
             calls.append(_call("browser_network_requests", include_static=False))
         calls.append(_call("browser_console_messages", level="info"))
-        return self._plan(
+        plan = self._plan(
             "snapshot",
             calls,
             include_network=bool(include_network),
         )
+        return self._maybe_execute(plan, execute)
 
     def route_observations(self, observations: Mapping[str, Any]) -> Dict[str, Any]:
         """Turn passive browser observations into confirmation-gated Hunter calls."""

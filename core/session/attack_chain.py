@@ -26,6 +26,14 @@ _EXPLOIT_PAUSE_STATUSES = {
 }
 _SAFE_REPLAY_METHODS = {"GET", "HEAD"}
 _PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}")
+_PARAMETER_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def _append_query(url: str, values: dict[str, Any]) -> str:
+    parsed = urlparse(url)
+    encoded = urlencode(values, doseq=True)
+    query = f"{parsed.query}&{encoded}" if parsed.query else encoded
+    return parsed._replace(query=query).geturl()
 
 
 @dataclass
@@ -71,7 +79,33 @@ class AttackChain:
     ) -> None:
         self.name = str(definition.get("name") or "attack-chain")
         self.description = str(definition.get("description") or "")
-        self.parameters = deepcopy(definition.get("parameters") or {})
+        raw_parameters = definition.get("parameters") or {}
+        if not isinstance(raw_parameters, dict):
+            raise ValueError("attack chain parameters must be an object")
+        self.parameters: dict[str, Any] = {}
+        self.parameter_definitions: dict[str, dict[str, Any]] = {}
+        for raw_name, raw_definition in raw_parameters.items():
+            name = str(raw_name)
+            if not _PARAMETER_NAME_RE.fullmatch(name):
+                raise ValueError(f"invalid attack chain parameter name: {name}")
+            descriptor_keys = {"description", "required", "default"}
+            if (
+                isinstance(raw_definition, dict)
+                and descriptor_keys <= set(raw_definition)
+            ):
+                description = str(raw_definition.get("description") or "")
+                required = bool(raw_definition.get("required", False))
+                default = deepcopy(raw_definition.get("default", ""))
+            else:
+                description = ""
+                required = False
+                default = deepcopy(raw_definition)
+            self.parameters[name] = default
+            self.parameter_definitions[name] = {
+                "description": description,
+                "required": required,
+                "default": deepcopy(default),
+            }
         self.steps = [
             AttackStep.from_dict(item) for item in (definition.get("steps") or [])
         ]
@@ -153,10 +187,19 @@ class AttackChain:
                 value = value.replace("${" + key + "}", str(replacement))
             return value
         if isinstance(value, dict):
-            return {
-                key: AttackChain._substitute(item, variables)
-                for key, item in value.items()
-            }
+            substituted = {}
+            for key, item in value.items():
+                new_key = (
+                    AttackChain._substitute(key, variables)
+                    if isinstance(key, str)
+                    else key
+                )
+                if new_key in substituted:
+                    raise ValueError(
+                        f"duplicate mapping key after substitution: {new_key}"
+                    )
+                substituted[new_key] = AttackChain._substitute(item, variables)
+            return substituted
         if isinstance(value, list):
             return [AttackChain._substitute(item, variables) for item in value]
         return value
@@ -167,7 +210,8 @@ class AttackChain:
             return set(_PLACEHOLDER_RE.findall(value))
         if isinstance(value, dict):
             found = set()
-            for item in value.values():
+            for key, item in value.items():
+                found.update(AttackChain._placeholders(key))
                 found.update(AttackChain._placeholders(item))
             return found
         if isinstance(value, (list, tuple)):
@@ -243,6 +287,8 @@ class AttackChain:
         attempt: int,
     ) -> None:
         cursor = deepcopy(session.chain_cursors.get(self.name) or {})
+        parsed_url = urlparse(url)
+        persisted_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
         cursor.update(
             {
                 "current_step": step.step_id,
@@ -250,7 +296,7 @@ class AttackChain:
                 "in_flight": {
                     "step_id": step.step_id,
                     "method": method,
-                    "url": url,
+                    "url": persisted_url,
                     "attempt": attempt,
                     "started_at": time.time(),
                 },
@@ -299,29 +345,110 @@ class AttackChain:
                 return False, condition
         return True, ""
 
+    @staticmethod
+    def _missing_required_value(value: Any) -> bool:
+        return value is None or (
+            isinstance(value, str) and not value.strip()
+        )
+
+    def _resolve_parameters(
+        self,
+        session: AttackSession,
+        params: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        variables = deepcopy(self.parameters)
+        variables.update(session.extracted_data)
+        variables.update(params or {})
+        return variables
+
+    def _validate_step_parameters(
+        self,
+        step: AttackStep,
+        variables: dict[str, Any],
+    ) -> None:
+        referenced = self._placeholders(asdict(step))
+        missing = []
+        for name, definition in self.parameter_definitions.items():
+            if not definition["required"] or name not in referenced:
+                continue
+            if self._missing_required_value(variables.get(name)):
+                description = definition["description"]
+                missing.append(
+                    f"{name} ({description})" if description else name
+                )
+        if missing:
+            raise ValueError("缺少必要参数: " + "; ".join(missing))
+
     def _execute_request(
         self,
         step: AttackStep,
         session: AttackSession,
         variables: dict[str, Any],
     ) -> dict[str, Any]:
+        raw_extra_fields = step.request.get("extra_fields")
         request = self._substitute(step.request, variables)
+        extra_fields = request.pop("extra_fields", None)
+        if isinstance(raw_extra_fields, str):
+            match = _PLACEHOLDER_RE.fullmatch(raw_extra_fields.strip())
+            if match:
+                extra_fields = deepcopy(variables.get(match.group(1), {}))
+        if extra_fields is not None and not isinstance(extra_fields, dict):
+            raise TypeError("request extra_fields must be an object")
         path = str(request.pop("path", request.pop("url", "")) or "")
         url = urljoin(session.target.rstrip("/") + "/", path)
         params = request.pop("params", None)
         if params:
-            url = f"{url}?{urlencode(params, doseq=True)}"
+            url = _append_query(url, params)
         method = str(request.pop("method", "GET")).upper()
-        session.authorize_request(method, url)
         headers = session.merge_headers(request.pop("headers", None))
+        headers = {
+            name: value
+            for name, value in headers.items()
+            if value is not None and str(value) != ""
+        }
         cookie_header = session.cookie_header(url)
-        if cookie_header:
-            headers.setdefault("Cookie", cookie_header)
+        if cookie_header and not headers.get("Cookie"):
+            headers["Cookie"] = cookie_header
         data = request.pop("data", None)
         if isinstance(data, dict):
-            for name, value in session.csrf_for_url(url).items():
-                data.setdefault(name, value)
-        request_options = deepcopy(request.pop("options", step.options))
+            data = {
+                key: value
+                for key, value in data.items()
+                if str(key).strip()
+            }
+        if extra_fields:
+            if data is None:
+                data = {}
+            if not isinstance(data, dict):
+                raise TypeError("request data must be an object when extra_fields are used")
+            merged_data = deepcopy(extra_fields)
+            merged_data.update(data)
+            data = merged_data
+        if isinstance(data, dict):
+            has_explicit_csrf = any(
+                "csrf" in str(name).lower()
+                or str(name).lower()
+                in {
+                    "_token",
+                    "authenticity_token",
+                    "execution",
+                    "lt",
+                    "token",
+                    "xsrf",
+                }
+                for name in data
+            )
+            if not has_explicit_csrf:
+                for name, value in session.csrf_for_url(url).items():
+                    data.setdefault(name, value)
+        if method in _SAFE_REPLAY_METHODS and isinstance(data, dict) and data:
+            url = _append_query(url, data)
+            data = None
+        session.authorize_request(method, url)
+        request_options = self._substitute(
+            deepcopy(request.pop("options", step.options)),
+            variables,
+        )
         if variables.get("_retry_strategy"):
             request_options["retry_strategy"] = variables["_retry_strategy"]
         request_options["chain_attempt"] = int(variables.get("_retry_attempt", 0))
@@ -346,7 +473,7 @@ class AttackChain:
         if not isinstance(result, dict):
             raise TypeError("request executor must return a dict")
         session.auto_extract(result)
-        proof = step.options.get("authentication_proof") or {}
+        proof = request_options.get("authentication_proof") or {}
         if proof and self._successful(result):
             body = str(result.get("body") or "")
             final_url = str(result.get("url") or url)
@@ -388,7 +515,12 @@ class AttackChain:
                 raise ValueError("extract rule requires store_as or name")
             pattern = self._substitute(str(rule.get("pattern") or ""), variables)
             value = session.extract_from_response(pattern, last_response)
-            variables[name] = value
+            current = variables.get(name)
+            if (
+                name not in self.parameter_definitions
+                or self._missing_required_value(current)
+            ):
+                variables[name] = value
             session.extracted_data[name] = deepcopy(value)
             extracted[name] = value
         return {"status": "ok", "extracted": extracted}
@@ -452,9 +584,7 @@ class AttackChain:
         max_steps: int = 200,
     ) -> dict[str, Any]:
         sensitive_values = _sensitive_values(params or {})
-        variables = deepcopy(self.parameters)
-        variables.update(session.extracted_data)
-        variables.update(params or {})
+        variables = self._resolve_parameters(session, params)
         saved_cursor = deepcopy(session.chain_cursors.get(self.name) or {})
         in_flight = deepcopy(saved_cursor.get("in_flight") or {})
         in_flight_method = str(in_flight.get("method") or "").upper()
@@ -530,6 +660,7 @@ class AttackChain:
             if current not in self.by_id:
                 raise ValueError(f"attack chain references unknown step: {current}")
             step = self.by_id[current]
+            self._validate_step_parameters(step, variables)
             preconditions_ok, failed_precondition = self._check_preconditions(
                 session, step.preconditions
             )

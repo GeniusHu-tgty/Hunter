@@ -510,6 +510,9 @@ class UnifiedOrchestrator:
     ):
         self.kernel = kernel
         self.services = dict(services or {})
+        from core.unified_scanner import UnifiedOrchestrationBridge
+
+        self.integration = UnifiedOrchestrationBridge(self.services)
         defaults = self._default_adapters()
         defaults.update(dict(adapters or {}))
         missing = [stage for stage in ORCHESTRATOR_STAGES if stage not in defaults]
@@ -716,6 +719,7 @@ class UnifiedOrchestrator:
             "stage_results": deepcopy(orchestrator.get("stage_results", {})),
             "observations": deepcopy(state.get("orchestrator", {}).get("observations", {})),
             "approvals": deepcopy(orchestrator.get("approvals", [])),
+            "http_transport": "stealth_http_client",
         }
 
     def orchestrate(
@@ -1198,16 +1202,18 @@ class UnifiedOrchestrator:
 
     def _default_adapters(self):
         return {
-            "memory": self._stage_memory,
-            "recon": self._stage_recon,
-            "attack_surface": self._stage_attack_surface,
-            "attack_execution": self._stage_attack_execution,
-            "vulnerability_confirmation": self._stage_confirmation,
-            "evidence_learning": self._stage_evidence_learning,
+            "memory": self.integration.stage_memory,
+            "recon": self.integration.stage_recon,
+            "attack_surface": self.integration.stage_attack_surface,
+            "attack_execution": self.integration.stage_attack_execution,
+            "vulnerability_confirmation": self.integration.stage_confirmation,
+            "evidence_learning": self.integration.stage_evidence_learning,
             "report": self._stage_report,
         }
 
     def _stage_memory(self, context):
+        return self.integration.stage_memory(context)
+
         from core.memory import FingerprintDatabase, TargetMemory, TechniqueMemory
 
         target_memory = TargetMemory()
@@ -1225,6 +1231,8 @@ class UnifiedOrchestrator:
         }
 
     def _stage_recon(self, context):
+        return self.integration.stage_recon(context)
+
         modules = set(context["modules"])
         target = context["target_url"]
         handoffs = [
@@ -1272,6 +1280,8 @@ class UnifiedOrchestrator:
         return {"target_profile": profile}
 
     def _stage_attack_surface(self, context):
+        return self.integration.stage_attack_surface(context)
+
         endpoints = context["target_profile"].get("api_endpoints", [])
         target = context["target_url"]
         candidates = [str(item.get("url", item) if isinstance(item, Mapping) else item) for item in endpoints]
@@ -1301,6 +1311,8 @@ class UnifiedOrchestrator:
         }
 
     def _stage_attack_execution(self, context):
+        return self.integration.stage_attack_execution(context)
+
         tools = {
             "authentication": "hunter_auto_jwt",
             "sqli_xss": "hunter_auto_sqli",
@@ -1384,6 +1396,8 @@ class UnifiedOrchestrator:
         }
 
     def _stage_confirmation(self, context):
+        return self.integration.stage_confirmation(context)
+
         from core.memory import PatternEngine
 
         observations = context.get("observations", {})
@@ -1428,6 +1442,8 @@ class UnifiedOrchestrator:
         }
 
     def _stage_evidence_learning(self, context):
+        return self.integration.stage_evidence_learning(context)
+
         from core.memory import TargetMemory, TechniqueMemory
 
         target_memory = TargetMemory()

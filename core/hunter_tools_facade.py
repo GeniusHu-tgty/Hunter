@@ -577,7 +577,7 @@ class HunterToolsFacade:
             "hunter_memory_query": {"category": "memory", "description": "Query target history, technique statistics, or reusable patterns"},
             "hunter_memory_record": {"category": "memory", "description": "Persist a bounded target, finding, attack, or technique observation"},
             "hunter_memory_recommend": {"category": "memory", "description": "Build explainable non-executing recommendations from local history"},
-            "hunter_fingerprint_detect": {"category": "memory", "description": "Match passive observations against WAF, CMS, framework, and API signatures"},
+            "hunter_fingerprint_detect": {"category": "memory", "description": "Match passive observations against WAF, CMS, education-system, framework, and API signatures"},
             "hunter_memory_stats": {"category": "memory", "description": "Return memory database and fingerprint catalog statistics"},
             "hunter_auto_pentest": {"category": "orchestration", "description": "Run the bounded seven-stage unified pentest orchestrator"},
             "hunter_kb_list": {"category": "kb", "description": "List Hunter markdown techniques and YAML payload files"},
@@ -614,7 +614,7 @@ class HunterToolsFacade:
                     "schema_version": "1.0",
                     "database": r"D:\Open-tgtylab\data\targets.db",
                     "query_types": ["target", "technique", "pattern"],
-                    "fingerprints": ["waf", "cdn", "cms", "framework", "api"],
+                    "fingerprints": ["waf", "cdn", "cms", "edu", "framework", "api"],
                     "recommendation_execution": "deferred",
                 },
                 "workflow": [

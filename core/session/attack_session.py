@@ -62,7 +62,15 @@ def _is_sensitive_key(key: Any) -> bool:
         or "secret" in normalized
         or "cookie" in normalized
         or "csrf" in normalized
-        or normalized in {"auth", "authorization", "proxy_authorization", "apikey", "api_key"}
+        or normalized in {
+            "auth",
+            "authorization",
+            "proxy_authorization",
+            "apikey",
+            "api_key",
+            "extra_fields",
+            "hidden",
+        }
         or normalized.startswith("auth_")
         or normalized.endswith("_auth")
     )
@@ -214,7 +222,12 @@ class _HTMLInventory(HTMLParser):
                 if values.get("type", "").lower() == "hidden":
                     self.hidden[name] = value
                 lowered = name.lower()
-                if "csrf" in lowered or lowered in {"_token", "authenticity_token"}:
+                if (
+                    "csrf" in lowered
+                    or "xsrf" in lowered
+                    or lowered
+                    in {"_token", "token", "authenticity_token", "execution", "lt"}
+                ):
                     self.csrf[name] = value
         elif tag == "meta":
             name = values.get("name", "")

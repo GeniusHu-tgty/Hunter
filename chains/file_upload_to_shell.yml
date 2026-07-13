@@ -1,8 +1,45 @@
+# 用途: 检查上传限制，并在审批后验证上传文件的服务器端执行效果。
+# 前置条件: 需要有效上传权限、已知上传字段，以及可访问的上传结果路径。
+# 期望结果: 生成上传约束证据，并验证一个明确批准的执行标记。
 name: file_upload_to_shell
-description: Upload validation flow with explicit approval gates for server-side execution.
+description: Upload validation flow with runtime-configurable endpoint, form, file, and session values.
 parameters:
-  upload_path: /upload
-  uploaded_path: ""
+  target_url:
+    description: "目标根URL"
+    required: true
+    default: ""
+  session_cookie:
+    description: "会话Cookie（如JSESSIONID=xxx）"
+    required: false
+    default: ""
+  csrf_token:
+    description: "CSRF令牌值；留空时从上传页自动提取"
+    required: false
+    default: ""
+  upload_path:
+    description: "文件上传页面或接口路径"
+    required: false
+    default: "/upload"
+  uploaded_path:
+    description: "上传成功后文件的访问路径"
+    required: true
+    default: ""
+  upload_field:
+    description: "文件上传表单字段名"
+    required: false
+    default: "file"
+  candidate_filename:
+    description: "授权测试文件名"
+    required: false
+    default: "hunter-probe.txt"
+  candidate_content_type:
+    description: "授权测试文件Content-Type"
+    required: false
+    default: "text/plain"
+  execution_marker:
+    description: "验证上传文件执行效果的无害标记"
+    required: false
+    default: "HUNTER_UPLOAD_OK"
 start: visit-upload
 steps:
   - step_id: visit-upload
@@ -11,16 +48,18 @@ steps:
     state: scan
     request:
       method: GET
-      path: ${upload_path}
+      url: "${target_url}${upload_path}"
+      headers:
+        Cookie: "${session_cookie}"
     on_success: extract-csrf
     critical: true
   - step_id: extract-csrf
     name: Extract CSRF token
     action: extract
     extract_rules:
-      - name: csrf
+      - name: csrf_token
         pattern: 'regex:name=["''](?:csrf_token|_token)["''][^>]*value=["'']([^"'']+)'
-        store_as: csrf
+        store_as: csrf_token
     on_success: test-upload-constraints
     critical: true
   - step_id: test-upload-constraints
@@ -32,6 +71,10 @@ steps:
       capabilities:
         - upload
       action: test_upload_constraints
+      endpoint: "${target_url}${upload_path}"
+      upload_field: "${upload_field}"
+      session_cookie: "${session_cookie}"
+      csrf_token: "${csrf_token}"
     on_success: generate-variants
     on_failure: ""
   - step_id: generate-variants
@@ -43,6 +86,9 @@ steps:
       capabilities:
         - upload
       action: generate_upload_variants
+      filename: "${candidate_filename}"
+      content_type: "${candidate_content_type}"
+      execution_marker: "${execution_marker}"
     on_success: upload-candidate
     on_failure: ""
   - step_id: upload-candidate
@@ -55,6 +101,12 @@ steps:
       capabilities:
         - upload
       action: upload_server_script
+      endpoint: "${target_url}${upload_path}"
+      upload_field: "${upload_field}"
+      filename: "${candidate_filename}"
+      content_type: "${candidate_content_type}"
+      csrf_token: "${csrf_token}"
+      session_cookie: "${session_cookie}"
     on_success: visit-uploaded-file
     on_failure: ""
     critical: true
@@ -63,7 +115,9 @@ steps:
     action: request
     request:
       method: GET
-      path: ${uploaded_path}
+      url: "${target_url}${uploaded_path}"
+      headers:
+        Cookie: "${session_cookie}"
     on_success: verify-execution
     critical: true
   - step_id: verify-execution
@@ -76,4 +130,6 @@ steps:
       capabilities:
         - command_execution
       action: verify_server_execution
+      uploaded_url: "${target_url}${uploaded_path}"
+      execution_marker: "${execution_marker}"
     critical: true

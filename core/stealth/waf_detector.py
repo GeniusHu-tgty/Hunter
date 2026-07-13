@@ -25,12 +25,114 @@ WAF_SIGNATURES = {
     'Sucuri': {'headers':['x-sucuri-id','x-sucuri-cache'], 'values':['sucuri'], 'body':['sucuri website firewall']},
 }
 BLOCK_WORDS=('forbidden','access denied','request blocked','您的请求已被拦截','安全检测','非法请求','访问被拒绝','web application firewall')
-STRATEGIES={
- 'Cloudflare':[('http2-multiplex','HTTP/2 connection reuse'),('chunked-body','standards-compliant chunked transfer framing'),('websocket-upgrade','WebSocket upgrade only when the application exposes a legitimate endpoint')],
- 'Alibaba Cloud WAF':[('percent-encoding','context-aware percent encoding'),('parameter-pollution','duplicate parameter normalization test'),('content-type-json','alternate supported Content-Type')],
- 'ModSecurity':[('case-variation','keyword case normalization test'),('comment-separation','parser normalization differential test'),('line-folding','line-break normalization test')],
- 'SafeDog':[('keyword-double-write','duplicate token normalization differential test'),('equivalent-function','equivalent expression normalization test')],
- 'default':[('header-consistency','use a coherent browser fingerprint'),('content-type-alternate','use another application-supported Content-Type'),('parameter-order','change benign parameter order')],
+STRATEGIES = {
+    'Cloudflare': [
+        ('http2-multiplex', '复用 HTTP/2 连接，比较边缘节点的流级规范化差异'),
+        ('chunked-body', '使用符合规范的分块传输请求体'),
+        ('websocket-upgrade', '仅在应用存在合法端点时切换 WebSocket 升级'),
+    ],
+    'Akamai': [
+        ('percent-encoding', '对参数值中的保留字符进行百分号编码'),
+        ('double-percent-encoding', '二次编码百分号，测试边缘节点的多层解码差异'),
+        ('protocol-version-switch', '在 HTTP/1.1 与 HTTP/2 间切换请求版本'),
+    ],
+    'AWS CloudFront': [
+        ('parameter-order', '调整参数排列顺序，测试缓存键规范化差异'),
+        ('protocol-version-switch', '使用合规格式切换 HTTP/1.1 与 HTTP/2'),
+        ('benign-field-padding', '在请求体末尾追加无害字段，测试字段边界解析'),
+    ],
+    'Fastly': [
+        ('parameter-order', '改变参数顺序，比较边缘节点与源站的规范化结果'),
+        ('protocol-version-switch', '在 HTTP/1.1 与 HTTP/2 间切换请求版本'),
+        ('chunked-body', '使用标准分块传输，测试请求体重组差异'),
+    ],
+    'Alibaba Cloud CDN': [
+        ('parameter-order', '调整参数排列顺序，测试边缘缓存键规范化差异'),
+        ('content-type-rotation', '在表单、multipart 与 JSON 类型间轮换'),
+        ('benign-field-padding', '在请求体末尾追加无害字段，测试字段边界解析'),
+    ],
+    'Tencent Cloud CDN': [
+        ('chunked-body', '使用标准分块传输，测试 CDN 请求体重组差异'),
+        ('content-type-rotation', '轮换表单、multipart 与 JSON 请求体类型'),
+        ('benign-field-padding', '在请求体末尾追加无害字段，测试长度边界解析'),
+    ],
+    'Alibaba Cloud WAF': [
+        ('percent-encoding', '按参数上下文进行百分号编码'),
+        ('parameter-pollution', '插入同名异值参数，测试重复参数规范化'),
+        ('content-type-json', '将受支持的表单请求切换为 JSON 请求体'),
+    ],
+    'Tencent Cloud WAF': [
+        ('parameter-pollution', '插入同名异值参数，测试首值与末值选择差异'),
+        ('chunked-body', '使用标准分块传输，测试请求体重组差异'),
+        ('content-type-rotation', '轮换表单、multipart 与 JSON 请求体类型'),
+    ],
+    'Huawei Cloud WAF': [
+        ('percent-encoding', '对参数值中的保留字符进行百分号编码'),
+        ('parameter-order', '改变参数排列顺序，测试规范化差异'),
+        ('content-type-rotation', '在受支持的请求体类型之间轮换'),
+    ],
+    'AWS WAF': [
+        ('percent-encoding', '对特殊字符进行合规百分号编码'),
+        ('versioned-comment-separation', '在 SQL 关键字中插入数据库版本注释'),
+        ('content-type-rotation', '在受支持的表单、multipart 与 JSON 类型间轮换'),
+    ],
+    'Azure WAF': [
+        ('percent-encoding', '对参数值中的保留字符进行百分号编码'),
+        ('protocol-version-switch', '使用合规格式切换 HTTP/1.1 与 HTTP/2'),
+        ('utf16-body', '使用声明了字符集的 UTF-16 请求体测试解码差异'),
+    ],
+    'ModSecurity': [
+        ('case-variation', '随机切换关键字大小写，测试规范化规则'),
+        ('comment-separation', '在关键字内部插入注释分隔符，测试标记化差异'),
+        ('line-folding', '在请求体中替换空白与换行，测试规范化差异'),
+    ],
+    'NAXSI': [
+        ('case-variation', '随机切换参数值中的关键字大小写'),
+        ('versioned-comment-separation', '在 SQL 关键字中插入数据库版本注释'),
+        ('unicode-equivalent', '使用 Unicode 等价字符替换 ASCII 字符'),
+    ],
+    'SafeDog': [
+        ('keyword-double-write', '双写关键字，测试单次替换后的重组行为'),
+        ('equivalent-function', '使用等价函数表达式测试规则归一化'),
+        ('case-variation', '随机切换关键字大小写，测试规范化规则'),
+    ],
+    'YunSuo': [
+        ('case-variation', '随机切换关键字大小写，测试大小写归一化'),
+        ('keyword-double-write', '双写关键字，测试单次过滤后的重组行为'),
+        ('double-percent-encoding', '二次编码百分号，测试多层 URL 解码差异'),
+    ],
+    'DShield': [
+        ('parameter-pollution', '插入同名异值参数，测试重复参数取值差异'),
+        ('query-to-body', '将查询字符串参数迁移到请求体中'),
+        ('html-numeric-entities', '将特殊字符改写为 HTML 数字实体'),
+    ],
+    '360 WAF': [
+        ('case-variation', '随机切换关键字大小写，测试规范化规则'),
+        ('keyword-double-write', '双写关键字，测试单次过滤后的重组行为'),
+        ('unicode-equivalent', '使用 Unicode 等价字符替换 ASCII 字符'),
+    ],
+    'Chaitin SafeLine': [
+        ('percent-encoding', '对参数值中的保留字符进行百分号编码'),
+        ('parameter-order', '调整参数排列顺序，测试解析顺序差异'),
+        ('content-type-rotation', '在受支持的请求体类型之间轮换'),
+    ],
+    'Sucuri': [
+        ('percent-encoding', '对参数值中的保留字符进行百分号编码'),
+        ('protocol-version-switch', '在 HTTP/1.1 与 HTTP/2 间切换请求版本'),
+        ('benign-field-padding', '在请求体末尾追加无害字段，测试字段边界解析'),
+    ],
+    'default': [
+        ('header-consistency', '使用一致且完整的浏览器请求头指纹'),
+        ('content-type-alternate', '切换到应用明确支持的其他请求体类型'),
+        ('parameter-order', '改变无害参数的排列顺序'),
+        ('percent-encoding', '对参数值中的保留字符进行百分号编码'),
+        ('double-percent-encoding', '对已编码的百分号进行二次编码'),
+        ('protocol-version-switch', '在 HTTP/1.1 与 HTTP/2 间切换请求版本'),
+        ('chunked-body', '使用符合规范的分块传输请求体'),
+        ('parameter-pollution', '插入同名异值参数测试重复参数解析'),
+        ('query-to-body', '将查询字符串参数迁移到请求体中'),
+        ('benign-field-padding', '在请求体末尾追加无害字段'),
+    ],
 }
 PROBES=[('xss','<script>alert(1)</script>'),('traversal','../../../etc/passwd'),('sqli',"' OR 1=1 --"),('parameter-volume',{f'p{i}':'x' for i in range(80)})]
 
