@@ -67,9 +67,14 @@ The five memory tools are `hunter_memory_query`,
 `hunter_fingerprint_detect`, and `hunter_memory_stats`. Recommendations are
 explainable data only: they do not launch scanners or execute payloads.
 
+`hunter_auto_pentest` runs the seven-stage unified orchestrator with
+`fast`/`standard`/`deep` profiles and `all`/`web`/`api`/`js`/`reverse` module
+selection. It persists stage checkpoints and pauses for interactive approval
+before high-impact actions.
+
 ## MCP v8 Hardening
 
-Hunter Tools exposes **110 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
+Hunter Tools exposes **111 MCP tools** with stable JSON output, local capability introspection, and evidence-driven routing.
 
 ### Local-first meta tools
 
@@ -100,7 +105,7 @@ All v8 wrappers return bounded JSON with `status`, `tool`, `elapsed_seconds`, an
 
 Hunter v8.2 consolidates every Hunter capability into one complete `hunter_tools` MCP server, including scanners, orchestration, sessions, reports, KB and Burp bridge.
 
-- Single complete server: `mcp_server.py` / server name `hunter_tools`, exposing **110 MCP tools**.
+- Single complete server: `mcp_server.py` / server name `hunter_tools`, exposing **111 MCP tools**.
 - `hunter_tools_mcp.py` is only a compatibility launcher that delegates to the complete server; it does not create a second MCP registry.
 - Core KB/Burp implementation: `core/hunter_tools_facade.py`.
 - Design/plan: `docs/hunter-tools-v81-design.md` and `docs/hunter-tools-v81-plan.md`.

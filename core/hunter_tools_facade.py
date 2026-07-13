@@ -579,6 +579,7 @@ class HunterToolsFacade:
             "hunter_memory_recommend": {"category": "memory", "description": "Build explainable non-executing recommendations from local history"},
             "hunter_fingerprint_detect": {"category": "memory", "description": "Match passive observations against WAF, CMS, framework, and API signatures"},
             "hunter_memory_stats": {"category": "memory", "description": "Return memory database and fingerprint catalog statistics"},
+            "hunter_auto_pentest": {"category": "orchestration", "description": "Run the bounded seven-stage unified pentest orchestrator"},
             "hunter_kb_list": {"category": "kb", "description": "List Hunter markdown techniques and YAML payload files"},
             "hunter_kb_search": {"category": "kb", "description": "Search Hunter KB by signal/query"},
             "hunter_kb_read": {"category": "kb", "description": "Read a Hunter KB file under payloads/"},

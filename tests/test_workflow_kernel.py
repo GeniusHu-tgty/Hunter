@@ -1,11 +1,45 @@
+import gc
 import json
+import multiprocessing
+import sys
+import threading
+import time
+from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from core.workflow import WorkflowKernel
 from core.workflow.backends import BackendRegistry
+from core.workflow.locking import WorkflowFileLock
 from core.workflow.models import WorkflowPolicy
+
+
+def _append_hypothesis_in_process(root, index, queue):
+    try:
+        WorkflowKernel(root).add_hypothesis("process-race", f"process-{index}")
+    except Exception as exc:
+        queue.put(f"{type(exc).__name__}: {exc}")
+    else:
+        queue.put("")
+
+
+def _create_workflow_in_process(root, queue):
+    try:
+        WorkflowKernel(root).create("process-create", "proof", [])
+    except ValueError as exc:
+        queue.put(f"error:{exc}")
+    else:
+        queue.put("ok")
+
+
+def _read_events(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def test_create_persists_v2_state_and_append_only_event(tmp_path):
@@ -21,6 +55,225 @@ def test_create_persists_v2_state_and_append_only_event(tmp_path):
     assert json.loads(events[0])["type"] == "workflow.created"
 
 
+def test_concurrent_kernel_instances_preserve_event_chain(tmp_path):
+    WorkflowKernel(tmp_path).create("race", objective="proof", inputs=[])
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [
+            pool.submit(
+                WorkflowKernel(tmp_path).add_hypothesis,
+                "race",
+                f"hypothesis-{index}",
+            )
+            for index in range(32)
+        ]
+        for future in futures:
+            future.result()
+
+    events = _read_events(
+        tmp_path / "cases" / "race" / "workflow.events.jsonl"
+    )
+    assert [event["revision"] for event in events] == list(range(1, 34))
+    for previous, current in zip(events, events[1:]):
+        assert current["previous_event_hash"] == previous["event_hash"]
+    assert len(WorkflowKernel(tmp_path).materialize("race")["hypotheses"]) == 32
+    assert not list((tmp_path / "cases" / "race").glob("*.tmp"))
+
+
+def test_independent_processes_preserve_event_chain(tmp_path):
+    WorkflowKernel(tmp_path).create("process-race", objective="proof", inputs=[])
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_append_hypothesis_in_process,
+            args=(str(tmp_path), index, queue),
+        )
+        for index in range(8)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+    assert [queue.get(timeout=2) for _ in processes] == [""] * len(processes)
+
+    events = _read_events(
+        tmp_path / "cases" / "process-race" / "workflow.events.jsonl"
+    )
+    assert [event["revision"] for event in events] == list(range(1, 10))
+    assert len(
+        WorkflowKernel(tmp_path).materialize("process-race")["hypotheses"]
+    ) == 8
+
+
+def test_concurrent_create_allows_exactly_one_workflow(tmp_path):
+    def create():
+        return WorkflowKernel(tmp_path).create("create-race", "proof", [])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(create) for _ in range(2)]
+    successes = 0
+    failures = 0
+    for future in futures:
+        try:
+            future.result()
+        except ValueError as exc:
+            assert "already exists" in str(exc)
+            failures += 1
+        else:
+            successes += 1
+    assert (successes, failures) == (1, 1)
+    assert len(
+        _read_events(
+            tmp_path / "cases" / "create-race" / "workflow.events.jsonl"
+        )
+    ) == 1
+
+
+def test_independent_process_create_allows_exactly_one_workflow(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_create_workflow_in_process,
+            args=(str(tmp_path), queue),
+        )
+        for _ in range(4)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+    results = [queue.get(timeout=2) for _ in processes]
+    assert results.count("ok") == 1
+    assert sum(item.startswith("error:workflow already exists") for item in results) == 3
+
+
+def test_record_dead_end_deduplicates_concurrent_writers(tmp_path):
+    kernel = WorkflowKernel(tmp_path)
+    kernel.create("dead-end-race", "proof", [])
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [
+            pool.submit(
+                WorkflowKernel(tmp_path).record_dead_end,
+                "dead-end-race",
+                "same failed path",
+                "same-signature",
+            )
+            for _ in range(32)
+        ]
+        for future in futures:
+            future.result()
+
+    state = WorkflowKernel(tmp_path).materialize("dead-end-race")
+    assert [item["signature"] for item in state["dead_ends"]] == [
+        "same-signature"
+    ]
+
+
+def test_workflow_file_lock_is_reentrant_for_same_instance(tmp_path):
+    path = tmp_path / ".workflow.lock"
+    lock = WorkflowFileLock(path, timeout=0.2)
+    with lock:
+        with lock:
+            pass
+
+    acquired = threading.Event()
+
+    def acquire_after_release():
+        with WorkflowFileLock(path, timeout=0.2):
+            acquired.set()
+
+    thread = threading.Thread(target=acquire_after_release)
+    thread.start()
+    thread.join(1)
+    assert acquired.is_set()
+
+
+def test_workflow_file_lock_uses_one_total_timeout(
+    tmp_path, monkeypatch
+):
+    import core.workflow.locking as locking
+
+    path = tmp_path / ".workflow.lock"
+    clock = [0.0]
+
+    class DelayedProcessLock:
+        def acquire(self, timeout):
+            clock[0] += 0.06
+            return True
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(
+        locking,
+        "_lock_handle",
+        lambda handle: (_ for _ in ()).throw(PermissionError("busy")),
+    )
+    monkeypatch.setattr(locking.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        locking.time,
+        "sleep",
+        lambda duration: clock.__setitem__(0, clock[0] + duration),
+    )
+    lock = WorkflowFileLock(path, timeout=0.1)
+    lock._process_lock = DelayedProcessLock()
+    with pytest.raises(TimeoutError):
+        with lock:
+            pass
+    assert clock[0] == pytest.approx(0.1)
+
+
+def test_workflow_file_lock_releases_process_lock_after_open_failure(
+    tmp_path, monkeypatch
+):
+    import core.workflow.locking as locking
+
+    path = tmp_path / ".workflow.lock"
+    original_open = locking.Path.open
+
+    def fail_open(self, *args, **kwargs):
+        if self.resolve() == path.resolve():
+            raise OSError("cannot open lock")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(locking.Path, "open", fail_open)
+    with pytest.raises(OSError, match="cannot open lock"):
+        with WorkflowFileLock(path, timeout=0.1):
+            pass
+    monkeypatch.setattr(locking.Path, "open", original_open)
+
+    with WorkflowFileLock(path, timeout=0.1):
+        pass
+
+
+def test_workflow_file_lock_unix_branch_uses_flock(monkeypatch, tmp_path):
+    import core.workflow.locking as locking
+
+    calls = []
+    fake_fcntl = SimpleNamespace(
+        LOCK_EX=1,
+        LOCK_NB=2,
+        LOCK_UN=4,
+        flock=lambda fileno, operation: calls.append((fileno, operation)),
+    )
+    monkeypatch.setitem(sys.modules, "fcntl", fake_fcntl)
+    monkeypatch.setattr(locking, "_platform_name", lambda: "posix")
+
+    with (tmp_path / "unix.lock").open("w+b") as handle:
+        handle.write(b"\0")
+        handle.flush()
+        locking._lock_handle(handle)
+        locking._unlock_handle(handle)
+
+    assert calls[0][1] == fake_fcntl.LOCK_EX | fake_fcntl.LOCK_NB
+    assert calls[1][1] == fake_fcntl.LOCK_UN
+
+
 def test_materializer_rebuilds_state_from_events(tmp_path):
     kernel = WorkflowKernel(tmp_path)
     kernel.create("case-a", objective="inspect app", inputs=[{"path": "app.apk"}])
@@ -30,6 +283,80 @@ def test_materializer_rebuilds_state_from_events(tmp_path):
     assert rebuilt["phase"] == "triage"
     assert rebuilt["hypotheses"][0]["claim"] == "native library validates token"
     assert len(rebuilt["history"]) == 3
+
+
+def test_event_append_succeeds_when_derived_state_cache_replace_fails(
+    tmp_path, monkeypatch
+):
+    import core.workflow.kernel as kernel_module
+
+    kernel = WorkflowKernel(tmp_path)
+    kernel.create("cache-failure", "proof", [])
+    original_replace = kernel_module.os.replace
+
+    def fail_state_replace(source, destination):
+        if Path(destination).name == "workflow.json":
+            raise OSError("state cache unavailable")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(kernel_module.os, "replace", fail_state_replace)
+    result = kernel.add_hypothesis("cache-failure", "event survives")
+
+    assert result["hypothesis"]["claim"] == "event survives"
+    events = _read_events(kernel._events("cache-failure"))
+    assert [event["revision"] for event in events] == [1, 2]
+    assert kernel.materialize("cache-failure")["hypotheses"][0]["claim"] == (
+        "event survives"
+    )
+    assert not list(kernel._dir("cache-failure").glob("*.tmp"))
+
+
+def test_checkpoint_removes_snapshot_when_event_append_fails(
+    tmp_path, monkeypatch
+):
+    kernel = WorkflowKernel(tmp_path)
+    kernel.create("checkpoint-failure", "proof", [])
+
+    def fail_append(*args, **kwargs):
+        raise OSError("event append unavailable")
+
+    monkeypatch.setattr(kernel, "_append", fail_append)
+    with pytest.raises(OSError, match="event append unavailable"):
+        kernel.checkpoint("checkpoint-failure")
+
+    checkpoint_dir = kernel._dir("checkpoint-failure") / "checkpoints"
+    assert not list(checkpoint_dir.glob("*.json"))
+    assert not list(checkpoint_dir.glob("*.tmp"))
+
+
+def test_checkpoint_survives_derived_cache_cleanup_failure(
+    tmp_path, monkeypatch
+):
+    import core.workflow.kernel as kernel_module
+
+    kernel = WorkflowKernel(tmp_path)
+    kernel.create("checkpoint-cache-failure", "proof", [])
+    original_replace = kernel_module.os.replace
+    original_unlink = kernel_module.Path.unlink
+
+    def fail_state_replace(source, destination):
+        if Path(destination).name == "workflow.json":
+            raise OSError("state cache unavailable")
+        return original_replace(source, destination)
+
+    def fail_state_tmp_cleanup(self, *args, **kwargs):
+        if self.name.startswith(".workflow.json.") and self.suffix == ".tmp":
+            raise OSError("state cache cleanup unavailable")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(kernel_module.os, "replace", fail_state_replace)
+    monkeypatch.setattr(kernel_module.Path, "unlink", fail_state_tmp_cleanup)
+
+    checkpoint = kernel.checkpoint("checkpoint-cache-failure")
+
+    assert Path(checkpoint["path"]).exists()
+    state = kernel.materialize("checkpoint-cache-failure")
+    assert state["checkpoints"][0]["checkpoint_id"] == checkpoint["checkpoint_id"]
 
 
 def test_lane_router_uses_strongest_signal_and_supports_mixed(tmp_path):
@@ -201,6 +528,106 @@ def test_resume_replays_events_after_checkpoint(tmp_path):
     resumed=kernel.resume("tail",cp["checkpoint_id"])["state"]
     assert resumed["hypotheses"][0]["claim"]=="later event"
     assert resumed["resume_metadata"]["events_after_checkpoint"]==1
+
+
+def test_checkpoint_resume_discards_invalid_utf8_tail(tmp_path):
+    kernel = WorkflowKernel(tmp_path)
+    kernel.create("utf8-tail", "proof", [])
+    checkpoint = kernel.checkpoint("utf8-tail")
+    with kernel._events("utf8-tail").open("ab") as handle:
+        handle.write(b'{"partial":"\xff')
+
+    resumed = kernel.resume("utf8-tail", checkpoint["checkpoint_id"])
+
+    assert resumed["state"]["workflow_id"]
+    assert resumed["state"]["resume_metadata"]["discarded_events"] >= 1
+    kernel.materialize("utf8-tail")
+
+
+def test_checkpoint_resume_preserves_valid_events_before_corrupt_tail(
+    tmp_path,
+):
+    kernel = WorkflowKernel(tmp_path)
+    kernel.create("valid-prefix", "proof", [])
+    checkpoint = kernel.checkpoint("valid-prefix")
+    kernel.add_hypothesis("valid-prefix", "preserve me")
+    with kernel._events("valid-prefix").open("ab") as handle:
+        handle.write(b'{"partial":"\xff')
+
+    resumed = kernel.resume("valid-prefix", checkpoint["checkpoint_id"])
+
+    assert resumed["state"]["hypotheses"][0]["claim"] == "preserve me"
+    assert resumed["state"]["resume_metadata"]["discarded_events"] == 1
+
+
+def test_concurrent_transitions_revalidate_under_workflow_lock(
+    tmp_path, monkeypatch
+):
+    import core.workflow.kernel as kernel_module
+
+    kernel = WorkflowKernel(tmp_path)
+    kernel.create("transition-race", "proof", [])
+    kernel.transition(
+        "transition-race",
+        "triage",
+        {"objective": True, "artifact_inventory": True},
+    )
+    kernel.transition("transition-race", "map", {"triage_summary": True})
+    kernel.transition(
+        "transition-race", "hypothesis", {"surface_map": True}
+    )
+    kernel.transition(
+        "transition-race",
+        "deep-analysis",
+        {"active_hypothesis": True},
+    )
+    kernel.transition(
+        "transition-race", "validation", {"analysis_result": True}
+    )
+    original_validate = kernel_module.validate_transition
+
+    def slow_validate(current, target, deliverables):
+        if current == "validation":
+            time.sleep(0.05)
+        return original_validate(current, target, deliverables)
+
+    monkeypatch.setattr(kernel_module, "validate_transition", slow_validate)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                WorkflowKernel(tmp_path).transition,
+                "transition-race",
+                "hypothesis",
+                {"validation_failed": True},
+            ),
+            pool.submit(
+                WorkflowKernel(tmp_path).transition,
+                "transition-race",
+                "evidence",
+                {"validation_result": True},
+            ),
+        ]
+    successes = 0
+    failures = 0
+    for future in futures:
+        try:
+            future.result()
+        except ValueError:
+            failures += 1
+        else:
+            successes += 1
+    assert (successes, failures) == (1, 1)
+
+
+def test_process_lock_registry_releases_unused_paths(tmp_path):
+    import core.workflow.locking as locking
+
+    baseline = len(locking._PROCESS_LOCKS)
+    for index in range(50):
+        with WorkflowFileLock(tmp_path / f"lock-{index}", timeout=0.2):
+            pass
+    gc.collect()
+    assert len(locking._PROCESS_LOCKS) <= baseline + 1
 
 
 def test_events_have_revision_and_hash_chain(tmp_path):

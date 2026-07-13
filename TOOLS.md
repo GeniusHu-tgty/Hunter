@@ -15,7 +15,7 @@ The kernel stores revisioned, hash-chained `workflow.events.jsonl`, atomically m
 
 ## MCP v8.1 Tool Surface
 
-- Total complete `hunter_tools` MCP tools: 110
+- Total complete `hunter_tools` MCP tools: 111
 - Meta/orchestration: `hunter_healthcheck`, `hunter_capabilities`, `hunter_recommend_next`, `hunter_agents_list`, `hunter_phases_list`
 - Pipelines: `hunter_scan`, `hunter_recon`, `hunter_vuln_scan`
 - Recon atomics: `hunter_subdomain`, `hunter_port_scan`, `hunter_tech_detect`, `hunter_dir_enum`, `hunter_js_analyze`
@@ -24,6 +24,7 @@ The kernel stores revisioned, hash-chained `workflow.events.jsonl`, atomically m
 - Persistent attack sessions: `hunter_session_start`, `hunter_session_execute_chain`, `hunter_session_checkpoint`, `hunter_post_exploit`, and dual-mode `hunter_session_state`
 - Browser bridge: `hunter_browser_navigate`, `hunter_browser_interact`, `hunter_browser_capture_network`, `hunter_browser_inject_hooks`, `hunter_browser_get_hook_results`, `hunter_browser_snapshot`
 - Memory: `hunter_memory_query`, `hunter_memory_record`, `hunter_memory_recommend`, `hunter_fingerprint_detect`, `hunter_memory_stats`
+- Unified orchestration: `hunter_auto_pentest`, plus `hunter_workflow_run` orchestration mode
 - Reverse analysis: `hunter_reverse_binary`, `hunter_reverse_step`, `hunter_reverse_extract_iocs`, `hunter_reverse_generate_rules`, `hunter_reverse_decrypt_plan`
 - Hunter KB facade: `hunter_kb_list`, `hunter_kb_search`, `hunter_kb_read`, `hunter_kb_recommend`
 - Burp bridge plan facade: `hunter_burp_bridge`, `hunter_burp_repeater`, `hunter_burp_proxy_search`, `hunter_burp_scanner_issues`, `hunter_burp_collaborator_workflow`

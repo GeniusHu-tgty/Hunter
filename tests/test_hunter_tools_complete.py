@@ -1,6 +1,7 @@
 
 import json
 from pathlib import Path
+import subprocess
 
 import mcp_server
 
@@ -14,6 +15,27 @@ def registered_functions(module):
 
 def test_complete_server_is_named_hunter_tools():
     assert mcp_server.mcp.name == "hunter_tools"
+
+
+def test_fastmcp_registry_matches_hunter_tool_functions():
+    registry = set(mcp_server.mcp._tool_manager._tools)
+    functions = registered_functions(mcp_server)
+    assert registry == functions
+    assert len(registry) == 111
+
+
+def test_internal_tool_inventory_uses_fastmcp_registry(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server,
+        "hunter_unregistered_probe",
+        lambda: None,
+        raising=False,
+    )
+
+    assert (
+        "hunter_unregistered_probe"
+        not in mcp_server._registered_hunter_tools()
+    )
 
 
 def test_complete_server_exposes_all_legacy_and_v81_tools():
@@ -64,3 +86,37 @@ def test_codex_configs_have_only_hunter_tools():
         assert "hunter" not in servers
         assert "hunter_tools" in servers
         assert servers["hunter_tools"]["args"][-1].replace("\\", "/").endswith("/hunter/mcp_server.py")
+
+
+def test_skill_document_has_no_corrupt_placeholder_runs():
+    skill = (Path(__file__).parents[1] / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "????" not in skill
+
+
+def test_file_upload_bypass_reference_exists():
+    payload = (
+        Path(__file__).parents[1]
+        / "payloads"
+        / "file-upload"
+        / "file-upload-bypass.md"
+    )
+    assert payload.is_file()
+
+
+def test_git_does_not_track_python_bytecode():
+    root = Path(__file__).parents[1]
+    proc = subprocess.run(
+        ["git", "ls-files"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    tracked = [
+        line
+        for line in proc.stdout.splitlines()
+        if "__pycache__/" in line or line.endswith(".pyc")
+    ]
+    assert tracked == []

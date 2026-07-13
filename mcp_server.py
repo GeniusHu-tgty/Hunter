@@ -25,6 +25,7 @@ import socket
 import ssl
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -52,7 +53,8 @@ from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
 from core.doctor import HunterDoctor
 from core.adaptive_engine import AdaptiveEngine, get_mode_profile
 from core.recon_cache import ReconCache
-from core.workflow import WorkflowKernel, WorkflowPolicy
+from core.workflow import UnifiedOrchestrator, WorkflowKernel, WorkflowPolicy
+from core.workflow.locking import WorkflowFileLock
 from core.session import AttackChain, AttackSessionStore, PostExploitation
 from core.browser import (
     BrowserController,
@@ -105,6 +107,171 @@ def _reset_workspace_adapter(root: Optional[str | Path] = None) -> OpenTgtyLabWo
 def _workflow_kernel() -> WorkflowKernel:
     """Bind workflow persistence to the active OpenTgtyLab workspace."""
     return WorkflowKernel(_workspace.root)
+
+
+def _orchestrator_generation_config(
+    *,
+    mode: str,
+    profile: str,
+    modules: List[str],
+    objective: str,
+    success_conditions: List[str],
+    proof_types: List[str],
+) -> Dict[str, Any]:
+    return {
+        "mode": mode,
+        "profile": profile,
+        "modules": UnifiedOrchestrator._modules(modules),
+        "objective": objective,
+        "success_conditions": list(success_conditions),
+        "proof_types": list(proof_types),
+    }
+
+
+def _state_generation_config(state: Dict[str, Any]) -> Dict[str, Any]:
+    generation = state.get("orchestrator", {}).get("generation", {})
+    config = generation.get("config")
+    if config:
+        return dict(config)
+    objective = state.get("objective", {})
+    return _orchestrator_generation_config(
+        mode=state.get("policy", {}).get("mode", "interactive"),
+        profile=state.get("orchestrator", {}).get("profile", "standard"),
+        modules=state.get("orchestrator", {}).get("modules", ["all"]),
+        objective=(
+            objective.get("text", "")
+            if isinstance(objective, dict)
+            else str(objective)
+        ),
+        success_conditions=(
+            objective.get("success_conditions", [])
+            if isinstance(objective, dict)
+            else []
+        ),
+        proof_types=(
+            objective.get("proof_types", [])
+            if isinstance(objective, dict)
+            else []
+        ),
+    )
+
+
+def _prepare_orchestrator_workflow(
+    kernel: WorkflowKernel,
+    *,
+    base_slug: str,
+    target_url: str,
+    config: Dict[str, Any],
+    mode: str,
+    profile: str,
+    modules: List[str],
+) -> tuple[str, Dict[str, Any], bool]:
+    objective = str(
+        config.get("objective", "unified authorized pentest workflow")
+    )
+    success_conditions = list(config.get("success_conditions", []))
+    proof_types = list(config.get("proof_types", []))
+    requested_config = _orchestrator_generation_config(
+        mode=mode,
+        profile=profile,
+        modules=modules,
+        objective=objective,
+        success_conditions=success_conditions,
+        proof_types=proof_types,
+    )
+    cases_root = kernel.root / "cases"
+    generation_lock = WorkflowFileLock(
+        cases_root / f".{base_slug}.generation.lock"
+    )
+    with generation_lock:
+        candidates = []
+        if cases_root.is_dir():
+            for directory in cases_root.iterdir():
+                if not directory.is_dir():
+                    continue
+                if (
+                    directory.name != base_slug
+                    and not directory.name.startswith(f"{base_slug}-g")
+                ):
+                    continue
+                try:
+                    state = kernel.materialize(directory.name)
+                except (FileNotFoundError, ValueError, UnicodeError, json.JSONDecodeError):
+                    continue
+                generation = state.get("orchestrator", {}).get(
+                    "generation", {}
+                )
+                number = int(
+                    generation.get(
+                        "number",
+                        1 if directory.name == base_slug else 0,
+                    )
+                )
+                candidates.append((number, directory.name, state))
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        latest = candidates[-1] if candidates else None
+        resume_requested = bool(config.get("resume", False))
+        fresh_requested = bool(config.get("fresh_run", False))
+        create_new = latest is None or fresh_requested
+        if latest is not None and not resume_requested and not fresh_requested:
+            latest_state = latest[2]
+            if (
+                latest_state.get("orchestrator", {}).get("status")
+                == "completed"
+                and _state_generation_config(latest_state)
+                != requested_config
+            ):
+                create_new = True
+
+        if create_new:
+            number = (latest[0] + 1) if latest else 1
+            slug = (
+                base_slug
+                if number == 1
+                else f"{base_slug}-g{number}-{uuid.uuid4().hex[:8]}"
+            )
+            kernel.create(
+                slug,
+                objective,
+                inputs=[{"type": "url", "value": target_url}],
+                mode=mode,
+                success_conditions=success_conditions,
+                proof_types=proof_types,
+            )
+            state = kernel.materialize(slug)
+            created = True
+        else:
+            number, slug, state = latest
+            created = False
+            if state.get("policy", {}).get("mode") != mode:
+                policy = dict(state.get("policy", {}))
+                policy["mode"] = mode
+                kernel.set_policy(slug, policy)
+                state = kernel.materialize(slug)
+
+        generation = {
+            "id": f"gen-{uuid.uuid4().hex[:12]}",
+            "base_slug": base_slug,
+            "number": number,
+            "config": requested_config,
+            "created_at": state.get("created_at", datetime.now().isoformat()),
+        }
+        existing_generation = state.get("orchestrator", {}).get(
+            "generation", {}
+        )
+        if (
+            created
+            or existing_generation.get("config") != requested_config
+            or existing_generation.get("number") != number
+        ):
+            kernel._append(
+                slug,
+                "orchestrator.generation.started",
+                {"generation": generation},
+            )
+        else:
+            generation = existing_generation
+        return slug, generation, created
 
 
 
@@ -1744,10 +1911,9 @@ def _tool_available(name: str) -> Dict[str, Any]:
 
 
 def _registered_hunter_tools() -> List[str]:
-    return sorted(
-        name for name, value in globals().items()
-        if name.startswith("hunter_") and callable(value)
-    )
+    tool_manager = getattr(mcp, "_tool_manager", None)
+    tools = getattr(tool_manager, "_tools", {})
+    return sorted(str(name) for name in tools)
 
 
 def _doctor() -> HunterDoctor:
@@ -1823,6 +1989,10 @@ async def hunter_healthcheck() -> str:
         "hunter_session_state", "hunter_set_proxy_pool",
         "hunter_session_start", "hunter_session_execute_chain",
         "hunter_session_checkpoint", "hunter_post_exploit",
+        "hunter_auto_pentest",
+        "hunter_memory_query", "hunter_memory_record",
+        "hunter_memory_recommend", "hunter_fingerprint_detect",
+        "hunter_memory_stats",
         "hunter_reverse_binary", "hunter_reverse_step",
         "hunter_reverse_extract_iocs", "hunter_reverse_generate_rules",
         "hunter_reverse_decrypt_plan",
@@ -1936,6 +2106,12 @@ async def hunter_capabilities() -> str:
         "hunter_auto_race": ("auto-vuln", "Race-condition checks"),
         "hunter_auto_access_control": ("auto-vuln", "Access-control checks"),
         "hunter_unified_scan": ("orchestration", "Selected multi-phase scan"),
+        "hunter_auto_pentest": ("orchestration", "Run the bounded seven-stage unified pentest orchestrator"),
+        "hunter_memory_query": ("memory", "Query target history, technique statistics, or patterns"),
+        "hunter_memory_record": ("memory", "Record target, attack, finding, or technique observations"),
+        "hunter_memory_recommend": ("memory", "Build explainable recommendations from local memory"),
+        "hunter_fingerprint_detect": ("memory", "Match passive observations against local fingerprints"),
+        "hunter_memory_stats": ("memory", "Inspect target memory and fingerprint statistics"),
         "hunter_payload_list": ("payload", "List payload types"),
         "hunter_payload_search": ("payload", "Search payload KB"),
         "hunter_payload_get": ("payload", "Read payload type or section"),
@@ -3076,10 +3252,118 @@ async def hunter_workflow_plan(case_slug: str, max_actions: int = 5) -> str:
     return _workflow_result("hunter_workflow_plan", _workflow_kernel().plan, case_slug, max_actions)
 
 @mcp.tool()
-async def hunter_workflow_run(case_slug: str, max_actions: int = 5) -> str:
+async def hunter_workflow_run(
+    case_slug: str,
+    max_actions: int = 5,
+    target_url: str = "",
+    options: Optional[Dict[str, Any]] = None,
+) -> str:
+    if target_url or options:
+        config = dict(options or {})
+        profile = config.get("policy", "standard")
+        raw_modules = config.get("modules", ["all"])
+        modules = [raw_modules] if isinstance(raw_modules, str) else list(raw_modules)
+        mode = config.get("mode", "interactive")
+        def orchestrate():
+            kernel = _workflow_kernel()
+            resolved_target = target_url
+            if not resolved_target:
+                try:
+                    resolved_target = UnifiedOrchestrator._target_from_state(
+                        kernel.materialize(case_slug)
+                    )
+                except FileNotFoundError:
+                    resolved_target = ""
+            if not resolved_target:
+                raise ValueError("target_url is required")
+            slug, generation, _ = _prepare_orchestrator_workflow(
+                kernel,
+                base_slug=case_slug,
+                target_url=resolved_target,
+                config=config,
+                mode=mode,
+                profile=profile,
+                modules=modules,
+            )
+            return UnifiedOrchestrator(kernel).orchestrate(
+                slug,
+                target_url=resolved_target,
+                modules=modules,
+                policy=profile,
+                resume=bool(config.get("resume", False)),
+                observations=config.get("observations"),
+                approval=config.get("approval"),
+                checkpoint_id=config.get("checkpoint_id", ""),
+            )
+        return _workflow_result("hunter_workflow_run", orchestrate)
+
     def execute_native(action):
         return {"status": "deferred", "summary": "Native MCP dispatch is emitted as a bounded action for the Codex orchestrator.", "action": action}
     return _workflow_result("hunter_workflow_run", _workflow_kernel().run, case_slug, execute_native, max_actions)
+
+
+@mcp.tool()
+async def hunter_auto_pentest(
+    target_url: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Run the bounded seven-stage unified orchestrator."""
+    config = dict(options or {})
+    profile = str(config.get("policy", "standard")).strip().lower()
+    raw_modules = config.get("modules", ["all"])
+    modules = [raw_modules] if isinstance(raw_modules, str) else list(raw_modules)
+    mode = str(config.get("mode", "interactive")).strip().lower()
+    if profile not in {"fast", "standard", "deep"}:
+        return _json_dumps({
+            "tool": "hunter_auto_pentest",
+            "status": "error",
+            "error_type": "invalid_input",
+            "error": "policy must be fast, standard, or deep",
+            "data": {},
+            "evidence": {},
+            "next_actions": [],
+        })
+    if mode not in {"interactive", "guided", "autopilot"}:
+        return _json_dumps({
+            "tool": "hunter_auto_pentest",
+            "status": "error",
+            "error_type": "invalid_input",
+            "error": "mode must be interactive, guided, or autopilot",
+            "data": {},
+            "evidence": {},
+            "next_actions": [],
+        })
+    base_slug = f"auto-pentest-{hashlib.sha256(target_url.encode('utf-8')).hexdigest()[:16]}"
+
+    def orchestrate():
+        kernel = _workflow_kernel()
+        slug, generation, _ = _prepare_orchestrator_workflow(
+            kernel,
+            base_slug=base_slug,
+            target_url=target_url,
+            config=config,
+            mode=mode,
+            profile=profile,
+            modules=modules,
+        )
+        result = UnifiedOrchestrator(kernel).orchestrate(
+            slug,
+            target_url=target_url,
+            modules=modules,
+            policy=profile,
+            resume=bool(config.get("resume", False)),
+            observations=config.get("observations"),
+            approval=config.get("approval"),
+            checkpoint_id=config.get("checkpoint_id", ""),
+        )
+        return {
+            "target_url": target_url,
+            "workflow_slug": slug,
+            "generation": generation,
+            **result,
+        }
+
+    return _workflow_result("hunter_auto_pentest", orchestrate)
 
 @mcp.tool()
 async def hunter_workflow_transition(case_slug: str, phase: str, deliverables: Optional[Dict[str, Any]] = None) -> str:

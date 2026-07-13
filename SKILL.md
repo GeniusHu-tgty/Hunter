@@ -1,61 +1,69 @@
 ---
 name: hunter
-description: Use when doing authorized web/API security assessment, CTF-style vulnerability research, recon, payload selection, MCP-based pentest orchestration, Hunter health checks, Burp proof planning, Hunter KB lookup, or evidence-driven report generation with the local Hunter framework.
+description: Use for authorized web/API security assessment, CTF vulnerability research, Hunter health checks, MCP orchestration, local knowledge-base lookup, evidence registration, and report generation.
 ---
 
-# Hunter v8.1 ? AI-driven pentest framework + `hunter_tools`
+# Hunter v8.2
 
-Hunter ?????? MCP server?
+Hunter is the authorized security-research framework exposed through one
+FastMCP server:
 
-- server name?`hunter_tools`
-- ?????`mcp_server.py`
-- ??????110
-- ???pipeline?recon?auto vulnerability scanners?payload?session?report?Hunter KB?Burp bridge
-- `hunter_tools_mcp.py` ??????????????????? MCP server
+- Server name: `hunter_tools`
+- Entrypoint: `mcp_server.py`
+- Contracted tool count: 111
+- Contract: `integration-contract.json`
+- Persistent workspace: `OPEN_TGTYLAB_ROOT`
 
-## ??????
+`hunter_tools_mcp.py` is a compatibility launcher. It delegates to the complete
+server and must not create a second Hunter registration.
 
-1. ? `cases/<slug>/state.json`?? `next_steps` ???
-2. ?????`??????______`?
-3. ??????????? `? hunter_healthcheck ?????? MCP ???`?
-4. ????? KB?`kb_router("<??>")` -> `kb_read_file`?
-5. ? `hunter_healthcheck` ? `hunter_capabilities`?
-6. ???/???? `hunter_recommend_next(target, signals, finding)` ? `hunter_kb_recommend(...)`?
+## Required Startup
 
-## ?????
+1. Read `cases/<slug>/state.json` and continue from `next_steps`.
+2. State the concrete result sought in this session.
+3. State why the selected tool is the correct tool.
+4. Query the local project KB with `hunter_project_kb_search`, then read the
+   selected technique with `hunter_project_kb_read`.
+5. Run `hunter_healthcheck` and `hunter_capabilities` when integration state is
+   relevant.
+6. Use `hunter_recommend_next` or `hunter_workspace_recommend` to route from
+   observed evidence.
 
-- HTTP ??/????Burp `send_http2_request` > `http_probe` > ?? curl/wget?
-- Hunter ???????????? Burp/http_probe ???
-- Hunter KB / payload / Burp bridge ?????????
-- ???????? request/response?diff?payload?????????
+## Safety Boundary
 
-## 110 ??? `hunter_tools` MCP ??
+- Operate only on targets and artifacts within the user's authorized scope.
+- Prefer targeted proof collection over broad or destructive execution.
+- Do not report a vulnerability without reproducible evidence.
+- High-impact exploitation and post-exploitation require an exact,
+  action-bound approval descriptor.
+- Treat memory and fingerprint recommendations as non-executing guidance.
+- Redact secrets from logs, notes, screenshots, and persisted hook results.
 
-### Meta / routing
+## Tool Priority
+
+- HTTP execution: Burp `send_http2_request` first, then `http_probe`.
+- JavaScript source inspection: `search_in_sources`; do not download source
+  merely to read it.
+- PE triage: `triage_pe`, then `ghidra_headless_analyze`.
+- Android dynamic work: `android_frida_run_script`.
+- Packer detection: `die_scan`.
+- Full suspicious-sample analysis: `sample_full_workup`.
+- Hunter tools generate plans and evidence packages when an external MCP
+  backend performs the actual operation.
+
+## Capability Groups
+
+### Diagnostics and Routing
 
 - `hunter_healthcheck`
 - `hunter_capabilities`
 - `hunter_recommend_next`
-- `hunter_agents_list`
-- `hunter_phases_list`
+- `hunter_doctor`
+- `hunter_config_audit`
+- `hunter_runtime_status`
+- `hunter_contract_check`
 
-### Hunter KB / `hunter_tools` facade
-
-- `hunter_kb_list`??? `payloads/**/*.md` ? `payloads/*/payloads.yaml`?
-- `hunter_kb_search`?????? Hunter ?? KB?
-- `hunter_kb_read`????? Hunter KB ???????? `payloads/`?
-- `hunter_kb_recommend`??? KB ???payload ???Hunter ??? Burp proof action?
-
-### Burp bridge plan facade
-
-- `hunter_burp_bridge`??? Burp MCP action descriptor builder?
-- `hunter_burp_repeater`??? Repeater action plan?
-- `hunter_burp_proxy_search`??? proxy history regex search action plan?
-- `hunter_burp_scanner_issues`??? scanner issues retrieval action plan?
-- `hunter_burp_collaborator_workflow`??? blind SSRF / XXE / CMDI Collaborator proof workflow?
-- `hunter_burp_import`??? Burp ??? request/response/screenshot/evidence?
-
-### Pipeline / recon
+### Recon and Scanning
 
 - `hunter_scan`
 - `hunter_recon`
@@ -65,8 +73,11 @@ Hunter ?????? MCP server?
 - `hunter_tech_detect`
 - `hunter_dir_enum`
 - `hunter_js_analyze`
+- `hunter_fast_scan`
+- `hunter_scan_plan`
+- `hunter_scan_benchmark`
 
-### Auto proof tools
+### Targeted Proof Tools
 
 - `hunter_auto_sqli`
 - `hunter_auto_xss`
@@ -84,22 +95,49 @@ Hunter ?????? MCP server?
 - `hunter_auto_access_control`
 - `hunter_unified_scan`
 
-### Payload / session / report
+### Knowledge, Payloads, and Burp
 
-- `hunter_payload_list`
-- `hunter_payload_search`
-- `hunter_payload_get`
-- `hunter_payload_generate`
-- `hunter_session_list`
-- `hunter_session_status`
-- `hunter_session_start`
-- `hunter_session_execute_chain`
-- `hunter_session_checkpoint`
+- `hunter_kb_list`, `hunter_kb_search`, `hunter_kb_read`,
+  `hunter_kb_recommend`
+- `hunter_payload_list`, `hunter_payload_search`, `hunter_payload_get`,
+  `hunter_payload_generate`
+- `hunter_burp_bridge`, `hunter_burp_repeater`,
+  `hunter_burp_proxy_search`, `hunter_burp_scanner_issues`,
+  `hunter_burp_collaborator_workflow`, `hunter_burp_import`
+
+### Workspace and Evidence
+
+- `hunter_workspace_health`
+- `hunter_case_open`, `hunter_case_status`, `hunter_case_update`,
+  `hunter_case_next_steps`
+- `hunter_project_kb_search`, `hunter_project_kb_read`
+- `hunter_evidence_save`, `hunter_note_write`, `hunter_report_publish`
+- `hunter_workspace_recommend`
+
+### Workflow Kernel
+
+- `hunter_workflow_create`, `hunter_workflow_open`,
+  `hunter_workflow_status`
+- `hunter_workflow_route`, `hunter_workflow_plan`, `hunter_workflow_run`
+- `hunter_workflow_transition`, `hunter_workflow_checkpoint`,
+  `hunter_workflow_resume`, `hunter_workflow_policy`
+- `hunter_hypothesis_add`, `hunter_evidence_register`,
+  `hunter_finding_promote`
+- `hunter_backend_status`, `hunter_lane_catalog`
+
+Workflow State v2 uses a hash-chained event log as the authority and
+`workflow.json` as a derived cache. Long-running work must checkpoint after
+each completed phase and resume from the first incomplete phase.
+
+### Stateful HTTP and Attack Sessions
+
+- `hunter_stealth_request`, `hunter_stealth_scan`
+- `hunter_session_create`, `hunter_session_state`, `hunter_set_proxy_pool`
+- `hunter_session_start`, `hunter_session_execute_chain`,
+  `hunter_session_checkpoint`
 - `hunter_post_exploit`
-- `hunter_session_state`
-- `hunter_report`
 
-### Browser / Playwright MCP bridge
+### Browser Bridge
 
 - `hunter_browser_navigate`
 - `hunter_browser_interact`
@@ -108,22 +146,19 @@ Hunter ?????? MCP server?
 - `hunter_browser_get_hook_results`
 - `hunter_browser_snapshot`
 
-The browser bridge emits deferred external Playwright MCP descriptors. It does
-not control a browser directly; observations are redacted and persisted, and
-Hunter follow-up actions remain confirmation-gated.
+The browser bridge emits deferred Playwright MCP descriptors. Playwright
+performs browser operations; Hunter plans, normalizes, redacts, and persists
+the observations.
 
-### Local memory
+### JavaScript Analysis
 
-- `hunter_memory_query`
-- `hunter_memory_record`
-- `hunter_memory_recommend`
-- `hunter_fingerprint_detect`
-- `hunter_memory_stats`
+- `hunter_js_unpack`
+- `hunter_js_deobfuscate`
+- `hunter_js_extract_api`
+- `hunter_js_extract_signature`
+- `hunter_js_full_analysis`
 
-Memory recommendations are local, explainable, and non-executing. Fingerprint
-detection consumes passive observations and does not make target requests.
-
-### Reverse analysis orchestration
+### Reverse Analysis
 
 - `hunter_reverse_binary`
 - `hunter_reverse_step`
@@ -131,34 +166,50 @@ detection consumes passive observations and does not make target requests.
 - `hunter_reverse_generate_rules`
 - `hunter_reverse_decrypt_plan`
 
-The reverse pipeline persists triage/static/identify/plan/capture/produce
-state and emits external Ghidra/ReverseLabTools/Frida handoffs when those
-backends are not directly available.
+Reverse workflows persist state and emit bounded handoffs for
+`reverse_lab_tools`, Ghidra, Frida, and JSHook when those backends are
+available.
 
-## ????
+### Local Memory
+
+- `hunter_memory_query`
+- `hunter_memory_record`
+- `hunter_memory_recommend`
+- `hunter_fingerprint_detect`
+- `hunter_memory_stats`
+
+### Unified Orchestration
+
+- `hunter_auto_pentest`
+
+The unified orchestrator coordinates memory, reconnaissance, attack-surface
+analysis, deferred attack execution, pattern confirmation, evidence, learning,
+and report generation. Repeated completed runs use explicit workflow
+generations; interrupted runs resume from durable checkpoints.
+
+## Evidence Workflow
+
+Use this sequence for authorized assessments:
 
 ```text
-state.json -> kb_router/kb_read_file -> hunter_healthcheck -> hunter_capabilities
--> hunter_kb_search / hunter_kb_read -> hunter_kb_recommend
--> targeted hunter_auto_* ? Burp action plan
--> Burp/http_probe ?? -> hunter_burp_import -> hunter_report -> exports/notes/reports
+case state
+-> project KB search/read
+-> health and capabilities
+-> targeted recon
+-> evidence-driven recommendation
+-> targeted proof or external MCP handoff
+-> evidence registration
+-> finding promotion
+-> checkpoint
+-> note/report publication
+-> case state update
 ```
 
-## ????
+Store project artifacts under:
 
-- ????????? `hunter_kb_search` ? `hunter_kb_recommend`?
-- ?? token/API/IDOR/CORS ????? `hunter_kb_recommend` + `hunter_burp_repeater`?
-- ?? OOB ???`hunter_burp_collaborator_workflow`?
-- ??? Burp ???? API/token?`hunter_burp_proxy_search`?
-- ?? payload?`hunter_payload_search/get/generate`??? `hunter_kb_recommend.payload_hits` ??
+- `D:\Open-tgtylab\exports\notes`
+- `D:\Open-tgtylab\exports\reports`
+- `D:\Open-tgtylab\exports\evidence`
 
-## ????
-
-- ?????`D:\Open-tgtylab\exports\notes|reports|...`
-- Hunter ?????`C:\Users\Administrator\.agents\skills\hunter\evidence\tool_output`
-- case ???`D:\Open-tgtylab\cases\<slug>\state.json`
-
-
-## Unified Workflow Kernel
-
-For CTF/reverse/pentest cases, define explicit `success_conditions`, then use `hunter_workflow_create` -> `hunter_workflow_route` -> `hunter_workflow_plan` -> backend execution -> `hunter_evidence_register` / `hunter_finding_promote` -> `hunter_workflow_checkpoint`. Use `interactive` by default and bounded `autopilot` for repeatable lab automation. PE/APK/JavaScript/mixed lanes delegate to `reverse_lab_tools`, `ghidra`, and `jshook` through capability plans.
+Hunter-owned runtime evidence remains under the Hunter repository's
+`evidence/` and `sessions/` directories.
