@@ -55,8 +55,9 @@ Each returned form contains:
 }
 ```
 
-All forms are returned. Exactly one form is selected as the login form when
-at least one form exists, using the following score ordering:
+All forms are returned. At most one form is selected as the login form. A
+form must match at least one login signal before it can be selected, using the
+following score ordering:
 
 1. action contains `login`, `signin`, `auth`, `logon`, `sso`, or `cas`;
 2. the form contains a password input;
@@ -64,7 +65,9 @@ at least one form exists, using the following score ordering:
    or `phone`.
 
 The implementation preserves document order as a tie breaker. The selected
-form is marked with `is_login=True`; non-selected forms are marked false.
+form is marked with `is_login=True`; non-selected forms are marked false. If
+no form matches any login signal, every form is returned with
+`is_login=False`.
 Missing form actions resolve to the supplied `base_url`. Relative actions are
 resolved with `urljoin`. The method is upper-cased and constrained to GET or
 POST, defaulting to GET for invalid or absent values.
@@ -155,12 +158,14 @@ automatic extraction runs only when all of the following are true:
 - a non-empty `target_url` is present in caller parameters.
 
 This preserves the existing required-parameter error for calls that omit
-`target_url`. The page is fetched through `_attack_request_executor` using the
-existing stateful stealth HTTP client and session authorization. The response
-body is passed to `FormExtractor`; credentials are generated; the feeder
-merges only missing or blank runtime values. If no login form is found, the
-legacy chain execution path runs unchanged and returns its normal validation
-result.
+`target_url`. If `target_url` already contains a non-root path, that exact URL
+is fetched. Otherwise the current explicit or default `login_path` is joined
+to `target_url`. The page is fetched through `_attack_request_executor` using
+the existing stateful stealth HTTP client and session authorization. The
+response body is passed to `FormExtractor`; credentials are generated; the
+feeder merges only missing or blank runtime values. If no login form is found,
+the legacy chain execution path runs unchanged and returns its normal
+validation result.
 
 The returned `data` contains the chain result and a redacted
 `auto_extract` summary with form metadata and candidate count. Candidate
@@ -188,7 +193,7 @@ Add focused tests for:
 
 1. relative action resolution, method normalization, all control types, default
    values, placeholders, and submit button extraction;
-2. login-form priority and CAS/CSRF token detection;
+2. login-form priority, no-signal fallback, and CAS/CSRF token detection;
 3. at least 20 baseline credential pairs, domain-derived candidates,
    duplicate removal, hidden-field retention, and CAPTCHA marking;
 4. feeder output, action origin/path splitting, explicit-parameter precedence,
