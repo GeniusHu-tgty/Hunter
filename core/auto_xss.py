@@ -10,9 +10,14 @@ Automates XSS detection and exploitation:
 6. Encoding analysis and bypass
 """
 
+import asyncio
+import hashlib
+import inspect
+import json
 import re
 import time
-from typing import Optional
+from typing import Mapping, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     from tools.probe import _get_session
@@ -25,12 +30,84 @@ except (ImportError, ModuleNotFoundError):
         return s
 
 
+def _get_browser_controller():
+    return None
+
+
+def _run_browser_awaitable(value):
+    if not inspect.isawaitable(value):
+        return value
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(value)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, value).result(timeout=30)
+
+
+def _structured_mapping(value, depth: int = 0) -> dict:
+    if depth > 8:
+        return {}
+    if isinstance(value, Mapping):
+        direct_keys = {
+            "page_loaded", "alert_triggered", "payload_rendered",
+            "dialogs", "html", "url",
+        }
+        if direct_keys.intersection(value):
+            return dict(value)
+        for key in ("structuredContent", "data", "result", "value"):
+            nested = _structured_mapping(value.get(key), depth + 1)
+            if nested:
+                return nested
+        content = value.get("content")
+        if isinstance(content, list):
+            for item in content:
+                nested = _structured_mapping(item, depth + 1)
+                if nested:
+                    return nested
+        text = value.get("text")
+        if isinstance(text, str):
+            try:
+                return _structured_mapping(json.loads(text), depth + 1)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+    if isinstance(value, list):
+        for item in value:
+            nested = _structured_mapping(item, depth + 1)
+            if nested:
+                return nested
+    return {}
+
+
+def _result_path(value, depth: int = 0) -> str:
+    if depth > 8:
+        return ""
+    if isinstance(value, Mapping):
+        for key in ("path", "file", "filename", "screenshot"):
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+        for item in value.values():
+            path = _result_path(item, depth + 1)
+            if path:
+                return path
+    elif isinstance(value, list):
+        for item in value:
+            path = _result_path(item, depth + 1)
+            if path:
+                return path
+    return ""
+
+
 class AutoXSS:
     """Automated XSS detection and exploitation engine."""
 
     def __init__(self, base_url: str, param: str = "q",
                  method: str = "GET", session=None, headers: dict = None,
-                 csrf_url: str = ""):
+                 csrf_url: str = "", browser_controller=None):
         self.base_url = base_url
         self.param = param
         self.method = method.upper()
@@ -45,11 +122,29 @@ class AutoXSS:
         self.xss_type = None  # reflected, dom, stored
         self.baseline_response = None
         self.evidence = None
+        self.browser_controller = browser_controller
+
+    def _payload_url(self, payload: str = None, target_url: str = None) -> str:
+        parts = urlsplit(target_url or self.base_url)
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key != self.param
+        ]
+        if payload is not None:
+            query.append((self.param, payload))
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
 
     def _request_record(self, payload: str) -> dict:
         if self.method == "GET":
-            from urllib.parse import quote
-            return {"method": "GET", "url": f"{self.base_url}?{self.param}={quote(payload)}", "headers": dict(getattr(self, "extra_headers", {})), "body": ""}
+            return {
+                "method": "GET",
+                "url": self._payload_url(payload),
+                "headers": dict(getattr(self, "extra_headers", {})),
+                "body": "",
+            }
         return {"method": self.method, "url": self.base_url, "headers": dict(getattr(self, "extra_headers", {})), "body": {self.param: payload}}
 
     def _build_evidence(self, payload: str, response: dict, reproduction_count: int) -> dict:
@@ -95,8 +190,7 @@ class AutoXSS:
             h = {**self.extra_headers, **(headers or {})}
 
             if m == "GET":
-                from urllib.parse import quote
-                full_url = f"{target_url}?{self.param}={quote(payload)}"
+                full_url = self._payload_url(payload, target_url)
                 resp = self.session.get(full_url, headers=h, timeout=10, allow_redirects=False)
             else:
                 resp = self.session.post(target_url, data={self.param: payload},
@@ -134,6 +228,272 @@ class AutoXSS:
             encodings["js_encoding"] = True
 
         return encodings
+
+    def _browser_payload_url(self, payload: str) -> str:
+        return self._payload_url(payload)
+
+    def _browser_baseline_url(self) -> str:
+        return self._payload_url("HUNTER_XSS_BASELINE_7392")
+
+    @staticmethod
+    def _expected_alert_message(payload: str) -> str:
+        match = re.search(
+            r"alert\s*\(\s*(.*?)\s*\)",
+            payload,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return ""
+        argument = match.group(1).strip()
+        if len(argument) >= 2 and argument[0] == argument[-1] and argument[0] in {"'", '"'}:
+            return argument[1:-1]
+        if re.fullmatch(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", argument):
+            return argument.lstrip("+")
+        if argument in {"true", "false", "null", "undefined"}:
+            return argument
+        return ""
+
+    @staticmethod
+    def _text_match_verdict(response: dict) -> str:
+        executable_reflection = (
+            response.get("reflected")
+            and not response.get("encoded", {}).get("html_entities")
+        )
+        return "VERIFIED" if executable_reflection else "REFUTED"
+
+    def _browser_plan(
+        self, payload: str, target_url: str, baseline_url: str
+    ) -> dict:
+        expected_alert_message = self._expected_alert_message(payload)
+        code = (
+            "async (page) => {\n"
+            f"  const baselineUrl = {json.dumps(baseline_url)};\n"
+            f"  const targetUrl = {json.dumps(target_url)};\n"
+            f"  const payload = {json.dumps(payload)};\n"
+            f"  const expectedAlertMessage = {json.dumps(expected_alert_message)};\n"
+            "  const collect = async url => {\n"
+            "    const dialogs = [];\n"
+            "    const onDialog = async dialog => {\n"
+            "      dialogs.push({type: dialog.type(), message: dialog.message()});\n"
+            "      await dialog.accept().catch(() => {});\n"
+            "    };\n"
+            "    page.on('dialog', onDialog);\n"
+            "    let pageLoaded = false;\n"
+            "    let error = '';\n"
+            "    try {\n"
+            "      await page.goto(url, {waitUntil: 'domcontentloaded', timeout: 15000});\n"
+            "      pageLoaded = true;\n"
+            "      await page.waitForTimeout(300);\n"
+            "    } catch (exc) { error = String(exc); }\n"
+            "    let html = '';\n"
+            "    try { html = await page.content(); } catch (exc) { if (!error) error = String(exc); }\n"
+            "    page.off('dialog', onDialog);\n"
+            "    return {page_loaded: pageLoaded, dialogs, html, url: page.url(), error};\n"
+            "  };\n"
+            "  const baseline = await collect(baselineUrl);\n"
+            "  const injected = await collect(targetUrl);\n"
+            "  const relevantAlerts = dialogs => dialogs.filter(item =>\n"
+            "    item.type === 'alert' && (!expectedAlertMessage || item.message === expectedAlertMessage)\n"
+            "  ).length;\n"
+            "  const baselineAlerts = relevantAlerts(baseline.dialogs);\n"
+            "  const injectedAlerts = relevantAlerts(injected.dialogs);\n"
+            "  let payloadRendered = injected.html.includes(payload);\n"
+            "  if (!payloadRendered && payload.trim().startsWith('<')) {\n"
+            "    try {\n"
+            "      const template = document.createElement('template');\n"
+            "      template.innerHTML = payload;\n"
+            "      const element = template.content.firstElementChild;\n"
+            "      if (element) {\n"
+            "        const candidates = Array.from(document.querySelectorAll(element.tagName));\n"
+            "        const expectedText = (element.textContent || '').trim();\n"
+            "        payloadRendered = candidates.some(candidate => {\n"
+            "          const attributesMatch = Array.from(element.attributes).every(attribute =>\n"
+            "            candidate.getAttribute(attribute.name) === attribute.value\n"
+            "          );\n"
+            "          const textMatches = !expectedText || (candidate.textContent || '').trim() === expectedText;\n"
+            "          return attributesMatch && textMatches;\n"
+            "        });\n"
+            "      }\n"
+            "    } catch (exc) {}\n"
+            "  }\n"
+            "  return {\n"
+            "    page_loaded: injected.page_loaded,\n"
+            "    alert_triggered: injectedAlerts > baselineAlerts,\n"
+            "    payload_rendered: payloadRendered,\n"
+            "    dialogs: injected.dialogs, baseline_dialogs: baseline.dialogs,\n"
+            "    html: injected.html, url: injected.url, error: injected.error\n"
+            "  };\n"
+            "}"
+        )
+        return {
+            "backend": "playwright-mcp",
+            "mode": "external-mcp-handoff",
+            "status": "proposed",
+            "execution": "deferred",
+            "requires_confirmation": False,
+            "operation": "verify_xss",
+            "target_url": target_url,
+            "baseline_url": baseline_url,
+            "calls": [
+                {"tool": "browser_run_code", "arguments": {"code": code}}
+            ],
+            "on_failure": [],
+        }
+
+    def _capture_browser_screenshot(self, controller, payload: str) -> str:
+        digest = hashlib.sha256(
+            f"{self.base_url}|{self.param}|{payload}".encode("utf-8")
+        ).hexdigest()[:12]
+        filename = f"hunter-xss-likely-{digest}.png"
+        plan = {
+            "backend": "playwright-mcp",
+            "mode": "external-mcp-handoff",
+            "status": "proposed",
+            "execution": "deferred",
+            "requires_confirmation": False,
+            "operation": "capture_xss_evidence",
+            "calls": [
+                {
+                    "tool": "browser_take_screenshot",
+                    "arguments": {"filename": filename},
+                },
+                {"tool": "browser_snapshot", "arguments": {}},
+            ],
+            "on_failure": [],
+        }
+        result = _run_browser_awaitable(
+            controller.execute_plan(plan, execute=True)
+        )
+        completed = (
+            isinstance(result, Mapping)
+            and result.get("status") == "ok"
+            and result.get("execution") == "completed"
+        )
+        if not completed:
+            error = (
+                result.get("error", "screenshot capture unavailable")
+                if isinstance(result, Mapping)
+                else "screenshot capture unavailable"
+            )
+            raise RuntimeError(str(error))
+        return _result_path(result) or filename
+
+    def _verify_payload_with_browser(self, payload: str, response: dict) -> dict:
+        fallback = self._text_match_verdict(response)
+        controller = self.browser_controller or _get_browser_controller()
+        if controller is None or getattr(controller, "execution_adapter", None) is None:
+            return {
+                "verdict": fallback,
+                "browser_unavailable": True,
+                "fallback": "text_match",
+            }
+
+        if self.method != "GET":
+            return {
+                "verdict": fallback,
+                "browser_unavailable": True,
+                "fallback": "text_match",
+                "error": "browser verification currently supports reflected GET and DOM URL sources",
+            }
+
+        target_url = self._browser_payload_url(payload)
+        baseline_url = self._browser_baseline_url()
+        try:
+            execution = _run_browser_awaitable(
+                controller.execute_plan(
+                    self._browser_plan(payload, target_url, baseline_url),
+                    execute=True,
+                )
+            )
+        except Exception as exc:
+            return {
+                "verdict": fallback,
+                "browser_unavailable": True,
+                "fallback": "text_match",
+                "error": str(exc),
+                "url": target_url,
+            }
+
+        completed = (
+            isinstance(execution, Mapping)
+            and execution.get("status") == "ok"
+            and execution.get("execution") == "completed"
+        )
+        if not completed:
+            error = (
+                execution.get("error", "browser execution unavailable")
+                if isinstance(execution, Mapping)
+                else "browser execution unavailable"
+            )
+            return {
+                "verdict": fallback,
+                "browser_unavailable": True,
+                "fallback": "text_match",
+                "error": str(error),
+                "url": target_url,
+            }
+
+        observation = _structured_mapping(execution.get("execution_results", []))
+        page_loaded = bool(observation.get("page_loaded"))
+        if not page_loaded:
+            return {
+                "verdict": fallback,
+                "browser_unavailable": True,
+                "fallback": "text_match",
+                "error": str(observation.get("error") or "browser page did not load"),
+                "url": str(observation.get("url") or target_url),
+            }
+
+        alert_triggered = bool(observation.get("alert_triggered"))
+        payload_rendered = bool(observation.get("payload_rendered"))
+        verdict = (
+            "VERIFIED"
+            if alert_triggered
+            else "LIKELY"
+            if payload_rendered
+            else "REFUTED"
+        )
+        result = {
+            "verdict": verdict,
+            "browser_unavailable": False,
+            "page_loaded": True,
+            "alert_triggered": alert_triggered,
+            "payload_rendered": payload_rendered,
+            "dialogs": observation.get("dialogs", []),
+            "html": str(observation.get("html") or ""),
+            "url": str(observation.get("url") or target_url),
+        }
+        if verdict == "LIKELY":
+            try:
+                result["screenshot"] = self._capture_browser_screenshot(
+                    controller, payload
+                )
+            except Exception as exc:
+                result["verdict"] = "INCONCLUSIVE"
+                result["screenshot_error"] = str(exc)
+        return result
+
+    def _browser_evidence(
+        self, payload: str, response: dict, verification: dict
+    ) -> dict:
+        reproduction_count = {
+            "VERIFIED": 3,
+            "LIKELY": 1,
+            "REFUTED": 0,
+        }.get(verification.get("verdict"), 0)
+        evidence_response = dict(response)
+        if not verification.get("browser_unavailable"):
+            evidence_response["body"] = verification.get("html", "")
+        evidence = self._build_evidence(
+            payload, evidence_response, reproduction_count
+        )
+        evidence["metadata"]["browser_verification"] = {
+            key: value
+            for key, value in verification.items()
+            if key != "html"
+        }
+        self.evidence = evidence
+        return evidence
 
     def _extract_csrf(self):
         """Extract CSRF token from form page."""
@@ -466,7 +826,8 @@ class AutoXSS:
         return any(ind in body for ind in waf_indicators) or result.get("status") in (403, 406, 429)
 
     def run_full_scan(self, dom_check: bool = True,
-                      stored_url: str = "", stored_params: dict = None) -> dict:
+                      stored_url: str = "", stored_params: dict = None,
+                      verify_with_browser: bool = False) -> dict:
         """Run complete automated XSS scan."""
         start = time.time()
         results = {
@@ -476,24 +837,48 @@ class AutoXSS:
         }
         self._ensure_baseline()
 
-        # Step 1: Detect context
         context = self.detect_context()
         results["context"] = context
         results["steps"].append({"step": "context_detection", "result": context})
 
         if context == "not_reflected":
             results["conclusion"] = "Input not reflected in response"
-
-            # Still check DOM XSS
+            dom_result = None
             if dom_check:
                 dom_result = self.detect_dom_xss()
                 results["dom_xss"] = dom_result
                 results["steps"].append({"step": "dom_xss", "result": dom_result})
                 if dom_result.get("vulnerable"):
-                    self.vulnerable = True
-                    self.xss_type = "dom"
+                    if verify_with_browser:
+                        payload = "<script>alert(1)</script>"
+                        probe = self._test_payload(payload)
+                        verification = self._verify_payload_with_browser(payload, probe)
+                        results["browser_verification"] = verification
+                        results["browser_unavailable"] = verification["browser_unavailable"]
+                        results["steps"].append({
+                            "step": "browser_verification",
+                            "result": {
+                                key: value
+                                for key, value in verification.items()
+                                if key != "html"
+                            },
+                        })
+                        if verification["browser_unavailable"]:
+                            self.vulnerable = True
+                            self.xss_type = "dom"
+                            self.working_payload = payload
+                            results["evidence"] = self._confirm_evidence(payload, probe)
+                        else:
+                            results["evidence"] = self._browser_evidence(
+                                payload, probe, verification
+                            )
+                            self.working_payload = payload
+                            self.xss_type = "dom"
+                            self.vulnerable = verification["verdict"] == "VERIFIED"
+                    else:
+                        self.vulnerable = True
+                        self.xss_type = "dom"
 
-            # Check stored XSS if URL provided
             if stored_url:
                 stored_result = self.test_stored_xss(
                     inject_url=stored_url,
@@ -503,46 +888,130 @@ class AutoXSS:
                 results["steps"].append({"step": "stored_xss", "result": stored_result})
 
             results["vulnerable"] = self.vulnerable
+            results["working_payload"] = self.working_payload
             results["xss_type"] = self.xss_type
             results["elapsed_ms"] = int((time.time() - start) * 1000)
             return results
 
-        # Step 2: WAF detection
         waf = self.detect_waf()
         results["waf_detected"] = waf
         results["steps"].append({"step": "waf_detection", "result": waf})
 
-        # Step 3: Test payloads for reflected XSS
         payloads = self.get_payloads_for_context(context, waf)
         results["payloads_tested"] = len(payloads)
+        likely_candidate = None
 
         for payload in payloads:
-            result = self._test_payload(payload)
-            self.payloads_tested.append(result)
+            response = self._test_payload(payload)
+            self.payloads_tested.append(response)
+            candidate = (
+                response.get("reflected")
+                and not response.get("encoded", {}).get("html_entities")
+            )
+            if not candidate:
+                continue
 
-            if result.get("reflected") and not result.get("encoded", {}).get("html_entities"):
-                self.vulnerable = True
-                self.working_payload = payload
-                self.xss_type = "reflected"
-                results["vulnerable"] = True
-                results["working_payload"] = payload
-                results["xss_type"] = "reflected"
+            if verify_with_browser:
+                verification = self._verify_payload_with_browser(payload, response)
+                results["browser_verification"] = verification
+                results["browser_unavailable"] = verification["browser_unavailable"]
                 results["steps"].append({
-                    "step": "payload_test",
-                    "result": {"payload": payload, "reflected": True, "encoded": result.get("encoded")},
+                    "step": "browser_verification",
+                    "result": {
+                        key: value
+                        for key, value in verification.items()
+                        if key != "html"
+                    },
                 })
-                break
+                if verification["browser_unavailable"]:
+                    self.vulnerable = True
+                    self.working_payload = payload
+                    self.xss_type = "reflected"
+                    results["evidence"] = self._confirm_evidence(payload, response)
+                    break
+                if verification["verdict"] == "VERIFIED":
+                    self.vulnerable = True
+                    self.working_payload = payload
+                    self.xss_type = "reflected"
+                    results["evidence"] = self._browser_evidence(
+                        payload, response, verification
+                    )
+                    break
+                if verification["verdict"] == "LIKELY" and likely_candidate is None:
+                    likely_candidate = (payload, response, verification)
+                continue
 
-        # Step 4: DOM XSS check
+            self.vulnerable = True
+            self.working_payload = payload
+            self.xss_type = "reflected"
+            results["steps"].append({
+                "step": "payload_test",
+                "result": {
+                    "payload": payload,
+                    "reflected": True,
+                    "encoded": response.get("encoded"),
+                },
+            })
+            break
+
+        if likely_candidate and not self.vulnerable:
+            payload, response, verification = likely_candidate
+            self.working_payload = payload
+            self.xss_type = "reflected"
+            results["browser_verification"] = verification
+            results["evidence"] = self._browser_evidence(
+                payload, response, verification
+            )
+
         if dom_check:
             dom_result = self.detect_dom_xss()
             results["dom_xss"] = dom_result
             results["steps"].append({"step": "dom_xss", "result": dom_result})
             if dom_result.get("vulnerable") and not self.vulnerable:
-                self.vulnerable = True
-                self.xss_type = "dom"
+                if verify_with_browser:
+                    payload = "<script>alert(1)</script>"
+                    response = self._test_payload(payload)
+                    verification = self._verify_payload_with_browser(payload, response)
+                    results["browser_verification"] = verification
+                    results["browser_unavailable"] = verification["browser_unavailable"]
+                    results["steps"].append({
+                        "step": "browser_verification",
+                        "result": {
+                            key: value
+                            for key, value in verification.items()
+                            if key != "html"
+                        },
+                    })
+                    if verification["browser_unavailable"]:
+                        self.vulnerable = True
+                        self.working_payload = payload
+                        self.xss_type = "dom"
+                        results["evidence"] = self._confirm_evidence(payload, response)
+                    elif verification["verdict"] == "VERIFIED":
+                        self.vulnerable = True
+                        self.working_payload = payload
+                        self.xss_type = "dom"
+                        results["evidence"] = self._browser_evidence(
+                            payload, response, verification
+                        )
+                    elif verification["verdict"] == "LIKELY" and not likely_candidate:
+                        self.working_payload = payload
+                        self.xss_type = "dom"
+                        results["evidence"] = self._browser_evidence(
+                            payload, response, verification
+                        )
+                    elif likely_candidate:
+                        reflected_payload, reflected_response, reflected_verification = likely_candidate
+                        self.working_payload = reflected_payload
+                        self.xss_type = "reflected"
+                        results["browser_verification"] = reflected_verification
+                        results["evidence"] = self._browser_evidence(
+                            reflected_payload, reflected_response, reflected_verification
+                        )
+                elif not verify_with_browser:
+                    self.vulnerable = True
+                    self.xss_type = "dom"
 
-        # Step 5: Stored XSS check
         if stored_url:
             stored_result = self.test_stored_xss(
                 inject_url=stored_url,
@@ -553,12 +1022,28 @@ class AutoXSS:
 
         if not self.vulnerable:
             results["vulnerable"] = False
-            results["conclusion"] = "No unencoded reflection found. May need manual testing."
+            if likely_candidate:
+                results["conclusion"] = (
+                    "Payload rendered in the browser but script execution was not observed."
+                )
+            else:
+                results["conclusion"] = (
+                    "No browser-executable reflection found. May need manual testing."
+                    if verify_with_browser
+                    else "No unencoded reflection found. May need manual testing."
+                )
+        else:
+            results["vulnerable"] = True
+            results["working_payload"] = self.working_payload
+            results["xss_type"] = self.xss_type
 
-        if self.working_payload:
+        if self.working_payload and "evidence" not in results:
             first_response = self._test_payload(self.working_payload)
-            results["evidence"] = self._confirm_evidence(self.working_payload, first_response)
+            results["evidence"] = self._confirm_evidence(
+                self.working_payload, first_response
+            )
 
+        results["working_payload"] = self.working_payload
         results["xss_type"] = self.xss_type
         results["elapsed_ms"] = int((time.time() - start) * 1000)
         return results
@@ -566,8 +1051,20 @@ class AutoXSS:
 
 def auto_xss_impl(base_url: str, param: str = "q", method: str = "GET",
                    dom_check: bool = True, stored_url: str = "",
-                   stored_params: dict = None, headers: dict = None) -> dict:
+                   stored_params: dict = None, headers: dict = None,
+                   verify_with_browser: bool = False,
+                   browser_controller=None) -> dict:
     """Run automated XSS scan. Entry point for MCP tool."""
-    engine = AutoXSS(base_url, param, method, headers=headers)
-    return engine.run_full_scan(dom_check=dom_check, stored_url=stored_url,
-                                 stored_params=stored_params)
+    engine = AutoXSS(
+        base_url,
+        param,
+        method,
+        headers=headers,
+        browser_controller=browser_controller,
+    )
+    return engine.run_full_scan(
+        dom_check=dom_check,
+        stored_url=stored_url,
+        stored_params=stored_params,
+        verify_with_browser=verify_with_browser,
+    )

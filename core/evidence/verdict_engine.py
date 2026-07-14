@@ -188,6 +188,13 @@ class VerdictEngine:
         baseline_time = float(evidence.metadata.get("baseline_response_time") or evidence.baseline_response.get("elapsed") or evidence.baseline_response.get("time") or 0)
         if response_time > 5.0 and 0 <= baseline_time < 1.0:
             signals.append("timing_delta")
+        boolean_analysis = evidence.metadata.get("boolean_analysis") or {}
+        if (
+            evidence.metadata.get("boolean_blind")
+            and isinstance(boolean_analysis, Mapping)
+            and boolean_analysis.get("significant")
+        ):
+            signals.append("boolean_response_delta")
         baseline_collision = response_matches and response_matches <= baseline_matches
         same_structured_shape = (
             len(body) > baseline_len * 1.5

