@@ -328,3 +328,44 @@ def test_sqlmap_post_request_includes_session_csrf(monkeypatch):
 
     assert "q=1" in captured["request"]
     assert "csrf_token=abc123" in captured["request"]
+
+
+def test_detector_restores_explicit_stealth_session_id():
+    from core.sqli_detect import SqliDetector
+
+    detection_session = ScriptedSession(lambda method, url, kwargs: Response(200, "same", {}))
+
+    class FakeClient:
+        def detection_session(self, session_id):
+            assert session_id == "stealth-restored"
+            return detection_session
+
+    detector = SqliDetector(
+        "https://target.test/item?id=1",
+        param="id",
+        session_id="stealth-restored",
+        stealth_client=FakeClient(),
+        technique_memory=RecordingMemory(),
+    )
+
+    assert detector.session is detection_session
+
+
+def test_evidence_redacts_authentication_headers():
+    from core.sqli_detect import SqliDetector
+
+    def responder(method, url, kwargs):
+        value = (kwargs.get("params") or kwargs.get("data"))["id"]
+        body = "mysql_fetch failed" if "\'" in value else "normal"
+        return Response(500 if body != "normal" else 200, body, {})
+
+    result = SqliDetector(
+        "https://target.test/item?id=1",
+        param="id",
+        session=ScriptedSession(responder),
+        headers={"Authorization": "Bearer secret", "X-Test": "visible"},
+        technique_memory=RecordingMemory(),
+    ).detect()
+
+    assert result["evidence"]["request"]["headers"]["Authorization"] == "<redacted>"
+    assert result["evidence"]["request"]["headers"]["X-Test"] == "visible"

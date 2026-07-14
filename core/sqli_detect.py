@@ -44,6 +44,7 @@ class SqliDetector:
         *,
         session: Any = None,
         session_id: str | None = None,
+        stealth_client: StealthHTTPClient | None = None,
         headers: Mapping[str, str] | None = None,
         technique_memory: Any = None,
         waf_type: str = "",
@@ -62,8 +63,17 @@ class SqliDetector:
         self.technique_memory = technique_memory or TechniqueMemory()
         self.waf_type = str(waf_type or "")
         self._temporary_directory = None
-        self.session = session or self._create_ephemeral_session()
+        self.stealth_client = stealth_client
+        self.session = session or self._session_from_id() or self._create_ephemeral_session()
         self.attempts: list[dict[str, Any]] = []
+
+    def _session_from_id(self):
+        if not self.session_id:
+            return None
+        client = self.stealth_client or StealthHTTPClient(
+            state_dir=Path(__file__).resolve().parents[1] / "sessions" / "stealth"
+        )
+        return client.detection_session(self.session_id)
 
     def _create_ephemeral_session(self):
         self._temporary_directory = tempfile.TemporaryDirectory(prefix="hunter-sqli-")
@@ -182,6 +192,13 @@ class SqliDetector:
             "keyword_delta": keyword_delta,
         }
 
+    def _redacted_headers(self) -> dict[str, str]:
+        sensitive = {"authorization", "cookie", "proxy-authorization", "x-csrf-token", "x-xsrf-token"}
+        return {
+            name: "<redacted>" if name.casefold() in sensitive else value
+            for name, value in self.headers.items()
+        }
+
     def _evidence(
         self,
         *,
@@ -203,7 +220,7 @@ class SqliDetector:
             "request": {
                 "method": self.method,
                 "url": self._request_url(),
-                "headers": self.headers,
+                "headers": self._redacted_headers(),
                 **request_data,
             },
             "response": {
