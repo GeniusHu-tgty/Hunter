@@ -41,6 +41,8 @@ Design reference:
   correlation metadata, and context propagation.
 - `core/process_supervisor.py` — active process registry, bounded streaming,
   process-tree cleanup, identity/version capture, and cancellation.
+- `core/process_identity.py` — executable resolution, SHA-256 identity, and
+  bounded version probing without recursive identity capture.
 - `core/windows_job.py` — minimal Windows Job Object adapter.
 - `tests/test_proof_engine_p0.py` — mandatory five P0 regressions.
 - `tests/test_action_planner.py` — queue merge, phase/module, budget, and
@@ -50,6 +52,12 @@ Design reference:
 - `tests/test_execution_context.py` — cancellation and absolute-deadline tests.
 - `tests/test_process_supervisor.py` — process-tree, output bound, identity,
   deadline, and cleanup tests.
+- `tests/test_process_supervisor_windows.py` — Windows Job Object and taskkill
+  fallback tests.
+- `tests/test_process_supervisor_posix.py` — POSIX process-group TERM/KILL
+  tests.
+- `tests/test_mcp_process_cancellation.py` — real MCP protocol cancellation
+  propagation.
 - `tests/fixtures/process_tree_parent.py` — deterministic parent/child process
   fixture.
 
@@ -447,7 +455,7 @@ def test_requested_modules_phases_and_budget_limit_real_execution():
     )
 
     assert calls == ["hunter_auto_sqli"]
-    assert result["budget"]["started_actions"] == 1
+    assert result["budget"]["selected_actions"] == 1
     assert result["filtered_actions"][0]["reason"] == "module_excluded"
 ```
 
@@ -762,7 +770,7 @@ class CanonicalAction:
 class ActionBudget:
     max_actions: int
     proposed_actions: int = 0
-    started_actions: int = 0
+    selected_actions: int = 0
     filtered_actions: int = 0
 
     def to_dict(self) -> dict[str, int]:
@@ -852,7 +860,7 @@ class ActionPlanner:
             "budget": {
                 "max_actions": max(0, int(max_actions)),
                 "proposed_actions": len(merged),
-                "started_actions": len(selected),
+                "selected_actions": len(selected),
                 "filtered_actions": len(filtered),
             },
         }
@@ -993,6 +1001,10 @@ class ActionPlanner:
             return "module_excluded"
         return ""
 ```
+
+The planner reports `selected_actions`, not `started_actions`. Actual
+`started_actions` is computed by the execution stage in P0 and by
+`action.started` events in P1.
 
 Implement `_filter_reason` with exact reasons:
 
@@ -1888,16 +1900,23 @@ git commit -m "fix: separate core and extension tool contracts"
 Add tests for these event types:
 
 ```text
+facts.updated
 action.proposed
+action.merged
 action.started
 action.completed
 action.deferred
+action.blocked
 action.cancelled
 evidence.registered
 verdict.created
+finding.promoted
 memory.projected
 process.started
+process.output
 process.terminated
+checkpoint.created
+handoff.result_ingested
 ```
 
 Assert that rebuilding after deleting `workflow.json` yields the same
@@ -1919,6 +1938,7 @@ Add methods:
 def record_action_event(self, slug, event_type, action):
     if event_type not in {
         "action.proposed",
+        "action.merged",
         "action.started",
         "action.completed",
         "action.deferred",
@@ -1947,6 +1967,19 @@ def record_process_event(self, slug, event_type, process):
     return self._append(slug, event_type, {"process": dict(process)})
 ```
 
+Validate action transitions:
+
+```text
+pending -> started | deferred | blocked | cancelled
+started -> completed | blocked | cancelled
+deferred -> completed | blocked | cancelled
+blocked | cancelled -> started only when attempt increments
+completed -> terminal
+```
+
+Every action event contains generation, correlation ID, action ID, attempt,
+and idempotency key.
+
 - [ ] **Step 4: Materialize event-derived state**
 
 In `materialize`, handle events without mutating unrelated projections:
@@ -1955,11 +1988,9 @@ In `materialize`, handle events without mutating unrelated projections:
 elif event_type.startswith("action."):
     action = dict(payload["action"])
     state.setdefault("actions", {})[action["action_id"]] = action
-    state["metrics"]["tool_calls"] = sum(
-        1
-        for item in state["actions"].values()
-        if item.get("status") in {"started", "completed"}
-    )
+    if event_type == "action.started":
+        state.setdefault("tool_runs", []).append(action)
+        state["metrics"]["tool_calls"] = len(state["tool_runs"])
 elif event_type == "verdict.created":
     verdict = dict(payload["verdict"])
     state.setdefault("verdicts", {})[
@@ -2063,7 +2094,7 @@ def test_broker_redacts_secret_arguments_in_events():
     assert events[0][1]["arguments"]["password"] == "REDACTED"
 
 
-def test_same_idempotency_key_reuses_completed_result():
+def test_broker_has_no_process_local_completed_result_cache():
     calls = []
     broker = ToolBroker(
         services={
@@ -2074,9 +2105,11 @@ def test_same_idempotency_key_reuses_completed_result():
     first = broker.execute(proof_action())
     second = broker.execute(proof_action())
     assert first["value"] == second["value"] == 1
-    assert second["reused"] is True
-    assert len(calls) == 1
+    assert len(calls) == 2
 ```
+
+Idempotency is an event-sourced workflow concern. The broker must not keep a
+process-local completed-result cache that can diverge from `WorkflowKernel`.
 
 - [ ] **Step 2: Run and confirm module absence**
 
@@ -2120,7 +2153,6 @@ class ToolBroker:
         self.services = dict(services or {})
         self.fallback_runner = fallback_runner
         self.event_sink = event_sink
-        self.completed = {}
 
     def execute(self, action):
         tool = action["tool"]
@@ -2128,12 +2160,6 @@ class ToolBroker:
             return {
                 "status": "blocked",
                 "reason": "tool_not_allowlisted",
-            }
-        key = action["idempotency_key"]
-        if key in self.completed:
-            return {
-                **self.completed[key],
-                "reused": True,
             }
         operation = self.services.get(tool)
         if operation is None and self.fallback_runner is None:
@@ -2156,7 +2182,6 @@ class ToolBroker:
             else self.fallback_runner(tool, action["arguments"])
         )
         normalized = result if isinstance(result, dict) else {"result": result}
-        self.completed[key] = normalized
         return normalized
 
     @staticmethod
@@ -2182,6 +2207,11 @@ class ToolBroker:
 Use the existing supported-argument filtering and awaitable resolution helpers
 inside the broker. Redact `password`, `token`, `authorization`, `cookie`, and
 `secret` values before emitting event metadata.
+
+Before calling the broker, the proof engine queries
+`WorkflowKernel.completed_action_keys(slug)`. A completed key is projected
+from the event log and reused without calling `ToolBroker.execute`. The broker
+therefore remains stateless with respect to completion, budget, and resume.
 
 - [ ] **Step 4: Delegate bridge invocation**
 
@@ -2599,6 +2629,24 @@ def test_child_deadline_cannot_exceed_parent():
     assert child.expires_at == parent.expires_at
 
 
+def test_child_action_context_reuses_token_and_total_deadline():
+    parent = ExecutionContext(
+        workflow_slug="wf-test",
+        token=CancellationToken(),
+        deadline=Deadline.after(0.2),
+    )
+    child = parent.child_for_action(
+        "act-1",
+        30,
+        attempt=2,
+        idempotency_key="key-1",
+    )
+    assert child.token is parent.token
+    assert child.deadline.expires_at == parent.deadline.expires_at
+    assert child.attempt == 2
+    assert child.idempotency_key == "key-1"
+
+
 def test_cancellation_reason_is_shared_across_threads():
     token = CancellationToken()
     observed = []
@@ -2610,8 +2658,10 @@ def test_cancellation_reason_is_shared_across_threads():
     )
     thread.start()
     token.cancel("mcp_cancelled")
+    token.cancel("cleanup_timeout")
     thread.join(timeout=2)
     assert observed == ["mcp_cancelled"]
+    assert token.reason == "mcp_cancelled"
 
 
 def test_remaining_seconds_reaches_zero_without_reset():
@@ -2705,11 +2755,32 @@ class ExecutionContext:
     )
     workflow_slug: str = ""
     action_id: str = ""
+    attempt: int = 1
+    idempotency_key: str = ""
     token: CancellationToken = field(default_factory=CancellationToken)
     deadline: Deadline = field(
         default_factory=lambda: Deadline.after(120)
     )
     event_sink: object | None = None
+
+    def child_for_action(
+        self,
+        action_id,
+        seconds,
+        *,
+        attempt,
+        idempotency_key,
+    ):
+        return ExecutionContext(
+            correlation_id=self.correlation_id,
+            workflow_slug=self.workflow_slug,
+            action_id=str(action_id),
+            attempt=max(1, int(attempt)),
+            idempotency_key=str(idempotency_key),
+            token=self.token,
+            deadline=self.deadline.child(seconds),
+            event_sink=self.event_sink,
+        )
 
 
 _CURRENT = ContextVar("hunter_execution_context", default=None)
@@ -2751,9 +2822,12 @@ git commit -m "feat: add execution cancellation context"
 
 **Files:**
 - Create: `core/windows_job.py`
+- Create: `core/process_identity.py`
 - Create: `core/process_supervisor.py`
 - Create: `tests/fixtures/process_tree_parent.py`
 - Create: `tests/test_process_supervisor.py`
+- Create: `tests/test_process_supervisor_windows.py`
+- Create: `tests/test_process_supervisor_posix.py`
 
 - [ ] **Step 1: Write process fixture**
 
@@ -2922,6 +2996,20 @@ def test_active_registry_is_empty_after_cleanup(tmp_path):
 Use `psutil` only if already installed; otherwise verify process exit with
 `os.kill(pid, 0)` on POSIX and `OpenProcess`/`GetExitCodeProcess` on Windows.
 
+Also cover all timeout categories:
+
+```text
+start_timeout
+idle_timeout
+action_deadline
+workflow_deadline
+cleanup_timeout
+```
+
+Cancellation has highest priority, followed by workflow deadline, action
+deadline, idle timeout, and normal process exit. Cleanup receives a separate,
+strictly bounded deadline after business execution stops.
+
 - [ ] **Step 3: Implement Windows Job Object adapter**
 
 `WindowsJob` must:
@@ -2950,6 +3038,16 @@ job handle.
 All handles close in `finally`. If assignment fails because the process is
 already inside a non-breakaway job, return a structured failure and let the
 supervisor use `taskkill /T /F`.
+
+Prefer creating the process inside the Job Object through a supported
+`STARTUPINFO.lpAttributeList["job_list"]` path so a child cannot escape between
+process creation and post-spawn assignment. When that runtime path is
+unavailable, use post-spawn assignment and record the fallback explicitly.
+
+Add Windows-only tests for Job ownership, idempotent close, assignment
+failure, taskkill fallback, and zero remaining fixture PIDs. Add POSIX-only
+tests for `start_new_session=True`, process-group SIGTERM, SIGKILL escalation,
+and zero parent/child orphans.
 
 - [ ] **Step 4: Implement bounded output storage**
 
@@ -2991,8 +3089,9 @@ class BoundedOutput:
 
 Required public methods:
 
-- `run(argv, *, timeout, idle_timeout=None, env=None, cwd=None,
-  max_output_bytes=1024 * 1024, context=None,
+- `run(argv, *, timeout, start_timeout=5.0, idle_timeout=None,
+  cleanup_timeout=5.0, env=None, cwd=None,
+  stdout_limit=1024 * 1024, stderr_limit=256 * 1024, context=None,
   version_args=("--version",), capture_identity=True) -> dict`
 - `cancel(correlation_id, reason="cancelled") -> bool`
 - `active() -> list[dict]`
@@ -3016,10 +3115,20 @@ Implementation requirements:
 8. Return `identity`, `deadline_type`, `cleanup`, `stdout`, `stderr`,
    `elapsed_seconds`, and `correlation_id`.
 
+Implement executable identity in `core/process_identity.py`. Record the exact
+resolved executable path, SHA-256, version argv, bounded version output,
+return code, and `success|timeout|unsupported|error` status. The version probe
+uses the same supervisor with `capture_identity=False`, a five-second child
+deadline, and at most 64 KiB output, so identity capture cannot recurse or
+extend the workflow deadline.
+
 - [ ] **Step 6: Run process tests**
 
 ```powershell
-python -m pytest -q tests/test_process_supervisor.py
+python -m pytest -q `
+  tests/test_process_supervisor.py `
+  tests/test_process_supervisor_windows.py `
+  tests/test_process_supervisor_posix.py
 ```
 
 Expected: pass with zero active records after every test.
@@ -3027,7 +3136,14 @@ Expected: pass with zero active records after every test.
 - [ ] **Step 7: Commit**
 
 ```powershell
-git add core/windows_job.py core/process_supervisor.py tests/fixtures/process_tree_parent.py tests/test_process_supervisor.py
+git add `
+  core/windows_job.py `
+  core/process_identity.py `
+  core/process_supervisor.py `
+  tests/fixtures/process_tree_parent.py `
+  tests/test_process_supervisor.py `
+  tests/test_process_supervisor_windows.py `
+  tests/test_process_supervisor_posix.py
 git commit -m "feat: supervise external process trees"
 ```
 
@@ -3110,11 +3226,14 @@ Run:
 @'
 import ast, pathlib
 root = pathlib.Path(".")
-allowed = {"core/process_supervisor.py", "core/windows_job.py"}
+targets = [
+    root / "core/mcp_server.py",
+    root / "core/auto_sqli.py",
+    root / "core/reverse/android_pipeline.py",
+    root / "core/stealth/captcha_handler.py",
+]
 hits = []
-for path in root.rglob("*.py"):
-    if "tests" in path.parts:
-        continue
+for path in targets:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if (
@@ -3122,8 +3241,8 @@ for path in root.rglob("*.py"):
             and isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "subprocess"
-            and node.func.attr in {"run", "Popen", "call", "check_output"}
-            and path.as_posix() not in allowed
+            and node.func.attr
+            in {"run", "Popen", "call", "check_call", "check_output"}
         ):
             hits.append((path.as_posix(), node.lineno, node.func.attr))
 print(hits)
@@ -3132,6 +3251,10 @@ assert hits == []
 ```
 
 Expected: `[]`.
+
+This P2 gate is intentionally limited to the four migration targets. Other
+legacy utility modules that still own subprocess calls require a separate
+follow-up migration and must not make this scoped P0–P2 plan unfinishable.
 
 - [ ] **Step 7: Run focused tests**
 
@@ -3167,17 +3290,22 @@ git commit -m "refactor: route external tools through supervisor"
 ### Task 15: Propagate MCP Cancellation and Total Deadlines
 
 **Files:**
+- Modify: `mcp_server.py:1252-1286`
 - Modify: `mcp_server.py:2323-2351`
+- Modify: `mcp_server.py:4391-4414`
 - Modify: `core/workflow/tool_broker.py`
 - Modify: `core/workflow/kernel.py`
 - Modify: `tests/test_mcp_transport.py`
+- Create: `tests/test_mcp_process_cancellation.py`
 - Modify: `tests/test_execution_context.py`
 - Modify: `tests/test_process_supervisor.py`
 
 - [ ] **Step 1: Write failing MCP cancellation test**
 
-Start a tool implementation that launches the process-tree fixture, call it
-through the in-memory FastMCP session, cancel the client task, then assert:
+Start a tool implementation that launches the process-tree fixture and call it
+through the in-memory FastMCP session. Send a real MCP
+`notifications/cancelled` message for the active request ID rather than merely
+cancelling the local Python client task. Then assert:
 
 ```python
 assert supervisor.active() == []
@@ -3185,9 +3313,14 @@ assert workflow_state["actions"][action_id]["status"] == "cancelled"
 assert workflow_state["checkpoints"]
 ```
 
+The test waits until the supervisor registry contains the process, sends the
+protocol cancellation, and verifies that the checkpoint and process cleanup
+complete before the MCP request reaches its terminal cancelled state.
+
 - [ ] **Step 2: Add execution scope to `_safe_json_tool`**
 
-Use:
+Extract one helper used by `_execute_agent_async`, `_safe_json_tool`, and
+`_async_workflow_result`. Use:
 
 ```python
 context = ExecutionContext(
@@ -3206,22 +3339,36 @@ try:
 except asyncio.CancelledError:
     context.token.cancel("mcp_cancelled")
     supervisor.cancel(context.correlation_id, "mcp_cancelled")
-    await asyncio.to_thread(
-        supervisor.wait_for_cleanup,
-        context.correlation_id,
-        5.0,
-    )
+    with anyio.CancelScope(shield=True):
+        await asyncio.to_thread(
+            supervisor.wait_for_cleanup,
+            context.correlation_id,
+            5.0,
+        )
+        await asyncio.to_thread(
+            record_cancel_and_checkpoint,
+            context,
+        )
     raise
 except asyncio.TimeoutError:
     context.token.cancel("tool_deadline")
     supervisor.cancel(context.correlation_id, "tool_deadline")
-    await asyncio.to_thread(
-        supervisor.wait_for_cleanup,
-        context.correlation_id,
-        5.0,
-    )
+    with anyio.CancelScope(shield=True):
+        await asyncio.to_thread(
+            supervisor.wait_for_cleanup,
+            context.correlation_id,
+            5.0,
+        )
+        await asyncio.to_thread(
+            record_cancel_and_checkpoint,
+            context,
+        )
     return timeout_envelope
 ```
+
+FastMCP uses AnyIO cancellation scopes. Shielded cleanup is required so the
+same cancellation cannot interrupt process-tree termination or checkpoint
+writing.
 
 - [ ] **Step 3: Pass child deadlines through ToolBroker**
 
@@ -3232,6 +3379,8 @@ child = ExecutionContext(
     correlation_id=parent.correlation_id,
     workflow_slug=parent.workflow_slug,
     action_id=action["action_id"],
+    attempt=action["attempt"],
+    idempotency_key=action["idempotency_key"],
     token=parent.token,
     deadline=parent.deadline.child(action_timeout),
     event_sink=parent.event_sink,
@@ -3263,6 +3412,7 @@ kernel.checkpoint(slug, source_session=correlation_id)
 ```powershell
 python -m pytest -q `
   tests/test_mcp_transport.py `
+  tests/test_mcp_process_cancellation.py `
   tests/test_execution_context.py `
   tests/test_process_supervisor.py -k "cancel or deadline or cleanup"
 ```
@@ -3277,6 +3427,7 @@ git add `
   core/workflow/tool_broker.py `
   core/workflow/kernel.py `
   tests/test_mcp_transport.py `
+  tests/test_mcp_process_cancellation.py `
   tests/test_execution_context.py `
   tests/test_process_supervisor.py
 git commit -m "feat: propagate cancellation and total deadlines"
@@ -3287,6 +3438,7 @@ git commit -m "feat: propagate cancellation and total deadlines"
 ### Task 16: Record Process Identity, Bounded Output, and Resume Metadata
 
 **Files:**
+- Modify: `core/process_identity.py`
 - Modify: `core/process_supervisor.py`
 - Modify: `core/workflow/kernel.py`
 - Modify: `core/workflow/tool_broker.py`
@@ -3305,7 +3457,7 @@ assert result["stdout"]["total_bytes"] > result["stdout"]["retained_bytes"]
 assert checkpoint["process"]["termination_reason"] == "workflow_deadline"
 ```
 
-- [ ] **Step 2: Resolve executable identity before launch**
+- [ ] **Step 2: Finalize executable identity before launch**
 
 Implement:
 
@@ -3320,9 +3472,10 @@ identity = {
 }
 ```
 
-The version probe uses the same supervisor with a five-second child deadline,
-`max_output_bytes=64 * 1024`, and `capture_identity=False` to prevent
-recursion.
+Place resolution, hashing, and version normalization in
+`core/process_identity.py`. The version probe uses the same supervisor with a
+five-second child deadline, `max_output_bytes=64 * 1024`, and
+`capture_identity=False` to prevent recursion.
 
 - [ ] **Step 3: Emit process events through the context sink**
 
@@ -3354,7 +3507,7 @@ Expected: pass.
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add core/process_supervisor.py core/workflow/kernel.py core/workflow/tool_broker.py tests/test_process_supervisor.py tests/test_orchestrator.py
+git add core/process_identity.py core/process_supervisor.py core/workflow/kernel.py core/workflow/tool_broker.py tests/test_process_supervisor.py tests/test_orchestrator.py
 git commit -m "feat: persist supervised process metadata"
 ```
 
@@ -3365,14 +3518,40 @@ git commit -m "feat: persist supervised process metadata"
 ### Task 17: Run Full Gates, Update Documentation, and Close the Case
 
 **Files:**
+- Modify: `pyproject.toml`
+- Modify: `.gitignore`
 - Modify: `SKILL.md`
 - Modify: `README.md`
 - Modify: `TOOLS.md`
+- Create: `D:\Open-tgtylab\exports\evidence\hunter-skill\unified-proof-engine-p0-p2-verification.json`
 - Create: `D:\Open-tgtylab\exports\notes\hunter-unified-proof-engine-20260715.md`
 - Create: `D:\Open-tgtylab\exports\reports\hunter-unified-proof-engine-20260715.md`
 - Modify: `D:\Open-tgtylab\cases\hunter-skill\state.json`
 
-- [ ] **Step 1: Run P0 acceptance tests**
+- [ ] **Step 1: Close dependency and runtime-artifact gates**
+
+Add explicit test dependencies:
+
+```toml
+[project.optional-dependencies]
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+]
+stealth = ["curl_cffi>=0.6.0"]
+```
+
+Add:
+
+```gitignore
+sessions/browser/
+sessions/scans/
+evidence/tool_output/
+```
+
+Do not delete committed evidence or reports.
+
+- [ ] **Step 2: Run P0 acceptance tests**
 
 ```powershell
 python -m pytest -q tests/test_proof_engine_p0.py
@@ -3386,7 +3565,7 @@ Expected: all pass:
 - baseline SQL errors are not confirmed;
 - phases, modules, and budget change actual execution.
 
-- [ ] **Step 2: Run P1 gates**
+- [ ] **Step 3: Run P1 gates**
 
 ```powershell
 python -m pytest -q `
@@ -3400,19 +3579,43 @@ python -m pytest -q `
 
 Expected: pass.
 
-- [ ] **Step 3: Run P2 gates**
+- [ ] **Step 4: Run P2 gates**
 
 ```powershell
 python -m pytest -q `
   tests/test_execution_context.py `
   tests/test_process_supervisor.py `
+  tests/test_process_supervisor_windows.py `
+  tests/test_process_supervisor_posix.py `
   tests/test_external_process_runner.py `
-  tests/test_mcp_transport.py
+  tests/test_mcp_transport.py `
+  tests/test_mcp_process_cancellation.py
 ```
 
 Expected: pass and zero managed orphan processes.
 
-- [ ] **Step 4: Run the complete suite**
+- [ ] **Step 5: Stress cancellation and timeout cleanup**
+
+Run the cancellation/timeout process fixture 100 times. If `pytest-repeat` is
+not installed:
+
+```powershell
+1..100 | ForEach-Object {
+  python -m pytest -q `
+    tests/test_process_supervisor.py `
+    -k 'cancel or timeout'
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+```
+
+Expected:
+
+- managed orphan process count: 0;
+- registry empty after every iteration;
+- cancellation-to-process-disappearance p99 below one second;
+- retained stdout and stderr remain within their configured bounds.
+
+- [ ] **Step 6: Run the complete suite**
 
 ```powershell
 python -m pytest -q
@@ -3422,7 +3625,7 @@ Expected: all tests pass. No exclusions are allowed for the five P0 acceptance
 groups, entry-point parity, cancellation, process-tree cleanup, or registry
 contract.
 
-- [ ] **Step 5: Run static and contract checks**
+- [ ] **Step 7: Run static and contract checks**
 
 ```powershell
 python -m py_compile `
@@ -3432,6 +3635,7 @@ python -m py_compile `
   core/workflow/tool_broker.py `
   core/evidence/normalizer.py `
   core/execution_context.py `
+  core/process_identity.py `
   core/process_supervisor.py `
   core/windows_job.py
 
@@ -3448,7 +3652,7 @@ Expected:
 - doctor reports Web/API readiness independently from missing reverse tools;
 - no whitespace errors.
 
-- [ ] **Step 6: Update docs**
+- [ ] **Step 8: Update docs**
 
 Document:
 
@@ -3461,10 +3665,11 @@ All four high-level entry points share one proof engine.
 External CLI execution is cancellable, deadline-aware, bounded, and resumable.
 ```
 
-- [ ] **Step 7: Write verification note and report**
+- [ ] **Step 9: Write verification evidence, note, and report**
 
-The note records exact commands, pass counts, duration, contract counts,
-process cleanup evidence, and remaining P3–P4 work.
+The JSON evidence artifact records exact commands, pass counts, duration,
+contract counts, process cleanup metrics, the golden workflow trace, and
+artifact hashes. The note summarizes those results and remaining P3–P4 work.
 
 The report includes:
 
@@ -3475,7 +3680,7 @@ The report includes:
 5. benchmark and process-cleanup results;
 6. deferred P3 tool-surface and HunterBench work.
 
-- [ ] **Step 8: Update case state**
+- [ ] **Step 10: Update case state**
 
 Set:
 
@@ -3492,23 +3697,24 @@ Set:
 
 Append findings and output paths without deleting historical state.
 
-- [ ] **Step 9: Commit final documentation and case state**
+- [ ] **Step 11: Commit final documentation and case state**
 
 ```powershell
-git add SKILL.md README.md TOOLS.md
+git add pyproject.toml .gitignore SKILL.md README.md TOOLS.md
 git commit -m "docs: document unified proof engine"
 
 git -C D:\Open-tgtylab add `
   cases/hunter-skill/state.json `
+  exports/evidence/hunter-skill/unified-proof-engine-p0-p2-verification.json `
   exports/notes/hunter-unified-proof-engine-20260715.md `
   exports/reports/hunter-unified-proof-engine-20260715.md
 git -C D:\Open-tgtylab commit -m "docs: record hunter proof engine verification"
 ```
 
 If `D:\Open-tgtylab` is not a Git repository in the active installation, save
-the three workspace artifacts but omit the second commit.
+the four workspace artifacts but omit the second commit.
 
-- [ ] **Step 10: Verify final status**
+- [ ] **Step 12: Verify final status**
 
 ```powershell
 git status --short
