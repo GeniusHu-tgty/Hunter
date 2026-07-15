@@ -34,6 +34,26 @@ class ActionBudget:
 
 
 @dataclass
+class ActionOutcome:
+    transport_success: bool = False
+    probe_executed: bool = False
+    signal_detected: bool = False
+    vulnerability_confirmed: bool = False
+    verdict: str = "inconclusive"
+    outcome: str = "unknown"
+
+    @property
+    def legacy_success(self) -> bool:
+        return self.vulnerability_confirmed
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "success": self.legacy_success,
+        }
+
+
+@dataclass
 class WorkflowPolicy:
     mode: str = "interactive"
     max_tool_calls: int = 8

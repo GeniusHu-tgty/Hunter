@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 from core.reasoning.attack_reasoning import AttackReasoner
 from core.workflow.action_planner import ActionPlanner
+from core.workflow.models import ActionOutcome
 
 
 SPA_SCRIPT_THRESHOLD = 64 * 1024
@@ -2490,31 +2491,49 @@ class UnifiedOrchestrationBridge:
                 "headers": dict(headers) if isinstance(headers, Mapping) else {},
             }
 
-        def record_auto_attempt(
-            tool_name: str,
-            target_url: str,
+        def classify_attempt(
             result: Mapping[str, Any],
         ) -> dict[str, Any]:
             details = response_details(result)
-            success = (
-                details["status_code"] not in {403, 429, 503}
-                if details["status_code"]
-                else self._result_success(result)
+            payload = self._result_payload(result)
+            status = str(
+                result.get("status")
+                or payload.get("status")
+                or ""
+            ).casefold()
+            transport_success = bool(details["status_code"]) or status in {
+                "ok",
+                "success",
+                "completed",
+            }
+            probe_executed = status not in {
+                "blocked",
+                "cancelled",
+                "deferred",
+                "error",
+                "timeout",
+                "unavailable",
+            }
+            signal_detected = bool(
+                payload.get("vulnerable")
+                or result.get("vulnerable")
+                or payload.get("candidate")
+                or payload.get("findings")
+                or result.get("findings")
             )
-            memory = self._technique_memory()
-            record_attempt = getattr(memory, "record_attempt", None)
-            if callable(record_attempt):
-                record_attempt(
-                    technique_name=tool_name,
-                    target_url=target_url,
-                    waf_type=waf_type,
-                    success=success,
-                    metadata={
-                        "payload": details["payload"],
-                        "status_code": details["status_code"],
-                    },
-                )
-            return {**details, "success": success}
+            outcome = ActionOutcome(
+                transport_success=transport_success,
+                probe_executed=probe_executed,
+                signal_detected=signal_detected,
+                vulnerability_confirmed=False,
+                verdict="inconclusive",
+                outcome=(
+                    "executed"
+                    if probe_executed
+                    else status or "not_executed"
+                ),
+            )
+            return {**details, **outcome.to_dict()}
 
         def redirected_to_login(details: Mapping[str, Any]) -> bool:
             if details.get("status_code") != 302:
@@ -2682,18 +2701,11 @@ class UnifiedOrchestrationBridge:
             if execution_allowed:
                 result = self._invoke_tool(tool, arguments)
                 payload = self._result_payload(result)
-                auto_details = (
-                    record_auto_attempt(tool, target, result)
-                    if tool.startswith("hunter_auto_")
-                    else {
-                        **response_details(result),
-                        "success": self._result_success(result),
-                    }
-                )
+                auto_details = classify_attempt(result)
                 attempt.update({
                     "response": result,
                     "status": result.get("status", payload.get("status", "")),
-                    "success": auto_details["success"],
+                    **auto_details,
                     "vulnerable": bool(
                         payload.get("vulnerable")
                         or result.get("vulnerable")
@@ -2704,7 +2716,7 @@ class UnifiedOrchestrationBridge:
                         or 0.0
                     ),
                     "session_id": session_id,
-                    "technique_recorded": tool.startswith("hunter_auto_"),
+                    "technique_recorded": False,
                 })
                 if redirected_to_login(auto_details):
                     if isinstance(context, dict):
@@ -2740,11 +2752,7 @@ class UnifiedOrchestrationBridge:
                                 weak_args,
                             )
                             weak_payload = self._result_payload(weak_result)
-                            weak_details = record_auto_attempt(
-                                "hunter_auto_access_control",
-                                response_url or target,
-                                weak_result,
-                            )
+                            weak_details = classify_attempt(weak_result)
                             attempts.append({
                                 "tool": "hunter_auto_access_control",
                                 "technique": "weak-credential-probe",
@@ -2755,7 +2763,7 @@ class UnifiedOrchestrationBridge:
                                     "password": "REDACTED",
                                 },
                                 "response": weak_result,
-                                "success": weak_details["success"],
+                                **weak_details,
                                 "vulnerable": bool(
                                     weak_payload.get("vulnerable")
                                     or weak_result.get("vulnerable")
@@ -2766,9 +2774,9 @@ class UnifiedOrchestrationBridge:
                                     or 0.0
                                 ),
                                 "session_id": session_id,
-                                "technique_recorded": True,
+                                "technique_recorded": False,
                             })
-                            if attempts[-1]["success"]:
+                            if attempts[-1]["signal_detected"]:
                                 break
                 attempts.append(attempt)
                 if isinstance(item, dict):
@@ -2795,7 +2803,7 @@ class UnifiedOrchestrationBridge:
                 session_id
                 and not explicit_tool
                 and kind in chains
-                and attempt.get("success")
+                and attempt.get("probe_executed")
                 and not attempt.get("vulnerable")
                 and not attempt.get("authentication_required")
             ):

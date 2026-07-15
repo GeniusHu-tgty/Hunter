@@ -113,6 +113,64 @@ def test_technique_memory_ranks_waf_success_and_retires_low_success(tmp_path):
     assert "double-encoding" in retired
 
 
+def test_technique_memory_counts_only_verified_attempts(tmp_path):
+    memory = TechniqueMemory(tmp_path / "memory.db")
+
+    attempt = memory.record_attempt(
+        target_url="https://example.test",
+        technique_name="hunter_auto_sqli",
+        transport_success=True,
+        probe_executed=True,
+        signal_detected=False,
+        vulnerability_confirmed=False,
+        verdict="refuted",
+        outcome="refuted",
+    )
+
+    ranked = memory.query_technique("hunter_auto_sqli")
+    assert attempt["transport_success"] is True
+    assert attempt["probe_executed"] is True
+    assert attempt["vulnerability_confirmed"] is False
+    assert ranked["successful_attempts"] == 0
+
+
+def test_legacy_success_parameter_maps_to_confirmed_for_compatibility(
+    tmp_path,
+):
+    memory = TechniqueMemory(tmp_path / "memory.db")
+
+    attempt = memory.record_attempt(
+        target_url="https://example.test",
+        technique_name="legacy",
+        success=True,
+    )
+
+    assert attempt["success"] is True
+    assert attempt["vulnerability_confirmed"] is True
+    assert attempt["verdict"] == "verified"
+
+
+def test_target_memory_records_separated_attack_outcome(tmp_path):
+    memory = TargetMemory(tmp_path / "memory.db")
+
+    attack = memory.record_attack(
+        "https://example.test",
+        tool="hunter_auto_sqli",
+        transport_success=True,
+        probe_executed=True,
+        signal_detected=False,
+        vulnerability_confirmed=False,
+        verdict="refuted",
+        outcome="refuted",
+    )
+
+    assert attack["transport_success"] is True
+    assert attack["probe_executed"] is True
+    assert attack["signal_detected"] is False
+    assert attack["vulnerability_confirmed"] is False
+    assert attack["success"] is False
+
+
 def test_pattern_engine_matches_parameters_responses_and_stack_strategy():
     engine = PatternEngine()
 

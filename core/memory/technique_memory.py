@@ -38,6 +38,22 @@ def _json_load(value: str | None, default: Any) -> Any:
         return default
 
 
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    declaration: str,
+) -> None:
+    existing = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+    if column not in existing:
+        connection.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        )
+
+
 class TechniqueMemory:
     """Record attack attempts and rank techniques by observed effectiveness."""
 
@@ -116,6 +132,42 @@ class TechniqueMemory:
         """
         with self._connect() as connection:
             connection.executescript(schema)
+            _ensure_column(
+                connection,
+                "technique_attempts",
+                "transport_success",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "technique_attempts",
+                "probe_executed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "technique_attempts",
+                "signal_detected",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "technique_attempts",
+                "vulnerability_confirmed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "technique_attempts",
+                "verdict",
+                "TEXT NOT NULL DEFAULT 'inconclusive'",
+            )
+            _ensure_column(
+                connection,
+                "technique_attempts",
+                "outcome",
+                "TEXT NOT NULL DEFAULT 'unknown'",
+            )
 
     def register_technique(
         self,
@@ -185,7 +237,13 @@ class TechniqueMemory:
         target_url: str,
         technique_name: str,
         waf_type: str | None = None,
-        success: bool,
+        success: bool | None = None,
+        transport_success: bool = False,
+        probe_executed: bool = False,
+        signal_detected: bool = False,
+        vulnerability_confirmed: bool | None = None,
+        verdict: str = "inconclusive",
+        outcome: str = "unknown",
         attempted_at: str | None = None,
         metadata: Mapping[str, Any] | None = None,
         notes: str = "",
@@ -197,6 +255,18 @@ class TechniqueMemory:
         if not normalized_target:
             raise ValueError("target_url must not be empty")
         normalized_waf = str(waf_type or "").strip()
+        confirmed = (
+            bool(success)
+            if vulnerability_confirmed is None
+            else bool(vulnerability_confirmed)
+        )
+        normalized_verdict = str(verdict or "inconclusive").strip().lower()
+        if (
+            normalized_verdict == "inconclusive"
+            and vulnerability_confirmed is None
+            and success is not None
+        ):
+            normalized_verdict = "verified" if confirmed else "refuted"
         timestamp = attempted_at or _utc_now()
         with self._connect() as connection:
             technique_id = self._technique_id(connection, normalized_name)
@@ -204,18 +274,26 @@ class TechniqueMemory:
                 """
                 INSERT INTO technique_attempts(
                     target_url, technique_id, waf_type, success,
-                    attempted_at, metadata, notes
+                    attempted_at, metadata, notes,
+                    transport_success, probe_executed, signal_detected,
+                    vulnerability_confirmed, verdict, outcome
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized_target,
                     technique_id,
                     normalized_waf,
-                    int(bool(success)),
+                    int(confirmed),
                     timestamp,
                     _json_dump(dict(metadata or {})),
                     str(notes or ""),
+                    int(bool(transport_success)),
+                    int(bool(probe_executed)),
+                    int(bool(signal_detected)),
+                    int(confirmed),
+                    normalized_verdict,
+                    str(outcome or "unknown").strip().lower(),
                 ),
             )
             self._refresh_stat(connection, technique_id, ALL_WAF_TYPES)
@@ -244,7 +322,8 @@ class TechniqueMemory:
         if waf_type == ALL_WAF_TYPES:
             row = connection.execute(
                 """
-                SELECT COUNT(*) AS total, COALESCE(SUM(success), 0) AS successful
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(vulnerability_confirmed), 0) AS successful
                 FROM technique_attempts
                 WHERE technique_id = ?
                 """,
@@ -253,7 +332,8 @@ class TechniqueMemory:
         else:
             row = connection.execute(
                 """
-                SELECT COUNT(*) AS total, COALESCE(SUM(success), 0) AS successful
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(vulnerability_confirmed), 0) AS successful
                 FROM technique_attempts
                 WHERE technique_id = ? AND lower(waf_type) = lower(?)
                 """,
@@ -516,6 +596,14 @@ class TechniqueMemory:
             "technique_type": row["technique_type"],
             "waf_type": row["waf_type"],
             "success": bool(row["success"]),
+            "transport_success": bool(row["transport_success"]),
+            "probe_executed": bool(row["probe_executed"]),
+            "signal_detected": bool(row["signal_detected"]),
+            "vulnerability_confirmed": bool(
+                row["vulnerability_confirmed"]
+            ),
+            "verdict": row["verdict"],
+            "outcome": row["outcome"],
             "attempted_at": row["attempted_at"],
             "metadata": _json_load(row["metadata"], {}),
             "notes": row["notes"],

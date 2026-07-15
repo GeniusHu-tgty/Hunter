@@ -38,6 +38,22 @@ def _json_load(value: str | None, default: Any) -> Any:
         return default
 
 
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    declaration: str,
+) -> None:
+    existing = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+    if column not in existing:
+        connection.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        )
+
+
 def _domain_for(value: str) -> str:
     parsed = urlparse(value if "://" in value else f"//{value}")
     return (parsed.hostname or parsed.path.split("/", 1)[0]).lower()
@@ -163,6 +179,42 @@ class TargetMemory:
         """
         with self._connect() as connection:
             connection.executescript(schema)
+            _ensure_column(
+                connection,
+                "attack_history",
+                "transport_success",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "attack_history",
+                "probe_executed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "attack_history",
+                "signal_detected",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "attack_history",
+                "vulnerability_confirmed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            _ensure_column(
+                connection,
+                "attack_history",
+                "verdict",
+                "TEXT NOT NULL DEFAULT 'inconclusive'",
+            )
+            _ensure_column(
+                connection,
+                "attack_history",
+                "outcome",
+                "TEXT NOT NULL DEFAULT 'unknown'",
+            )
 
     def _ensure_target(
         self,
@@ -415,29 +467,54 @@ class TargetMemory:
         *,
         tool: str,
         payload_metadata: Mapping[str, Any] | None = None,
-        success: bool,
+        success: bool | None = None,
+        transport_success: bool = False,
+        probe_executed: bool = False,
+        signal_detected: bool = False,
+        vulnerability_confirmed: bool | None = None,
+        verdict: str = "inconclusive",
+        outcome: str = "unknown",
         bypass_strategy: str = "",
         notes: str = "",
         attempted_at: str | None = None,
     ) -> dict[str, Any]:
+        confirmed = (
+            bool(success)
+            if vulnerability_confirmed is None
+            else bool(vulnerability_confirmed)
+        )
+        normalized_verdict = str(verdict or "inconclusive").strip().lower()
+        if (
+            normalized_verdict == "inconclusive"
+            and vulnerability_confirmed is None
+            and success is not None
+        ):
+            normalized_verdict = "verified" if confirmed else "refuted"
         with self._connect() as connection:
             target_id = self._ensure_target(connection, target_url)
             cursor = connection.execute(
                 """
                 INSERT INTO attack_history(
                     target_id, attempted_at, tool, payload_metadata, success,
-                    bypass_strategy, notes
+                    bypass_strategy, notes, transport_success, probe_executed,
+                    signal_detected, vulnerability_confirmed, verdict, outcome
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     target_id,
                     attempted_at or _utc_now(),
                     str(tool).strip(),
                     _json_dump(dict(payload_metadata or {})),
-                    int(bool(success)),
+                    int(confirmed),
                     str(bypass_strategy or ""),
                     str(notes or ""),
+                    int(bool(transport_success)),
+                    int(bool(probe_executed)),
+                    int(bool(signal_detected)),
+                    int(confirmed),
+                    normalized_verdict,
+                    str(outcome or "unknown").strip().lower(),
                 ),
             )
             attack_id = int(cursor.lastrowid)
@@ -608,6 +685,14 @@ class TargetMemory:
             "tool": row["tool"],
             "payload_metadata": _json_load(row["payload_metadata"], {}),
             "success": bool(row["success"]),
+            "transport_success": bool(row["transport_success"]),
+            "probe_executed": bool(row["probe_executed"]),
+            "signal_detected": bool(row["signal_detected"]),
+            "vulnerability_confirmed": bool(
+                row["vulnerability_confirmed"]
+            ),
+            "verdict": row["verdict"],
+            "outcome": row["outcome"],
             "bypass_strategy": row["bypass_strategy"],
             "notes": row["notes"],
         }
