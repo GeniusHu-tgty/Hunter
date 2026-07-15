@@ -1,7 +1,12 @@
 {
   "contract_version": "1.0",
   "server_name": "hunter_tools",
-  "minimum_tool_count": 111,
+  "minimum_tool_count": 113,
+  "exact_core_tool_count": 113,
+  "optional_extension_namespaces": [
+    "re_"
+  ],
+  "unknown_tool_policy": "error",
   "workspace_schema_version": "1.0",
   "required_tools": [
     "hunter_scan",
@@ -17,6 +22,7 @@
     "hunter_js_extract_api",
     "hunter_js_extract_signature",
     "hunter_js_full_analysis",
+    "hunter_auto_attack",
     "hunter_auto_sqli",
     "hunter_auto_xss",
     "hunter_auto_ssrf",
@@ -70,6 +76,7 @@
     "hunter_runtime_status",
     "hunter_contract_check",
     "hunter_fast_scan",
+    "hunter_fast_recon",
     "hunter_scan_plan",
     "hunter_scan_benchmark",
     "hunter_cache_status",

@@ -4,6 +4,7 @@ import json
 import pytest
 
 import mcp_server
+from core.doctor import HunterDoctor
 
 
 def run_async(coro):
@@ -82,6 +83,13 @@ def test_new_auto_wrappers_call_real_impls(monkeypatch):
 
 
 def test_healthcheck_and_capabilities_are_local_and_structured():
+    inventory = mcp_server._registered_tool_inventory()
+    core_count = len(inventory["core"])
+    extension_count = sum(
+        len(names) for names in inventory["extensions"].values()
+    )
+    unknown_count = len(inventory["unknown"])
+
     health = load_json(run_async(mcp_server.hunter_healthcheck()))
     assert health["framework"] == "Hunter"
     assert "status" in health
@@ -89,6 +97,12 @@ def test_healthcheck_and_capabilities_are_local_and_structured():
     assert "payloads" in health
     assert "mcp_tools" in health
     assert "hunter_auto_sqli" in health["mcp_tools"]["registered"]
+    assert health["mcp_tools"]["core_count"] == core_count
+    assert health["mcp_tools"]["extension_count"] == extension_count
+    assert health["mcp_tools"]["unknown_count"] == unknown_count
+    assert health["mcp_tools"]["total_registered"] == (
+        core_count + extension_count + unknown_count
+    )
 
     capabilities = load_json(run_async(mcp_server.hunter_capabilities()))
     assert capabilities["framework"] == "Hunter"
@@ -96,6 +110,119 @@ def test_healthcheck_and_capabilities_are_local_and_structured():
     assert "tools" in capabilities
     assert capabilities["tools"]["hunter_healthcheck"]["category"] == "meta"
     assert capabilities["tools"]["hunter_auto_sqli"]["category"] == "auto-vuln"
+    assert capabilities["tool_counts"]["core"] == core_count
+    assert capabilities["tool_counts"]["extensions"] == extension_count
+    assert capabilities["tool_counts"]["unknown"] == unknown_count
+
+    runtime = load_json(run_async(mcp_server.hunter_runtime_status()))
+    assert runtime["data"]["core_tool_count"] == core_count
+    assert runtime["data"]["extension_tool_count"] == extension_count
+    assert runtime["data"]["unknown_tool_count"] == unknown_count
+
+    doctor = load_json(run_async(mcp_server.hunter_doctor()))
+    assert doctor["data"]["tool_counts"]["core"] == core_count
+    assert doctor["data"]["tool_counts"]["extensions"] == extension_count
+    assert doctor["data"]["tool_counts"]["unknown"] == unknown_count
+
+
+def write_exact_contract(tmp_path):
+    contract_path = tmp_path / "integration-contract.json"
+    contract_path.write_text(
+        json.dumps(
+            {
+                "contract_version": "1.0",
+                "server_name": "hunter_tools",
+                "minimum_tool_count": 2,
+                "exact_core_tool_count": 2,
+                "optional_extension_namespaces": ["re_"],
+                "unknown_tool_policy": "error",
+                "required_tools": [
+                    "hunter_healthcheck",
+                    "hunter_doctor",
+                ],
+                "workspace_schema_version": "1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return contract_path
+
+
+def test_doctor_extensions_are_optional_and_cannot_fill_missing_core(
+    tmp_path,
+):
+    contract_path = write_exact_contract(tmp_path)
+    without_extensions = HunterDoctor(
+        tmp_path,
+        registered_tools=["hunter_healthcheck", "hunter_doctor"],
+        contract_path=contract_path,
+        config_paths=[],
+    ).contract_check()
+    with_extensions = HunterDoctor(
+        tmp_path,
+        registered_tools=["hunter_healthcheck", "hunter_doctor"],
+        extension_tools={
+            "reverse_lab_tools": ["re_triage_pe"],
+        },
+        contract_path=contract_path,
+        config_paths=[],
+    ).contract_check()
+    missing_core = HunterDoctor(
+        tmp_path,
+        registered_tools=["hunter_healthcheck"],
+        extension_tools={
+            "reverse_lab_tools": [
+                "re_hunter_doctor",
+                "re_triage_pe",
+            ],
+        },
+        contract_path=contract_path,
+        config_paths=[],
+    ).contract_check()
+
+    assert without_extensions["status"] == "ok"
+    assert with_extensions["status"] == "ok"
+    assert with_extensions["data"]["extension_tool_count"] == 1
+    assert missing_core["status"] == "error"
+    assert missing_core["data"]["missing_core_tools"] == [
+        "hunter_doctor"
+    ]
+
+
+def test_doctor_rejects_unexpected_core_tools(tmp_path):
+    contract_path = write_exact_contract(tmp_path)
+    result = HunterDoctor(
+        tmp_path,
+        registered_tools=[
+            "hunter_healthcheck",
+            "hunter_doctor",
+            "hunter_extra",
+        ],
+        contract_path=contract_path,
+        config_paths=[],
+    ).contract_check()
+
+    assert result["status"] == "error"
+    assert result["data"]["unexpected_core_tools"] == [
+        "hunter_extra"
+    ]
+
+
+def test_doctor_reports_unknown_tools_using_contract_policy(tmp_path):
+    contract_path = write_exact_contract(tmp_path)
+    result = HunterDoctor(
+        tmp_path,
+        registered_tools=["hunter_healthcheck", "hunter_doctor"],
+        unknown_tools=["plugin_unclassified"],
+        contract_path=contract_path,
+        config_paths=[],
+    ).contract_check()
+
+    assert result["status"] == "error"
+    assert result["data"]["unknown_tool_policy"] == "error"
+    assert result["data"]["unknown_tools"] == [
+        "plugin_unclassified"
+    ]
 
 
 def test_recommend_next_prioritizes_logic_and_proof_goals():

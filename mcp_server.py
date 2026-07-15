@@ -2796,18 +2796,40 @@ def _tool_available(name: str) -> Dict[str, Any]:
     }
 
 
-def _registered_hunter_tools() -> List[str]:
+def _registered_tool_inventory() -> Dict[str, Any]:
     tool_manager = getattr(mcp, "_tool_manager", None)
     tools = getattr(tool_manager, "_tools", {})
-    return sorted(str(name) for name in tools)
+    names = sorted(str(name) for name in tools)
+    return {
+        "core": [
+            name for name in names if name.startswith("hunter_")
+        ],
+        "extensions": {
+            "reverse_lab_tools": [
+                name for name in names if name.startswith("re_")
+            ],
+        },
+        "unknown": [
+            name
+            for name in names
+            if not name.startswith(("hunter_", "re_"))
+        ],
+    }
+
+
+def _registered_hunter_tools() -> List[str]:
+    return list(_registered_tool_inventory()["core"])
 
 
 def _doctor() -> HunterDoctor:
     workspace_root = _workspace.root if _workspace and _workspace.root else None
+    inventory = _registered_tool_inventory()
     return HunterDoctor(
         HUNTER_DIR,
-        registered_tools=_registered_hunter_tools(),
+        registered_tools=inventory["core"],
         workspace_root=workspace_root,
+        extension_tools=inventory["extensions"],
+        unknown_tools=inventory["unknown"],
     )
 
 
@@ -2860,6 +2882,7 @@ async def hunter_healthcheck() -> str:
     """Check Hunter MCP, payload inventory, wordlists, and external tool availability locally."""
     required_mcp = [
         "hunter_scan", "hunter_recon", "hunter_vuln_scan",
+        "hunter_auto_attack",
         "hunter_auto_sqli", "hunter_auto_xss", "hunter_auto_ssrf", "hunter_auto_ssti",
         "hunter_auto_cmd", "hunter_auto_xxe", "hunter_auto_idor", "hunter_auto_csrf",
         "hunter_auto_cors", "hunter_auto_jwt", "hunter_auto_graphql", "hunter_auto_websocket",
@@ -2883,8 +2906,23 @@ async def hunter_healthcheck() -> str:
         "hunter_reverse_extract_iocs", "hunter_reverse_generate_rules",
         "hunter_reverse_decrypt_plan",
     ]
-    registered = _registered_hunter_tools()
-    missing_mcp = [name for name in required_mcp if name not in registered]
+    inventory = _registered_tool_inventory()
+    registered_core = inventory["core"]
+    extension_count = sum(
+        len(names) for names in inventory["extensions"].values()
+    )
+    all_registered = sorted(
+        registered_core
+        + [
+            name
+            for names in inventory["extensions"].values()
+            for name in names
+        ]
+        + inventory["unknown"]
+    )
+    missing_mcp = [
+        name for name in required_mcp if name not in registered_core
+    ]
     external_names = [
         "nuclei", "subfinder", "naabu", "httpx", "ffuf", "katana", "gau",
         "dalfox", "sqlmap", "wafw00f", "whatweb", "getjs",
@@ -2906,10 +2944,16 @@ async def hunter_healthcheck() -> str:
         "status": "degraded" if degraded else "ok",
         "base_dir": str(HUNTER_DIR),
         "mcp_tools": {
-            "registered": registered,
+            "registered": all_registered,
+            "core": registered_core,
+            "extensions": inventory["extensions"],
+            "unknown": inventory["unknown"],
             "required": required_mcp,
             "missing": missing_mcp,
-            "total_registered": len(registered),
+            "core_count": len(registered_core),
+            "extension_count": extension_count,
+            "unknown_count": len(inventory["unknown"]),
+            "total_registered": len(all_registered),
         },
         "external_tools": external,
         "wordlists": wordlists,
@@ -2928,7 +2972,11 @@ async def hunter_healthcheck() -> str:
 @mcp.tool()
 async def hunter_capabilities() -> str:
     """Return the actual Hunter MCP capability matrix for agent-side routing."""
-    registered = set(_registered_hunter_tools())
+    inventory = _registered_tool_inventory()
+    registered = set(inventory["core"])
+    extension_count = sum(
+        len(names) for names in inventory["extensions"].values()
+    )
     definitions = {
         "hunter_workflow_create": ("workflow", "Create workflow-state-v2 case"),
         "hunter_workflow_open": ("workflow", "Open materialized workflow state"),
@@ -2993,6 +3041,7 @@ async def hunter_capabilities() -> str:
         "hunter_auto_race": ("auto-vuln", "Race-condition checks"),
         "hunter_auto_access_control": ("auto-vuln", "Access-control checks"),
         "hunter_unified_scan": ("orchestration", "Selected multi-phase scan"),
+        "hunter_auto_attack": ("orchestration", "Run adaptive proof-oriented attack orchestration"),
         "hunter_auto_pentest": ("orchestration", "Run the bounded seven-stage unified pentest orchestrator"),
         "hunter_memory_query": ("memory", "Query target history, technique statistics, or patterns"),
         "hunter_memory_record": ("memory", "Record target, attack, finding, or technique observations"),
@@ -3049,6 +3098,18 @@ async def hunter_capabilities() -> str:
         "framework": "Hunter",
         "version": "v8-hardening",
         "tools": tools,
+        "tool_counts": {
+            "core": len(inventory["core"]),
+            "extensions": extension_count,
+            "unknown": len(inventory["unknown"]),
+            "total": (
+                len(inventory["core"])
+                + extension_count
+                + len(inventory["unknown"])
+            ),
+        },
+        "extensions": inventory["extensions"],
+        "unknown_tools": inventory["unknown"],
         "payloads": _payload_inventory(),
         "hunter_tools": _hunter_tools.capabilities().get("data", {}),
         "workspace": _workspace.health().get("data", {}),

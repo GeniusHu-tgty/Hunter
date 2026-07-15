@@ -18,10 +18,43 @@ def test_complete_server_is_named_hunter_tools():
 
 
 def test_fastmcp_registry_matches_hunter_tool_functions():
+    inventory_factory = getattr(
+        mcp_server,
+        "_registered_tool_inventory",
+        None,
+    )
+    assert callable(inventory_factory)
+    inventory = inventory_factory()
     registry = set(mcp_server.mcp._tool_manager._tools)
     functions = registered_functions(mcp_server)
-    assert registry == functions
-    assert len(registry) == 113
+    extension_names = set(
+        inventory["extensions"]["reverse_lab_tools"]
+    )
+    assert inventory["unknown"] == []
+    assert registry == functions | extension_names
+    assert len(functions) == 113
+
+
+def test_registered_tool_inventory_separates_core_and_extensions():
+    inventory_factory = getattr(
+        mcp_server,
+        "_registered_tool_inventory",
+        None,
+    )
+    assert callable(inventory_factory)
+    inventory = inventory_factory()
+    functions = registered_functions(mcp_server)
+    core = set(inventory["core"])
+    extensions = set(
+        inventory["extensions"]["reverse_lab_tools"]
+    )
+
+    assert core == functions
+    assert all(name.startswith("re_") for name in extensions)
+    assert core.isdisjoint(extensions)
+    assert inventory["unknown"] == []
+    assert len(core) == 113
+    assert set(mcp_server._registered_hunter_tools()) == core
 
 
 def test_internal_tool_inventory_uses_fastmcp_registry(monkeypatch):
@@ -36,6 +69,23 @@ def test_internal_tool_inventory_uses_fastmcp_registry(monkeypatch):
         "hunter_unregistered_probe"
         not in mcp_server._registered_hunter_tools()
     )
+
+
+def test_integration_contract_exactly_matches_core_tools():
+    contract = json.loads(
+        (Path(__file__).parents[1] / "integration-contract.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    functions = registered_functions(mcp_server)
+
+    assert set(contract["required_tools"]) == functions
+    assert len(contract["required_tools"]) == 113
+    assert contract["minimum_tool_count"] == 113
+    assert contract["exact_core_tool_count"] == 113
+    assert contract["optional_extension_namespaces"] == ["re_"]
+    assert "hunter_auto_attack" in contract["required_tools"]
+    assert "hunter_fast_recon" in contract["required_tools"]
 
 
 def test_complete_server_exposes_all_legacy_and_v81_tools():

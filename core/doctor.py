@@ -6,7 +6,7 @@ import os
 import platform
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 CONTRACT_FILENAME = "integration-contract.json"
 
@@ -28,6 +28,39 @@ def load_integration_contract(path: str | Path) -> dict[str, Any]:
         raise ValueError("Contract required_tools must be a string list")
     if not isinstance(data["minimum_tool_count"], int) or data["minimum_tool_count"] < 1:
         raise ValueError("Contract minimum_tool_count must be a positive integer")
+    exact_core_tool_count = data.get(
+        "exact_core_tool_count",
+        data["minimum_tool_count"],
+    )
+    if (
+        not isinstance(exact_core_tool_count, int)
+        or exact_core_tool_count < 1
+    ):
+        raise ValueError(
+            "Contract exact_core_tool_count must be a positive integer"
+        )
+    optional_namespaces = data.get(
+        "optional_extension_namespaces",
+        [],
+    )
+    if (
+        not isinstance(optional_namespaces, list)
+        or not all(
+            isinstance(namespace, str) and namespace
+            for namespace in optional_namespaces
+        )
+    ):
+        raise ValueError(
+            "Contract optional_extension_namespaces must be a string list"
+        )
+    unknown_tool_policy = data.get("unknown_tool_policy", "error")
+    if unknown_tool_policy not in {"error", "warning"}:
+        raise ValueError(
+            "Contract unknown_tool_policy must be error or warning"
+        )
+    data["exact_core_tool_count"] = exact_core_tool_count
+    data["optional_extension_namespaces"] = optional_namespaces
+    data["unknown_tool_policy"] = unknown_tool_policy
     return data
 
 
@@ -39,12 +72,36 @@ class HunterDoctor:
         contract_path: Optional[str | Path] = None,
         config_paths: Optional[Iterable[str | Path]] = None,
         workspace_root: Optional[str | Path] = None,
+        extension_tools: Optional[
+            Mapping[str, Iterable[str]]
+        ] = None,
+        unknown_tools: Optional[Iterable[str]] = None,
     ) -> None:
         self.hunter_dir = Path(hunter_dir).expanduser().resolve()
         self.registered_tools = sorted(set(registered_tools))
+        self.extension_tools = {
+            source: sorted(set(names))
+            for source, names in (extension_tools or {}).items()
+        }
+        self.unknown_tools = sorted(set(unknown_tools or []))
         self.contract_path = Path(contract_path or self.hunter_dir / CONTRACT_FILENAME).expanduser().resolve()
         self.workspace_root = Path(workspace_root).expanduser().resolve() if workspace_root else None
         self.config_paths = [Path(p).expanduser().resolve() for p in config_paths] if config_paths is not None else self.discover_config_paths()
+
+    def _tool_counts(self) -> dict[str, int]:
+        extension_count = sum(
+            len(names) for names in self.extension_tools.values()
+        )
+        return {
+            "core": len(self.registered_tools),
+            "extensions": extension_count,
+            "unknown": len(self.unknown_tools),
+            "total": (
+                len(self.registered_tools)
+                + extension_count
+                + len(self.unknown_tools)
+            ),
+        }
 
     def discover_config_paths(self) -> list[Path]:
         candidates: list[Path] = []
@@ -62,16 +119,69 @@ class HunterDoctor:
     def contract_check(self) -> dict[str, Any]:
         try:
             contract = load_integration_contract(self.contract_path)
-            missing = sorted(set(contract["required_tools"]) - set(self.registered_tools))
-            count_ok = len(self.registered_tools) >= contract["minimum_tool_count"]
+            required_core = set(contract["required_tools"])
+            registered_core = set(self.registered_tools)
+            missing = sorted(required_core - registered_core)
+            unexpected = sorted(registered_core - required_core)
+            minimum_count_ok = (
+                len(registered_core) >= contract["minimum_tool_count"]
+            )
+            exact_count_ok = (
+                len(registered_core)
+                == contract["exact_core_tool_count"]
+            )
+            declared_namespaces = tuple(
+                contract["optional_extension_namespaces"]
+            )
+            invalid_extensions = sorted(
+                name
+                for names in self.extension_tools.values()
+                for name in names
+                if not declared_namespaces
+                or not name.startswith(declared_namespaces)
+            )
+            unknown_tools = sorted(
+                set(self.unknown_tools) | set(invalid_extensions)
+            )
+            unknown_is_error = (
+                bool(unknown_tools)
+                and contract["unknown_tool_policy"] == "error"
+            )
+            tool_counts = self._tool_counts()
             data = {
                 **contract,
                 "path": str(self.contract_path),
-                "registered_tool_count": len(self.registered_tools),
+                "registered_tool_count": tool_counts["total"],
+                "registered_core_tool_count": tool_counts["core"],
+                "extension_tool_count": tool_counts["extensions"],
+                "unknown_tool_count": len(unknown_tools),
                 "missing_tools": missing,
-                "minimum_tool_count_satisfied": count_ok,
+                "missing_core_tools": missing,
+                "unexpected_core_tools": unexpected,
+                "extension_tools": self.extension_tools,
+                "invalid_extension_tools": invalid_extensions,
+                "unknown_tools": unknown_tools,
+                "minimum_tool_count_satisfied": minimum_count_ok,
+                "exact_core_tool_count_satisfied": exact_count_ok,
+                "warnings": (
+                    [f"Unknown registered tools: {', '.join(unknown_tools)}"]
+                    if unknown_tools
+                    and contract["unknown_tool_policy"] == "warning"
+                    else []
+                ),
             }
-            return _result("hunter_contract_check", "ok" if not missing and count_ok else "error", data)
+            valid = (
+                not missing
+                and not unexpected
+                and minimum_count_ok
+                and exact_count_ok
+                and not unknown_is_error
+            )
+            return _result(
+                "hunter_contract_check",
+                "ok" if valid else "error",
+                data,
+            )
         except Exception as exc:
             return _result("hunter_contract_check", "error", {"path": str(self.contract_path), "error": str(exc)})
 
@@ -121,6 +231,7 @@ class HunterDoctor:
             contract = load_integration_contract(self.contract_path)
         except Exception:
             pass
+        tool_counts = self._tool_counts()
         return _result("hunter_runtime_status", "ok", {
             "server_name": (contract or {}).get("server_name", "hunter_tools"),
             "pid": os.getpid(),
@@ -131,7 +242,15 @@ class HunterDoctor:
             "cwd": str(Path.cwd().resolve()),
             "hunter_dir": str(self.hunter_dir),
             "workspace_root": str(self.workspace_root) if self.workspace_root else None,
-            "registered_tool_count": len(self.registered_tools),
+            "registered_tool_count": tool_counts["total"],
+            "core_tool_count": tool_counts["core"],
+            "extension_tool_count": tool_counts["extensions"],
+            "extension_tool_counts": {
+                source: len(names)
+                for source, names in self.extension_tools.items()
+            },
+            "unknown_tool_count": tool_counts["unknown"],
+            "unknown_tools": self.unknown_tools,
             "environment": {name: os.environ.get(name) for name in ("CODEX_HOME", "OPEN_TGTYLAB_ROOT", "OPEN_TGTYLAB_WORKSPACE", "TGTYLAB_ROOT") if os.environ.get(name)},
         })
 
@@ -142,4 +261,11 @@ class HunterDoctor:
             "runtime": self.runtime_status(),
         }
         status = "ok" if all(item["status"] == "ok" for item in checks.values()) else "degraded"
-        return _result("hunter_doctor", status, {"checks": checks})
+        return _result(
+            "hunter_doctor",
+            status,
+            {
+                "tool_counts": self._tool_counts(),
+                "checks": checks,
+            },
+        )
