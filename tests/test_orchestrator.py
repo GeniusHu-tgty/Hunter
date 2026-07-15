@@ -389,8 +389,37 @@ def test_default_high_impact_confirmation_is_required_in_autopilot(tmp_path):
         ["web"],
         orchestrator._profile("standard"),
     )
-    context["observations"] = {
-        "responses": ["uid=1000(www-data) gid=1000(www-data)"]
+    context["stage_results"]["attack_execution"] = {
+        "attempts": [
+            {
+                "action_id": "act-rce",
+                "tool": "hunter_auto_cmd",
+                "attack_surface": "rce",
+                "target": "https://example.test/exec",
+                "response": {
+                    "data": {
+                        "evidence": {
+                            "request": {
+                                "url": "https://example.test/exec",
+                            },
+                            "response": {
+                                "status_code": 200,
+                                "body": (
+                                    "uid=1000(www-data) "
+                                    "gid=1000(www-data)"
+                                ),
+                            },
+                            "baseline_response": {
+                                "status_code": 200,
+                                "body": "normal",
+                            },
+                            "payload": "id",
+                            "reproduction_count": 3,
+                        }
+                    }
+                },
+            }
+        ]
     }
 
     result = orchestrator._stage_confirmation(context)
@@ -1234,7 +1263,7 @@ def test_dynamic_form_browser_failure_keeps_deferred_navigation_fallback():
     )
 
 
-def test_confirmation_uses_response_patterns_to_flag_false_positives(
+def test_confirmation_requires_normalized_proof_and_flags_false_positives(
     tmp_path,
 ):
     kernel = WorkflowKernel(tmp_path)
@@ -1246,14 +1275,40 @@ def test_confirmation_uses_response_patterns_to_flag_false_positives(
         ["web"],
         orchestrator._profile("standard"),
     )
+    context["stage_results"]["attack_execution"] = {
+        "attempts": [
+            {
+                "action_id": "act-sqli",
+                "tool": "hunter_auto_sqli",
+                "attack_surface": "sqli",
+                "target": "https://example.test/?id=1",
+                "session_id": "session-sqli",
+                "response": {
+                    "data": {
+                        "evidence": {
+                            "request": {
+                                "url": "https://example.test/?id=1'",
+                            },
+                            "response": {
+                                "status_code": 500,
+                                "body": (
+                                    "You have an error in your SQL syntax"
+                                ),
+                            },
+                            "baseline_response": {
+                                "status_code": 200,
+                                "body": "normal application response",
+                            },
+                            "payload": "'",
+                            "reproduction_count": 3,
+                        }
+                    }
+                },
+            }
+        ]
+    }
     context["observations"] = {
         "responses": [
-            {
-                "body": "You have an error in your SQL syntax",
-                "vulnerability_type": "sqli",
-                "vulnerable": True,
-                "session_id": "session-sqli",
-            },
             {
                 "body": "normal application response",
                 "vulnerability_type": "xss",

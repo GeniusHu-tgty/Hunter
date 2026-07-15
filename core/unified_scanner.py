@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qs, urljoin, urlparse
 
+from core.evidence.normalizer import EvidenceNormalizer
+from core.evidence.verdict_engine import VerdictEngine
 from core.reasoning.attack_reasoning import AttackReasoner
 from core.workflow.action_planner import ActionPlanner
 from core.workflow.models import ActionOutcome
@@ -2957,86 +2959,115 @@ class UnifiedOrchestrationBridge:
         self,
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
-        findings = []
-        false_positives = []
-        for raw_response in self._response_records(context):
-            record = (
-                dict(raw_response)
-                if isinstance(raw_response, Mapping)
-                else {"body": raw_response}
-            )
-            for key in ("body", "text", "content", "response"):
-                if key in record and record[key] is not None:
-                    record[key] = str(record[key]).casefold()
-            match = self._pattern_engine().match_response(record)
-            claimed = str(
-                record.get("vulnerability_type")
-                or record.get("type")
-                or ""
-            ).strip().casefold()
-            if claimed == "cmdi":
-                claimed = "command_injection"
-            matched = str(match.get("vulnerability_type") or "").casefold()
-            reported = bool(
-                record.get("vulnerable")
-                or record.get("reported_vulnerable")
-                or claimed
-            )
-            explicitly_confirmed = bool(
-                record.get("confirmed")
-                or str(record.get("status", "")).casefold() == "confirmed"
-            )
-            if matched and (not claimed or matched == claimed):
+        normalizer = self._service(
+            "evidence_normalizer",
+            EvidenceNormalizer,
+        )
+        verdict_engine = self._service(
+            "verdict_engine",
+            VerdictEngine,
+        )
+        attempts = (
+            context.get("stage_results", {})
+            .get("attack_execution", {})
+            .get("attempts", [])
+        )
+        verdicts: list[dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
+        pending_review: list[dict[str, Any]] = []
+        false_positives: list[dict[str, Any]] = []
+        for attempt in attempts:
+            if not isinstance(attempt, Mapping):
+                continue
+            vuln_type, evidence = normalizer.normalize_attempt(attempt)
+            if vuln_type is None:
+                continue
+            verdict = verdict_engine.assess(vuln_type, evidence)
+            action_id = str(attempt.get("action_id") or "")
+            verdict_record = {
+                **verdict.to_dict(),
+                "verdict_id": f"verdict-{action_id}",
+                "action_id": action_id,
+                "evidence_key": f"evidence-{action_id}",
+                "tool": str(attempt.get("tool") or ""),
+                "target": str(attempt.get("target") or ""),
+            }
+            verdicts.append(verdict_record)
+            if verdict.verified:
                 findings.append(
                     {
-                        "title": f"{matched} response pattern",
-                        "type": matched,
-                        "severity": (
-                            "high"
-                            if float(match.get("confidence", 0)) >= 0.9
-                            else "medium"
+                        "title": f"Verified {vuln_type.value}",
+                        "type": vuln_type.value,
+                        "severity": str(
+                            attempt.get("severity")
+                            or (
+                                "high"
+                                if vuln_type.value
+                                in {"sqli", "rce", "auth_bypass"}
+                                else "medium"
+                            )
                         ),
                         "status": "confirmed",
-                        "confidence": match.get("confidence", 0),
-                        "evidence": match.get("evidence", []),
-                        "session_id": record.get("session_id", ""),
-                    }
-                )
-                continue
-            if explicitly_confirmed and claimed:
-                findings.append(
-                    {
-                        "title": str(
-                            record.get("title")
-                            or f"{claimed} confirmed finding"
+                        "confidence": 1.0,
+                        "verdict": verdict.verdict.value,
+                        "verdict_id": verdict_record["verdict_id"],
+                        "evidence_keys": [
+                            verdict_record["evidence_key"]
+                        ],
+                        "proof_type": "verdict-engine",
+                        "session_id": str(
+                            attempt.get("session_id") or ""
                         ),
-                        "type": claimed,
-                        "severity": str(record.get("severity") or "high"),
-                        "status": "confirmed",
-                        "confidence": float(record.get("confidence") or 1.0),
-                        "evidence": list(record.get("evidence") or []),
-                        "session_id": record.get("session_id", ""),
                     }
                 )
-                continue
-            if reported:
+            elif verdict.verdict.value == "likely":
+                pending_review.append(verdict_record)
+            else:
                 false_positives.append(
                     {
-                        "title": str(
-                            record.get("title")
-                            or f"{claimed or 'reported finding'} lacks response confirmation"
+                        **verdict_record,
+                        "title": (
+                            f"{vuln_type.value} candidate was not verified"
                         ),
-                        "type": claimed or matched or "unknown",
+                        "type": vuln_type.value,
                         "status": "probable_false_positive",
-                        "reason": (
-                            "response fingerprint did not match the reported vulnerability"
-                            if not matched
-                            else f"response matched {matched}, not {claimed}"
+                    }
+                )
+        for raw_response in context.get("observations", {}).get(
+            "responses",
+            [],
+        ):
+            if not isinstance(raw_response, Mapping):
+                continue
+            claimed = str(
+                raw_response.get("vulnerability_type")
+                or raw_response.get("type")
+                or ""
+            ).strip().casefold()
+            if (
+                raw_response.get("vulnerable")
+                or raw_response.get("reported_vulnerable")
+                or claimed
+            ):
+                false_positives.append(
+                    {
+                        "title": (
+                            f"{claimed or 'reported'} candidate lacks "
+                            "normalized proof evidence"
                         ),
-                        "response_fingerprint": match,
+                        "type": claimed or "unknown",
+                        "status": "probable_false_positive",
+                        "verdict": "inconclusive",
+                        "reason": (
+                            "request, response, baseline, payload, and "
+                            "reproduction evidence are required"
+                        ),
                     }
                 )
         findings = _unique(findings)
+        verdicts = _unique(verdicts)
+        pending_review = _unique(pending_review)
+        false_positives = _unique(false_positives)
         post_exploitation_handoffs = [
             {
                 "tool": "hunter_post_exploit",
@@ -3061,7 +3092,10 @@ class UnifiedOrchestrationBridge:
             if handoff["requires_confirmation"]
         ]
         result = {
+            "status": "completed",
+            "verdicts": verdicts,
             "findings": findings,
+            "pending_review": pending_review,
             "false_positives": false_positives,
             "post_exploitation_handoffs": post_exploitation_handoffs,
         }
