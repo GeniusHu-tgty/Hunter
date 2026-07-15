@@ -2193,7 +2193,7 @@ def test_scan_plan_strategy_handoffs_use_supported_schema_only():
     )
 
 
-def test_explicit_strategy_stays_deferred_with_live_session():
+def test_explicit_strategy_executes_with_injected_executor():
     calls = []
 
     def execute_chain(**arguments):
@@ -2231,7 +2231,7 @@ def test_explicit_strategy_stays_deferred_with_live_session():
         {
             "target_url": "https://example.test",
             "session_id": "session-live",
-            "profile": {"name": "standard"},
+            "profile": {"name": "standard", "mode": "guided"},
             "target_profile": {"fingerprints": {}},
             "attack_queue": [
                 {
@@ -2248,9 +2248,62 @@ def test_explicit_strategy_stays_deferred_with_live_session():
         }
     )
 
-    assert calls == []
-    assert result["status"] == "deferred"
-    assert result["handoffs"][0]["tool"] == "hunter_session_execute_chain"
+    assert len(calls) == 1
+    assert result["attempts"][0]["tool"] == "hunter_session_execute_chain"
+    assert all(
+        item["tool"] != "hunter_session_execute_chain"
+        for item in result["handoffs"]
+    )
+
+
+def test_explicit_strategy_is_deferred_without_executor():
+    class FakePatternEngine:
+        @staticmethod
+        def match_parameter(parameter, context=""):
+            return {"parameter": parameter, "vulnerability_types": []}
+
+    class EmptyTechniqueMemory:
+        @staticmethod
+        def best_for_waf(waf_type, limit=5):
+            return []
+
+    class EmptyTargetMemory:
+        @staticmethod
+        def query_target(target):
+            return {"attack_history": []}
+
+        @staticmethod
+        def similar_targets(target, limit=5):
+            return []
+
+    bridge = core.unified_scanner.UnifiedOrchestrationBridge(
+        {
+            "pattern_engine": FakePatternEngine(),
+            "technique_memory": EmptyTechniqueMemory(),
+            "target_memory": EmptyTargetMemory(),
+        }
+    )
+    result = bridge.stage_attack_execution(
+        {
+            "target_url": "https://example.test",
+            "profile": {"name": "standard", "mode": "guided"},
+            "target_profile": {"fingerprints": {}},
+            "attack_queue": [
+                {
+                    "kind": "authentication",
+                    "target": "https://example.test/login",
+                    "tool": "hunter_session_execute_chain",
+                    "tool_args": {
+                        "chain_name": "login_to_admin",
+                        "endpoint": "/login",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert result["attempts"] == []
+    assert result["handoffs"][0]["reason"] == "executor_unavailable"
 
 
 def test_attack_execution_merges_reasoned_strategies_and_deduplicates_ids():

@@ -2378,10 +2378,22 @@ class UnifiedOrchestrationBridge:
         browser = None
         browser_operations: list[dict[str, Any]] = []
         browser_evidence: list[dict[str, Any]] = []
+        explicit_tools = {
+            "hunter_auto_access_control",
+            "hunter_auto_idor",
+            "hunter_auto_sqli",
+            "hunter_auto_ssrf",
+            "hunter_auto_xss",
+            "hunter_auto_csrf",
+            "hunter_auto_jwt",
+            "hunter_browser_navigate",
+            "hunter_scan_plan",
+            "hunter_session_execute_chain",
+        }
         has_injected_executor = bool(
             self.services.get("auto_tool_runner")
             or any(
-                str(name).startswith("hunter_auto_")
+                str(name) in explicit_tools
                 for name in self.services
             )
         )
@@ -2401,18 +2413,6 @@ class UnifiedOrchestrationBridge:
                 and executable_session
             )
         )
-        explicit_tools = {
-            "hunter_auto_access_control",
-            "hunter_auto_idor",
-            "hunter_auto_sqli",
-            "hunter_auto_ssrf",
-            "hunter_auto_xss",
-            "hunter_auto_csrf",
-            "hunter_auto_jwt",
-            "hunter_browser_navigate",
-            "hunter_scan_plan",
-            "hunter_session_execute_chain",
-        }
         base_target = str(context["target_url"])
         completed_attacks = context.get("completed_attacks", set())
         if not isinstance(completed_attacks, set):
@@ -2616,6 +2616,22 @@ class UnifiedOrchestrationBridge:
             elif session_id:
                 arguments["session_id"] = session_id
             attempt = {
+                "action_id": str(
+                    item.get("action_id")
+                    or item.get("reasoning_action_id")
+                    or hashlib.sha256(
+                        json.dumps(
+                            {
+                                "tool": tool,
+                                "target": target,
+                                "arguments": arguments,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        ).encode()
+                    ).hexdigest()[:16]
+                ),
+                "strategy_id": str(item.get("strategy_id") or ""),
                 "tool": tool,
                 "technique": tool,
                 "target": target,
@@ -2625,7 +2641,14 @@ class UnifiedOrchestrationBridge:
                 "preflight": preflight,
                 "arguments": dict(arguments),
             }
-            if executed and not explicit_tool:
+            execution_allowed = (
+                executed
+                and (
+                    not explicit_tool
+                    or execution_mode in {"guided", "autopilot"}
+                )
+            )
+            if execution_allowed:
                 result = self._invoke_tool(tool, arguments)
                 payload = self._result_payload(result)
                 auto_details = (
@@ -2721,10 +2744,16 @@ class UnifiedOrchestrationBridge:
                     item["status"] = "completed"
                 completed_attacks.add(current_attack)
             else:
+                reason = (
+                    "executor_unavailable"
+                    if not executed
+                    else "policy_requires_guided_or_autopilot"
+                )
                 handoffs.append({
                     "tool": tool,
                     "execution": "deferred",
                     "status": "proposed",
+                    "reason": reason,
                     "target": target,
                     "attack_surface": kind,
                     "http_transport": "stealth_http_client",
