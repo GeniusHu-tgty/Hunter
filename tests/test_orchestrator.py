@@ -83,7 +83,19 @@ def _adapters(calls, pause_once=False):
         "attack_execution": adapter(
             "attack_execution",
             {
-                "attempts": [{"technique": "case-variation", "success": True}],
+                "attempts": [
+                    {
+                        "action_id": "act-sqli",
+                        "technique": "case-variation",
+                        "tool": "hunter_auto_sqli",
+                        "attack_surface": "sqli",
+                        "transport_success": True,
+                        "probe_executed": True,
+                        "signal_detected": True,
+                        "vulnerability_confirmed": False,
+                        "success": False,
+                    }
+                ],
                 "handoffs": [{"execution": "deferred", "tool": "hunter_auto_sqli"}],
             },
         ),
@@ -93,17 +105,35 @@ def _adapters(calls, pause_once=False):
                 "findings": [
                     {
                         "title": "SQL injection",
+                        "type": "sqli",
                         "status": "confirmed",
                         "severity": "high",
+                        "verdict": "verified",
+                        "verdict_id": "verdict-act-sqli",
+                        "evidence_keys": ["evidence-act-sqli"],
+                        "proof_type": "verdict-engine",
                         "satisfies": ["confirmed-finding"],
                     }
-                ]
+                ],
+                "verdicts": [
+                    {
+                        "action_id": "act-sqli",
+                        "verdict": "verified",
+                        "verdict_id": "verdict-act-sqli",
+                        "evidence_key": "evidence-act-sqli",
+                    }
+                ],
             },
         ),
         "evidence_learning": adapter(
             "evidence_learning",
             {
-                "evidence": [{"summary": "request-response pair"}],
+                "evidence": [
+                    {
+                        "evidence_key": "evidence-act-sqli",
+                        "summary": "request-response pair",
+                    }
+                ],
                 "learning_updates": [{"technique": "case-variation", "success": True}],
             },
         ),
@@ -1424,27 +1454,102 @@ def test_evidence_learning_persists_stack_attempts_and_confirmed_findings(
         "attack_execution": {
             "attempts": [
                 {
+                    "action_id": "act-case",
+                    "tool": "hunter_auto_sqli",
+                    "attack_surface": "sqli",
                     "technique": "case-variation",
-                    "success": True,
                     "target": "https://example.test/api/users",
+                    "transport_success": True,
+                    "probe_executed": True,
+                    "signal_detected": True,
+                    "vulnerability_confirmed": False,
+                    "success": False,
+                    "response": {
+                        "data": {
+                            "evidence": {
+                                "request": {
+                                    "url": (
+                                        "https://example.test/api/users"
+                                    )
+                                },
+                                "response": {
+                                    "status_code": 500,
+                                    "body": (
+                                        "You have an error in your SQL syntax"
+                                    ),
+                                },
+                                "baseline_response": {
+                                    "status_code": 200,
+                                    "body": "normal",
+                                },
+                                "payload": "'",
+                                "reproduction_count": 3,
+                            }
+                        }
+                    },
                 },
                 {
+                    "action_id": "act-plain",
+                    "tool": "hunter_auto_sqli",
+                    "attack_surface": "sqli",
                     "technique": "plain-payload",
                     "success": False,
                     "target": "https://example.test/api/users",
+                    "transport_success": True,
+                    "probe_executed": True,
+                    "signal_detected": False,
+                    "vulnerability_confirmed": False,
+                    "response": {
+                        "data": {
+                            "evidence": {
+                                "request": {
+                                    "url": (
+                                        "https://example.test/api/users"
+                                    )
+                                },
+                                "response": {
+                                    "status_code": 200,
+                                    "body": "normal",
+                                },
+                                "baseline_response": {
+                                    "status_code": 200,
+                                    "body": "normal",
+                                },
+                                "payload": "'",
+                                "reproduction_count": 3,
+                            }
+                        }
+                    },
                 },
             ],
             "handoffs": [],
         },
-        "vulnerability_confirmation": {
-            "findings": [
-                {
+            "vulnerability_confirmation": {
+                "verdicts": [
+                    {
+                        "action_id": "act-case",
+                        "verdict": "verified",
+                        "verdict_id": "verdict-act-case",
+                        "evidence_key": "evidence-act-case",
+                    },
+                    {
+                        "action_id": "act-plain",
+                        "verdict": "refuted",
+                        "verdict_id": "verdict-act-plain",
+                        "evidence_key": "evidence-act-plain",
+                    },
+                ],
+                "findings": [
+                    {
                     "title": "SQL injection",
                     "type": "sqli",
-                    "severity": "high",
-                    "status": "confirmed",
-                }
-            ]
+                        "severity": "high",
+                        "status": "confirmed",
+                        "verdict": "verified",
+                        "verdict_id": "verdict-act-case",
+                        "evidence_keys": ["evidence-act-case"],
+                    }
+                ]
         },
     }
 
@@ -1453,7 +1558,10 @@ def test_evidence_learning_persists_stack_attempts_and_confirmed_findings(
     assert target_memory.targets[0][2]["framework"] == "React"
     assert len(target_memory.fingerprints) == 1
     assert target_memory.endpoints[0][1].endswith("/api/users")
-    assert [item[1]["success"] for item in target_memory.attacks] == [
+    assert [
+        item[1]["vulnerability_confirmed"]
+        for item in target_memory.attacks
+    ] == [
         True,
         False,
     ]
@@ -1463,8 +1571,18 @@ def test_evidence_learning_persists_stack_attempts_and_confirmed_findings(
     } == {"https://example.test/api/users"}
     assert target_memory.vulnerabilities[0][1]["vuln_type"] == "sqli"
     assert result["learning_updates"] == [
-        {"technique": "case-variation", "success": True},
-        {"technique": "plain-payload", "success": False},
+        {
+            "technique": "case-variation",
+            "success": True,
+            "verdict": "verified",
+            "action_id": "act-case",
+        },
+        {
+            "technique": "plain-payload",
+            "success": False,
+            "verdict": "refuted",
+            "action_id": "act-plain",
+        },
     ]
 
 

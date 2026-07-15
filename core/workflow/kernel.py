@@ -383,7 +383,7 @@ class WorkflowKernel:
             if dedupe_key:
                 item["dedupe_key"] = dedupe_key
             return {"evidence":item,"state":self._append(slug,"evidence.registered",{"evidence":item}),"deduplicated":False}
-    def promote_finding(self, slug, title, status, evidence_ids, severity="Info", satisfies=None, proof_type="", dedupe_key=""):
+    def promote_finding(self, slug, title, status, evidence_ids, severity="Info", satisfies=None, proof_type="", dedupe_key="", verdict_id="", verdict="", finding_type=""):
         with self._lock(slug):
             state = self.materialize(slug)
             if dedupe_key:
@@ -404,6 +404,12 @@ class WorkflowKernel:
             valid={x["id"] for x in state["evidence"]}
             if status in {"reproduced","confirmed","reported"} and (not evidence_ids or not set(evidence_ids)<=valid): raise ValueError("valid evidence is required")
             item={"id":ident("finding"),"title":title,"severity":severity,"status":status,"evidence_ids":evidence_ids,"satisfies":satisfies or [],"proof_type":proof_type,"created_at":now()}
+            if verdict_id:
+                item["verdict_id"] = verdict_id
+            if verdict:
+                item["verdict"] = verdict
+            if finding_type:
+                item["type"] = finding_type
             if dedupe_key:
                 item["dedupe_key"] = dedupe_key
             return {"finding":item,"state":self._append(slug,"finding.promoted",{"finding":item}),"deduplicated":False}
@@ -1140,7 +1146,7 @@ class UnifiedOrchestrator:
             if evidence_result is not None
             else stage_results.get("evidence_learning", {}).get("evidence", [])
         )
-        evidence_ids = []
+        evidence_key_to_id = {}
         for index, item in enumerate(evidence_items):
             if not isinstance(item, Mapping):
                 item = {"summary": str(item)}
@@ -1167,25 +1173,24 @@ class UnifiedOrchestrator:
                 sha256=str(item.get("sha256", "")),
                 dedupe_key=dedupe_key,
             )
-            evidence_ids.append(registered["evidence"]["id"])
+            evidence_key = str(item.get("evidence_key") or "")
+            if evidence_key:
+                evidence_key_to_id[evidence_key] = registered[
+                    "evidence"
+                ]["id"]
         findings = stage_results.get("vulnerability_confirmation", {}).get("findings", [])
         for index, finding in enumerate(findings):
             if not isinstance(finding, Mapping):
                 continue
-            finding_evidence = list(evidence_ids)
+            if finding.get("verdict") != "verified":
+                continue
+            finding_evidence = [
+                evidence_key_to_id[key]
+                for key in finding.get("evidence_keys", [])
+                if key in evidence_key_to_id
+            ]
             if not finding_evidence:
-                fallback_key = hashlib.sha256(
-                    f"{state['workflow_id']}|pattern|{index}|{finding.get('title', '')}".encode()
-                ).hexdigest()
-                registered = self.kernel.register_evidence(
-                    slug,
-                    summary=f"Pattern confirmation for {finding.get('title', 'finding')}",
-                    source="pattern_engine",
-                    evidence_type="pattern-confirmation",
-                    confidence=str(finding.get("confidence", "medium")),
-                    dedupe_key=fallback_key,
-                )
-                finding_evidence.append(registered["evidence"]["id"])
+                continue
             finding_key = hashlib.sha256(
                 json.dumps(
                     {
@@ -1208,6 +1213,9 @@ class UnifiedOrchestrator:
                 satisfies=list(finding.get("satisfies", [])),
                 proof_type=str(finding.get("proof_type", "pattern-confirmation")),
                 dedupe_key=finding_key,
+                verdict_id=str(finding.get("verdict_id") or ""),
+                verdict=str(finding.get("verdict") or ""),
+                finding_type=str(finding.get("type") or ""),
             )
 
     def _default_adapters(self):
@@ -1532,9 +1540,13 @@ class UnifiedOrchestrator:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "orchestrator-report.json"
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-        raw_findings = context.get("stage_results", {}).get(
-            "vulnerability_confirmation", {}
-        ).get("findings", [])
+        state = self.kernel.materialize(context["slug"])
+        raw_findings = state.get("findings", [])
+        evidence_by_id = {
+            item["id"]: item
+            for item in state.get("evidence", [])
+            if isinstance(item, Mapping) and item.get("id")
+        }
         findings = sorted(
             [dict(item) for item in raw_findings],
             key=lambda item: (
@@ -1554,6 +1566,11 @@ class UnifiedOrchestrator:
                 str(finding.get("type", "")).casefold(),
                 "templates/report-generic.md",
             )
+            finding["evidence"] = [
+                evidence_by_id[evidence_id]
+                for evidence_id in finding.get("evidence_ids", [])
+                if evidence_id in evidence_by_id
+            ]
         report = {
             "workflow_id": context["workflow_id"],
             "target_url": context["target_url"],

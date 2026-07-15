@@ -3174,23 +3174,64 @@ class UnifiedOrchestrationBridge:
             "attack_execution",
             {},
         ).get("attempts", [])
+        confirmation = context.get("stage_results", {}).get(
+            "vulnerability_confirmation",
+            {},
+        )
+        verdicts = {
+            str(item.get("action_id") or ""): dict(item)
+            for item in confirmation.get("verdicts", [])
+            if isinstance(item, Mapping) and item.get("action_id")
+        }
+        normalizer = self._service(
+            "evidence_normalizer",
+            EvidenceNormalizer,
+        )
         waf = _fingerprint_name(fingerprints.get("waf"))
+        evidence = []
         for attempt in attempts:
-            if (
-                not isinstance(attempt, Mapping)
-                or attempt.get("success") is None
-                or attempt.get("technique_recorded")
-            ):
+            if not isinstance(attempt, Mapping):
                 continue
             technique = attempt.get("technique") or attempt.get("tool")
             if not technique:
                 continue
-            success = bool(attempt["success"])
+            action_id = str(attempt.get("action_id") or "")
+            verdict = verdicts.get(action_id)
+            if verdict is None:
+                continue
+            _, normalized = normalizer.normalize_attempt(attempt)
+            evidence_key = str(
+                verdict.get("evidence_key")
+                or f"evidence-{action_id}"
+            )
+            evidence.append(
+                {
+                    "evidence_key": evidence_key,
+                    "action_id": action_id,
+                    "summary": f"{technique} proof evidence",
+                    "source": str(technique),
+                    "type": "proof-attempt",
+                    "confidence": (
+                        "high"
+                        if verdict.get("verdict") == "verified"
+                        else "medium"
+                    ),
+                    "content": normalized.to_dict(),
+                }
+            )
+            confirmed = verdict.get("verdict") == "verified"
             technique_memory.record_attempt(
                 target_url=str(attempt.get("target") or target),
                 technique_name=str(technique),
                 waf_type=waf,
-                success=success,
+                transport_success=bool(
+                    attempt.get("transport_success")
+                ),
+                probe_executed=bool(attempt.get("probe_executed")),
+                signal_detected=bool(attempt.get("signal_detected")),
+                vulnerability_confirmed=confirmed,
+                verdict=str(verdict.get("verdict") or "inconclusive"),
+                outcome=str(verdict.get("verdict") or "inconclusive"),
                 metadata={
                     key: value
                     for key, value in attempt.items()
@@ -3204,11 +3245,25 @@ class UnifiedOrchestrationBridge:
                     payload_metadata={
                         "target": attempt.get("target", target),
                         "parameter": attempt.get("parameter", ""),
-                        "response_fingerprint": self._pattern_engine().match_response(
-                            attempt
-                        ),
+                        "action_id": action_id,
+                        "verdict_id": verdict.get("verdict_id", ""),
                     },
-                    success=success,
+                    transport_success=bool(
+                        attempt.get("transport_success")
+                    ),
+                    probe_executed=bool(
+                        attempt.get("probe_executed")
+                    ),
+                    signal_detected=bool(
+                        attempt.get("signal_detected")
+                    ),
+                    vulnerability_confirmed=confirmed,
+                    verdict=str(
+                        verdict.get("verdict") or "inconclusive"
+                    ),
+                    outcome=str(
+                        verdict.get("verdict") or "inconclusive"
+                    ),
                     bypass_strategy=str(
                         attempt.get("bypass_strategy")
                         or attempt.get("technique")
@@ -3216,16 +3271,21 @@ class UnifiedOrchestrationBridge:
                     ),
                 )
             updates.append(
-                {"technique": str(technique), "success": success}
+                {
+                    "technique": str(technique),
+                    "success": confirmed,
+                    "verdict": str(
+                        verdict.get("verdict") or "inconclusive"
+                    ),
+                    "action_id": action_id,
+                }
             )
-        findings = context.get("stage_results", {}).get(
-            "vulnerability_confirmation",
-            {},
-        ).get("findings", [])
+        findings = confirmation.get("findings", [])
         for finding in findings:
             if (
                 isinstance(finding, Mapping)
                 and finding.get("status") == "confirmed"
+                and finding.get("verdict") == "verified"
                 and hasattr(target_memory, "record_vulnerability")
             ):
                 target_memory.record_vulnerability(
@@ -3235,7 +3295,8 @@ class UnifiedOrchestrationBridge:
                     status="confirmed",
                     details=dict(finding),
                 )
-        evidence = [
+        evidence.extend(
+            [
             {
                 "summary": (
                     f"Deferred attack handoff: "
@@ -3249,7 +3310,8 @@ class UnifiedOrchestrationBridge:
                 "attack_execution",
                 {},
             ).get("handoffs", [])
-        ]
+            ]
+        )
         evidence.extend(
             dict(item)
             for item in profile.get("browser_evidence", [])
