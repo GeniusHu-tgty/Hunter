@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from core.workflow import WorkflowKernel
 from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
 
 
@@ -31,6 +32,22 @@ def test_discovers_workspace_from_env(workspace):
     adapter = OpenTgtyLabWorkspaceAdapter()
     assert adapter.root == workspace.resolve()
     assert adapter.health()["data"]["available"] is True
+
+
+def test_explicit_root_overrides_valid_env_workspace(workspace, tmp_path):
+    explicit = tmp_path / "new-workspace"
+
+    adapter = OpenTgtyLabWorkspaceAdapter(explicit)
+
+    assert adapter.root == explicit.resolve()
+    created = WorkflowKernel(adapter.root).create(
+        "explicit-case",
+        objective="verify explicit workspace",
+        inputs=[],
+    )
+    assert created["state"]["slug"] == "explicit-case"
+    assert (explicit / "cases" / "explicit-case" / "workflow.json").is_file()
+    assert not (workspace / "cases" / "explicit-case").exists()
 
 
 def test_case_open_status_next_steps_and_controlled_update(workspace):

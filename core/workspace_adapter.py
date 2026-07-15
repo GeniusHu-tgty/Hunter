@@ -31,9 +31,9 @@ class OpenTgtyLabWorkspaceAdapter:
 
     @classmethod
     def discover_root(cls, explicit: Optional[str | Path] = None) -> Path:
+        if explicit is not None and str(explicit):
+            return Path(explicit).expanduser().resolve()
         candidates: List[Path] = []
-        if explicit:
-            candidates.append(Path(explicit).expanduser())
         for name in _ENV_NAMES:
             if os.environ.get(name):
                 candidates.append(Path(os.environ[name]).expanduser())
@@ -44,8 +44,6 @@ class OpenTgtyLabWorkspaceAdapter:
             resolved = candidate.resolve()
             if cls._looks_like_workspace(resolved):
                 return resolved
-        if explicit:
-            return Path(explicit).expanduser().resolve()
         for name in _ENV_NAMES:
             if os.environ.get(name):
                 return Path(os.environ[name]).expanduser().resolve()
