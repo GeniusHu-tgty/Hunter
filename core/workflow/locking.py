@@ -21,6 +21,17 @@ def _process_lock(key: str) -> threading.RLock:
         return _PROCESS_LOCKS.setdefault(key, threading.RLock())
 
 
+def _lock_key_from_resolved_path(resolved: Path) -> str:
+    key = os.fspath(resolved)
+    if _platform_name() != "nt":
+        return key
+    if key.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + key[8:]
+    if key.startswith("\\\\?\\"):
+        return key[4:]
+    return key
+
+
 def _lock_handle(handle) -> None:
     handle.seek(0)
     if _platform_name() == "nt":
@@ -51,9 +62,10 @@ class WorkflowFileLock:
     """Re-entrant process and OS-level lock for one workflow directory."""
 
     def __init__(self, path: str | Path, timeout: float = 10.0):
-        self.path = Path(path).resolve()
+        raw_path = Path(path)
+        self.path = raw_path.resolve()
         self.timeout = float(timeout)
-        self._key = str(self.path)
+        self._key = _lock_key_from_resolved_path(self.path)
         self._process_lock = _process_lock(self._key)
         self._enter_count = 0
 

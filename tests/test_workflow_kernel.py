@@ -1,6 +1,7 @@
 import gc
 import json
 import multiprocessing
+import os
 import sys
 import threading
 import time
@@ -191,6 +192,120 @@ def test_workflow_file_lock_is_reentrant_for_same_instance(tmp_path):
     thread.start()
     thread.join(1)
     assert acquired.is_set()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path spelling only")
+def test_workflow_file_lock_uses_stable_key_when_windows_resolve_spelling_drifts(
+    tmp_path, monkeypatch
+):
+    import core.workflow.locking as locking
+
+    raw_path = tmp_path / ".workflow.lock"
+    normal_path = locking.Path(
+        os.path.abspath(os.fspath(raw_path))
+    )
+    extended_path = locking.Path(f"\\\\?\\{normal_path}")
+    resolved_paths = iter((extended_path, normal_path))
+    original_resolve = locking.Path.resolve
+
+    def drifting_resolve(self, *args, **kwargs):
+        if self == raw_path:
+            return next(resolved_paths)
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(locking.Path, "resolve", drifting_resolve)
+    first = WorkflowFileLock(raw_path, timeout=0.05)
+    second = WorkflowFileLock(raw_path, timeout=0.05)
+
+    assert first._key == second._key
+    assert first._process_lock is second._process_lock
+    with first:
+        with second:
+            pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path spelling only")
+def test_workflow_file_lock_key_normalizes_windows_extended_unc_prefix(
+    tmp_path, monkeypatch
+):
+    import core.workflow.locking as locking
+
+    first_raw_path = tmp_path / "first" / ".workflow.lock"
+    second_raw_path = tmp_path / "second" / ".workflow.lock"
+    extended_target = locking.Path(
+        r"\\?\UNC\server\share\target\.workflow.lock"
+    )
+    standard_target = locking.Path(
+        r"\\server\share\target\.workflow.lock"
+    )
+    original_resolve = locking.Path.resolve
+
+    def unc_spelling_resolve(self, *args, **kwargs):
+        if self == first_raw_path:
+            return extended_target
+        if self == second_raw_path:
+            return standard_target
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(locking.Path, "resolve", unc_spelling_resolve)
+    first = WorkflowFileLock(first_raw_path)
+    second = WorkflowFileLock(second_raw_path)
+
+    assert first._key == second._key
+    assert first._process_lock is second._process_lock
+
+
+def test_workflow_file_lock_key_uses_resolved_path_identity(
+    tmp_path, monkeypatch
+):
+    import core.workflow.locking as locking
+
+    first_raw_path = tmp_path / "first" / ".workflow.lock"
+    second_raw_path = tmp_path / "second" / ".workflow.lock"
+    target = (tmp_path / "target" / ".workflow.lock").resolve()
+    original_resolve = locking.Path.resolve
+
+    def shared_target_resolve(self, *args, **kwargs):
+        if self in (first_raw_path, second_raw_path):
+            return target
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(locking.Path, "resolve", shared_target_resolve)
+    first = WorkflowFileLock(first_raw_path)
+    second = WorkflowFileLock(second_raw_path)
+
+    assert first._key == second._key
+    assert first._process_lock is second._process_lock
+
+
+def test_workflow_file_lock_key_preserves_resolved_path_case(
+    tmp_path, monkeypatch
+):
+    import core.workflow.locking as locking
+
+    first_raw_path = tmp_path / "first" / ".workflow.lock"
+    second_raw_path = tmp_path / "second" / ".workflow.lock"
+    first_target = Path(
+        os.path.abspath(tmp_path / "TARGET" / ".workflow.lock")
+    )
+    second_target = Path(
+        os.path.abspath(tmp_path / "target" / ".workflow.lock")
+    )
+    original_resolve = locking.Path.resolve
+
+    def case_distinct_resolve(self, *args, **kwargs):
+        if self == first_raw_path:
+            return first_target
+        if self == second_raw_path:
+            return second_target
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(locking.Path, "resolve", case_distinct_resolve)
+    first = WorkflowFileLock(first_raw_path)
+    second = WorkflowFileLock(second_raw_path)
+
+    assert first._key != second._key
+    assert first._process_lock is not second._process_lock
 
 
 def test_workflow_file_lock_uses_one_total_timeout(
