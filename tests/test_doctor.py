@@ -1,5 +1,7 @@
 ﻿import json
+import platform
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -46,13 +48,23 @@ def test_config_audit_detects_legacy_registration_portably(tmp_path):
     assert result["data"]["legacy_registrations"] == [str(config.resolve())]
 
 
-def test_runtime_status_does_not_require_windows_or_fixed_drive(tmp_path):
+def test_runtime_status_reports_actual_runtime_sources(
+    monkeypatch,
+    tmp_path,
+):
+    configured_root = r"D:\configured-by-user"
+    monkeypatch.setenv("OPEN_TGTYLAB_ROOT", configured_root)
     doctor = HunterDoctor(tmp_path, registered_tools=["hunter_doctor"])
     result = doctor.runtime_status()
     assert result["status"] == "ok"
-    assert result["data"]["python_executable"]
-    assert result["data"]["platform"]
-    assert "D:\\" not in json.dumps(result)
+    assert result["data"]["python_executable"] == sys.executable
+    assert result["data"]["cwd"] == str(Path.cwd().resolve())
+    assert result["data"]["hunter_dir"] == str(tmp_path.resolve())
+    assert result["data"]["platform"] == platform.platform()
+    assert (
+        result["data"]["environment"]["OPEN_TGTYLAB_ROOT"]
+        == configured_root
+    )
 
 
 def test_doctor_aggregates_checks(tmp_path):

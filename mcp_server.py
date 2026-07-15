@@ -32,7 +32,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from html.parser import HTMLParser
 from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -55,7 +55,12 @@ from core.burp_import import import_burp_evidence
 from payloads.loader import PayloadLoader
 from core.hunter_tools_facade import HunterToolsFacade
 from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
-from core.doctor import HunterDoctor
+from core.doctor import (
+    CONTRACT_FILENAME,
+    HunterDoctor,
+    load_integration_contract,
+)
+from core.tool_catalog import classify_tool_inventory
 from core.adaptive_engine import AdaptiveEngine, get_mode_profile
 from core.recon_cache import ReconCache
 from core.reasoning.attack_reasoning import AttackReasoner
@@ -79,6 +84,20 @@ from core.memory import (
     PatternEngine,
     TargetMemory,
     TechniqueMemory,
+)
+
+INTEGRATION_CONTRACT_PATH = HUNTER_DIR / CONTRACT_FILENAME
+_EXTENSION_TOOL_SOURCES: Dict[str, set[str]] = {}
+_EXTENSION_TOOL_COLLISIONS: List[Dict[str, Any]] = []
+_REVERSE_LAB_MODULE_CACHE: Dict[Path, Any] = {}
+_REVERSE_LAB_ROOT_ENV_NAMES = (
+    "OPEN_TGTYLAB_ROOT",
+    "OPEN_TGTYLAB_WORKSPACE",
+    "TGTYLAB_ROOT",
+)
+_REVERSE_LAB_RELATIVE_PATH = Path(
+    "tools/skills/mcp/ReverseLabToolsMCP/"
+    "reverse_lab_tools_mcp.py"
 )
 
 # ============================================================
@@ -2799,22 +2818,46 @@ def _tool_available(name: str) -> Dict[str, Any]:
 def _registered_tool_inventory() -> Dict[str, Any]:
     tool_manager = getattr(mcp, "_tool_manager", None)
     tools = getattr(tool_manager, "_tools", {})
-    names = sorted(str(name) for name in tools)
-    return {
-        "core": [
-            name for name in names if name.startswith("hunter_")
-        ],
-        "extensions": {
-            "reverse_lab_tools": [
-                name for name in names if name.startswith("re_")
-            ],
-        },
-        "unknown": [
-            name
-            for name in names
-            if not name.startswith(("hunter_", "re_"))
-        ],
+    names = {str(name) for name in tools}
+    try:
+        contract = load_integration_contract(
+            INTEGRATION_CONTRACT_PATH
+        )
+    except Exception:
+        contract = {}
+    namespaces = tuple(
+        contract.get("optional_extension_namespaces", [])
+    )
+    core = {name for name in names if name.startswith("hunter_")}
+    extensions = {
+        source: sorted(names & {str(item) for item in source_names})
+        for source, source_names in _EXTENSION_TOOL_SOURCES.items()
     }
+    attributed = {
+        name
+        for source_names in extensions.values()
+        for name in source_names
+    }
+    unattributed_extensions = {
+        name
+        for name in names - core - attributed
+        if namespaces and name.startswith(namespaces)
+    }
+    if unattributed_extensions:
+        extensions["contract_extensions"] = sorted(
+            set(extensions.get("contract_extensions", []))
+            | unattributed_extensions
+        )
+    unknown = names - core - attributed - unattributed_extensions
+    inventory, invalid_extensions = classify_tool_inventory(
+        core,
+        extensions,
+        unknown,
+        namespaces,
+        _classifier_extension_collisions(),
+    )
+    inventory["invalid_extension_tools"] = invalid_extensions
+    return inventory
 
 
 def _registered_hunter_tools() -> List[str]:
@@ -2830,6 +2873,12 @@ def _doctor() -> HunterDoctor:
         workspace_root=workspace_root,
         extension_tools=inventory["extensions"],
         unknown_tools=inventory["unknown"],
+        invalid_extension_tools=inventory.get(
+            "invalid_extension_tools",
+            [],
+        ),
+        extension_collisions=inventory["collisions"],
+        contract_path=INTEGRATION_CONTRACT_PATH,
     )
 
 
@@ -2908,9 +2957,7 @@ async def hunter_healthcheck() -> str:
     ]
     inventory = _registered_tool_inventory()
     registered_core = inventory["core"]
-    extension_count = sum(
-        len(names) for names in inventory["extensions"].values()
-    )
+    tool_counts = inventory["counts"]
     all_registered = sorted(
         registered_core
         + [
@@ -2948,12 +2995,19 @@ async def hunter_healthcheck() -> str:
             "core": registered_core,
             "extensions": inventory["extensions"],
             "unknown": inventory["unknown"],
+            "invalid_extension_tools": inventory.get(
+                "invalid_extension_tools",
+                [],
+            ),
+            "collisions": inventory["collisions"],
+            "collision_count": len(inventory["collisions"]),
             "required": required_mcp,
             "missing": missing_mcp,
-            "core_count": len(registered_core),
-            "extension_count": extension_count,
-            "unknown_count": len(inventory["unknown"]),
-            "total_registered": len(all_registered),
+            "core_count": tool_counts["core"],
+            "extension_count": tool_counts["extensions"],
+            "unknown_count": tool_counts["unknown"],
+            "total_registered": tool_counts["total"],
+            "counts": tool_counts,
         },
         "external_tools": external,
         "wordlists": wordlists,
@@ -2974,9 +3028,7 @@ async def hunter_capabilities() -> str:
     """Return the actual Hunter MCP capability matrix for agent-side routing."""
     inventory = _registered_tool_inventory()
     registered = set(inventory["core"])
-    extension_count = sum(
-        len(names) for names in inventory["extensions"].values()
-    )
+    tool_counts = inventory["counts"]
     definitions = {
         "hunter_workflow_create": ("workflow", "Create workflow-state-v2 case"),
         "hunter_workflow_open": ("workflow", "Open materialized workflow state"),
@@ -3098,18 +3150,15 @@ async def hunter_capabilities() -> str:
         "framework": "Hunter",
         "version": "v8-hardening",
         "tools": tools,
-        "tool_counts": {
-            "core": len(inventory["core"]),
-            "extensions": extension_count,
-            "unknown": len(inventory["unknown"]),
-            "total": (
-                len(inventory["core"])
-                + extension_count
-                + len(inventory["unknown"])
-            ),
-        },
+        "tool_counts": tool_counts,
         "extensions": inventory["extensions"],
         "unknown_tools": inventory["unknown"],
+        "invalid_extension_tools": inventory.get(
+            "invalid_extension_tools",
+            [],
+        ),
+        "collisions": inventory["collisions"],
+        "collision_count": len(inventory["collisions"]),
         "payloads": _payload_inventory(),
         "hunter_tools": _hunter_tools.capabilities().get("data", {}),
         "workspace": _workspace.health().get("data", {}),
@@ -4773,36 +4822,163 @@ _enable_structured_mcp_results()
 # All reverse-engineering tools get "re_" prefix to avoid name collision.
 # ============================================================
 
+def _reverse_lab_tool_candidates(
+    environment: Optional[Mapping[str, str]] = None,
+) -> List[Path]:
+    """Return configured ReverseLab MCP candidates in stable priority order."""
+    env = os.environ if environment is None else environment
+    raw_candidates = []
+    explicit_path = env.get("REVERSELAB_MCP_PATH", "")
+    try:
+        explicit_candidate = (
+            Path(explicit_path).expanduser()
+            if explicit_path
+            else None
+        )
+    except RuntimeError:
+        explicit_candidate = None
+    if explicit_candidate is not None and explicit_candidate.is_absolute():
+        raw_candidates.append(explicit_candidate)
+    for name in _REVERSE_LAB_ROOT_ENV_NAMES:
+        root = env.get(name, "")
+        try:
+            root_path = Path(root).expanduser() if root else None
+        except RuntimeError:
+            root_path = None
+        if root_path is not None and root_path.is_absolute():
+            raw_candidates.append(
+                root_path / _REVERSE_LAB_RELATIVE_PATH
+            )
+
+    candidates = []
+    seen = set()
+    for candidate in raw_candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            candidates.append(resolved)
+    return candidates
+
+
+def _existing_extension_sources(tool_name: str) -> List[str]:
+    sources = sorted(
+        {
+            str(source)
+            for source, names in _EXTENSION_TOOL_SOURCES.items()
+            if source != "reverse_lab_tools" and tool_name in names
+        }
+    )
+    if tool_name.startswith("hunter_"):
+        sources.append("hunter_core")
+    if sources:
+        return sorted(set(sources))
+    return ["contract_extensions"]
+
+
+def _classifier_extension_collisions() -> List[Dict[str, Any]]:
+    """Return collision metadata in the shared classifier's legacy shape."""
+    return [
+        {
+            "tool": collision["tool"],
+            "sources": sorted(
+                set(collision["existing_sources"])
+                | {collision["incoming_source"]}
+            ),
+            "existing_source": collision["existing_sources"][0],
+            "incoming_source": collision["incoming_source"],
+        }
+        for collision in _EXTENSION_TOOL_COLLISIONS
+    ]
+
+
+def _record_extension_tool_collision(
+    tool_name: str,
+    incoming_source: str,
+) -> None:
+    existing_sources = _existing_extension_sources(tool_name)
+    record = {
+        "tool": tool_name,
+        "existing_sources": existing_sources,
+        "incoming_source": incoming_source,
+    }
+    _clear_extension_tool_collision(tool_name, incoming_source)
+    _EXTENSION_TOOL_COLLISIONS.append(record)
+    _EXTENSION_TOOL_COLLISIONS.sort(
+        key=lambda item: (
+            item["tool"],
+            item["existing_sources"],
+            item["incoming_source"],
+        )
+    )
+
+
+def _clear_extension_tool_collision(
+    tool_name: str,
+    incoming_source: str,
+) -> None:
+    _EXTENSION_TOOL_COLLISIONS[:] = [
+        collision
+        for collision in _EXTENSION_TOOL_COLLISIONS
+        if not (
+            collision.get("tool") == tool_name
+            and collision.get("incoming_source") == incoming_source
+        )
+    ]
+
+
 def _import_reverse_lab_tools() -> None:
     """Dynamically load reverse_lab_tools_mcp.py and merge its tools into hunter's mcp."""
     import importlib.util
 
-    candidates = [
-        os.environ.get("REVERSELAB_MCP_PATH", ""),
-        r"D:\Open-tgtylab-repo\tools\skills\mcp\ReverseLabToolsMCP\reverse_lab_tools_mcp.py",
-        r"D:\Open-tgtylab\tools\skills\mcp\ReverseLabToolsMCP\reverse_lab_tools_mcp.py",
-    ]
-    rlt_path = next((Path(p) for p in candidates if p and Path(p).is_file()), None)
+    rlt_path = next(
+        (
+            path
+            for path in _reverse_lab_tool_candidates()
+            if path.is_file()
+        ),
+        None,
+    )
     if rlt_path is None:
         print("[hunter_tools] reverse_lab_tools not found, skipping merge", file=sys.stderr)
         return
+    rlt_path = rlt_path.resolve()
 
-    project_dir = rlt_path.parent
-    if str(project_dir) not in sys.path:
-        sys.path.insert(0, str(project_dir))
-
-    spec = importlib.util.spec_from_file_location(
-        "reverse_lab_tools_mcp_shim", str(rlt_path)
-    )
-    if spec is None or spec.loader is None:
-        print("[hunter_tools] failed to build reverselab spec", file=sys.stderr)
-        return
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
-        print(f"[hunter_tools] reverselab load failed: {exc}", file=sys.stderr)
-        return
+    module = _REVERSE_LAB_MODULE_CACHE.get(rlt_path)
+    if module is None:
+        path_digest = hashlib.sha256(
+            os.path.normcase(str(rlt_path)).encode("utf-8")
+        ).hexdigest()
+        module_name = f"_hunter_reverselab_{path_digest}"
+        original_sys_path = list(sys.path)
+        project_dir = str(rlt_path.parent)
+        try:
+            if project_dir not in sys.path:
+                sys.path.insert(0, project_dir)
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                str(rlt_path),
+            )
+            if spec is None or spec.loader is None:
+                print(
+                    "[hunter_tools] failed to build reverselab spec",
+                    file=sys.stderr,
+                )
+                return
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception as exc:
+                if sys.modules.get(module_name) is module:
+                    del sys.modules[module_name]
+                print(
+                    f"[hunter_tools] reverselab load failed: {exc}",
+                    file=sys.stderr,
+                )
+                return
+            _REVERSE_LAB_MODULE_CACHE[rlt_path] = module
+        finally:
+            sys.path[:] = original_sys_path
 
     rlt_mcp = getattr(module, "mcp", None)
     if rlt_mcp is None or not hasattr(rlt_mcp, "_tool_manager"):
@@ -4810,15 +4986,33 @@ def _import_reverse_lab_tools() -> None:
         return
 
     merged = 0
+    source_tools = _EXTENSION_TOOL_SOURCES.setdefault(
+        "reverse_lab_tools",
+        set(),
+    )
     for tool_name, tool in list(rlt_mcp._tool_manager._tools.items()):
         new_name = tool_name if tool_name.startswith("re_") else f"re_{tool_name}"
         if new_name in mcp._tool_manager._tools:
+            existing_tool = mcp._tool_manager._tools[new_name]
+            if (
+                new_name not in source_tools
+                or existing_tool is not tool
+            ):
+                _record_extension_tool_collision(
+                    new_name,
+                    "reverse_lab_tools",
+                )
             continue
+        _clear_extension_tool_collision(
+            new_name,
+            "reverse_lab_tools",
+        )
         try:
             tool.name = new_name
         except Exception:
             pass
         mcp._tool_manager._tools[new_name] = tool
+        source_tools.add(new_name)
         merged += 1
     print(f"[hunter_tools] merged {merged} reverse_lab tools (re_* prefix)", file=sys.stderr)
 

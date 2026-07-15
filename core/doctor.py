@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from core.tool_catalog import classify_tool_inventory
+
 CONTRACT_FILENAME = "integration-contract.json"
 
 
@@ -28,17 +30,15 @@ def load_integration_contract(path: str | Path) -> dict[str, Any]:
         raise ValueError("Contract required_tools must be a string list")
     if not isinstance(data["minimum_tool_count"], int) or data["minimum_tool_count"] < 1:
         raise ValueError("Contract minimum_tool_count must be a positive integer")
-    exact_core_tool_count = data.get(
-        "exact_core_tool_count",
-        data["minimum_tool_count"],
-    )
-    if (
-        not isinstance(exact_core_tool_count, int)
-        or exact_core_tool_count < 1
-    ):
-        raise ValueError(
-            "Contract exact_core_tool_count must be a positive integer"
-        )
+    if "exact_core_tool_count" in data:
+        exact_core_tool_count = data["exact_core_tool_count"]
+        if (
+            not isinstance(exact_core_tool_count, int)
+            or exact_core_tool_count < 1
+        ):
+            raise ValueError(
+                "Contract exact_core_tool_count must be a positive integer"
+            )
     optional_namespaces = data.get(
         "optional_extension_namespaces",
         [],
@@ -58,7 +58,6 @@ def load_integration_contract(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             "Contract unknown_tool_policy must be error or warning"
         )
-    data["exact_core_tool_count"] = exact_core_tool_count
     data["optional_extension_namespaces"] = optional_namespaces
     data["unknown_tool_policy"] = unknown_tool_policy
     return data
@@ -76,6 +75,10 @@ class HunterDoctor:
             Mapping[str, Iterable[str]]
         ] = None,
         unknown_tools: Optional[Iterable[str]] = None,
+        invalid_extension_tools: Optional[Iterable[str]] = None,
+        extension_collisions: Optional[
+            Iterable[Mapping[str, Any]]
+        ] = None,
     ) -> None:
         self.hunter_dir = Path(hunter_dir).expanduser().resolve()
         self.registered_tools = sorted(set(registered_tools))
@@ -84,24 +87,59 @@ class HunterDoctor:
             for source, names in (extension_tools or {}).items()
         }
         self.unknown_tools = sorted(set(unknown_tools or []))
+        self.invalid_extension_tools = sorted(
+            set(invalid_extension_tools or [])
+        )
+        self.extension_collisions = [
+            dict(collision)
+            for collision in (extension_collisions or [])
+        ]
         self.contract_path = Path(contract_path or self.hunter_dir / CONTRACT_FILENAME).expanduser().resolve()
         self.workspace_root = Path(workspace_root).expanduser().resolve() if workspace_root else None
         self.config_paths = [Path(p).expanduser().resolve() for p in config_paths] if config_paths is not None else self.discover_config_paths()
 
-    def _tool_counts(self) -> dict[str, int]:
-        extension_count = sum(
-            len(names) for names in self.extension_tools.values()
+    def _inventory(
+        self,
+        contract: Optional[Mapping[str, Any]] = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        if contract is None:
+            try:
+                contract = load_integration_contract(self.contract_path)
+            except Exception:
+                contract = {}
+        inventory, classified_invalid = classify_tool_inventory(
+            self.registered_tools,
+            self.extension_tools,
+            self.unknown_tools,
+            contract.get("optional_extension_namespaces", []),
+            self.extension_collisions,
         )
-        return {
-            "core": len(self.registered_tools),
-            "extensions": extension_count,
-            "unknown": len(self.unknown_tools),
-            "total": (
-                len(self.registered_tools)
-                + extension_count
-                + len(self.unknown_tools)
-            ),
-        }
+        invalid_extensions = sorted(
+            set(classified_invalid)
+            | set(self.invalid_extension_tools)
+        )
+        assigned_tools = set(inventory["core"])
+        assigned_tools.update(
+            name
+            for names in inventory["extensions"].values()
+            for name in names
+        )
+        inventory["unknown"] = sorted(
+            set(inventory["unknown"])
+            | (set(invalid_extensions) - assigned_tools)
+        )
+        inventory["counts"]["unknown"] = len(inventory["unknown"])
+        inventory["counts"]["total"] = (
+            inventory["counts"]["core"]
+            + inventory["counts"]["extensions"]
+            + inventory["counts"]["unknown"]
+        )
+        inventory["invalid_extension_tools"] = invalid_extensions
+        return inventory, invalid_extensions
+
+    def _tool_counts(self) -> dict[str, int]:
+        inventory, _ = self._inventory()
+        return dict(inventory["counts"])
 
     def discover_config_paths(self) -> list[Path]:
         candidates: list[Path] = []
@@ -120,34 +158,42 @@ class HunterDoctor:
         try:
             contract = load_integration_contract(self.contract_path)
             required_core = set(contract["required_tools"])
-            registered_core = set(self.registered_tools)
+            inventory, invalid_extensions = self._inventory(contract)
+            registered_core = set(inventory["core"])
             missing = sorted(required_core - registered_core)
             unexpected = sorted(registered_core - required_core)
             minimum_count_ok = (
                 len(registered_core) >= contract["minimum_tool_count"]
             )
+            exact_core_tool_count = contract.get(
+                "exact_core_tool_count"
+            )
             exact_count_ok = (
-                len(registered_core)
-                == contract["exact_core_tool_count"]
+                len(registered_core) == exact_core_tool_count
+                if exact_core_tool_count is not None
+                else None
             )
-            declared_namespaces = tuple(
-                contract["optional_extension_namespaces"]
-            )
-            invalid_extensions = sorted(
-                name
-                for names in self.extension_tools.values()
-                for name in names
-                if not declared_namespaces
-                or not name.startswith(declared_namespaces)
-            )
-            unknown_tools = sorted(
-                set(self.unknown_tools) | set(invalid_extensions)
-            )
+            unknown_tools = inventory["unknown"]
+            collisions = inventory["collisions"]
             unknown_is_error = (
                 bool(unknown_tools)
                 and contract["unknown_tool_policy"] == "error"
             )
-            tool_counts = self._tool_counts()
+            tool_counts = inventory["counts"]
+            collision_errors = (
+                [
+                    "Extension tool source collisions: "
+                    + "; ".join(
+                        (
+                            f"{collision['tool']} "
+                            f"({', '.join(collision['sources'])})"
+                        )
+                        for collision in collisions
+                    )
+                ]
+                if collisions
+                else []
+            )
             data = {
                 **contract,
                 "path": str(self.contract_path),
@@ -158,11 +204,15 @@ class HunterDoctor:
                 "missing_tools": missing,
                 "missing_core_tools": missing,
                 "unexpected_core_tools": unexpected,
-                "extension_tools": self.extension_tools,
+                "extension_tools": inventory["extensions"],
                 "invalid_extension_tools": invalid_extensions,
                 "unknown_tools": unknown_tools,
+                "collisions": collisions,
+                "collision_count": len(collisions),
                 "minimum_tool_count_satisfied": minimum_count_ok,
                 "exact_core_tool_count_satisfied": exact_count_ok,
+                "tool_counts": tool_counts,
+                "errors": collision_errors,
                 "warnings": (
                     [f"Unknown registered tools: {', '.join(unknown_tools)}"]
                     if unknown_tools
@@ -172,10 +222,13 @@ class HunterDoctor:
             }
             valid = (
                 not missing
-                and not unexpected
                 and minimum_count_ok
-                and exact_count_ok
+                and (
+                    exact_core_tool_count is None
+                    or (not unexpected and exact_count_ok)
+                )
                 and not unknown_is_error
+                and not collisions
             )
             return _result(
                 "hunter_contract_check",
@@ -231,7 +284,8 @@ class HunterDoctor:
             contract = load_integration_contract(self.contract_path)
         except Exception:
             pass
-        tool_counts = self._tool_counts()
+        inventory, invalid_extensions = self._inventory(contract)
+        tool_counts = inventory["counts"]
         return _result("hunter_runtime_status", "ok", {
             "server_name": (contract or {}).get("server_name", "hunter_tools"),
             "pid": os.getpid(),
@@ -247,14 +301,19 @@ class HunterDoctor:
             "extension_tool_count": tool_counts["extensions"],
             "extension_tool_counts": {
                 source: len(names)
-                for source, names in self.extension_tools.items()
+                for source, names in inventory["extensions"].items()
             },
             "unknown_tool_count": tool_counts["unknown"],
-            "unknown_tools": self.unknown_tools,
+            "unknown_tools": inventory["unknown"],
+            "invalid_extension_tools": invalid_extensions,
+            "collisions": inventory["collisions"],
+            "collision_count": len(inventory["collisions"]),
+            "tool_counts": tool_counts,
             "environment": {name: os.environ.get(name) for name in ("CODEX_HOME", "OPEN_TGTYLAB_ROOT", "OPEN_TGTYLAB_WORKSPACE", "TGTYLAB_ROOT") if os.environ.get(name)},
         })
 
     def run(self) -> dict[str, Any]:
+        inventory, invalid_extensions = self._inventory()
         checks = {
             "contract": self.contract_check(),
             "config": self.config_audit(),
@@ -265,7 +324,10 @@ class HunterDoctor:
             "hunter_doctor",
             status,
             {
-                "tool_counts": self._tool_counts(),
+                "tool_counts": inventory["counts"],
+                "invalid_extension_tools": invalid_extensions,
+                "collisions": inventory["collisions"],
+                "collision_count": len(inventory["collisions"]),
                 "checks": checks,
             },
         )
