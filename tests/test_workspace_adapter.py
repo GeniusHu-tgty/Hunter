@@ -63,6 +63,43 @@ def test_project_kb_search_read_and_path_safety(workspace):
     assert adapter.kb_search("jwt", board="not-real")["status"] == "error"
 
 
+
+
+def test_project_kb_search_auto_routes_across_boards(workspace):
+    result = OpenTgtyLabWorkspaceAdapter().kb_search(
+        "jwt authorization",
+        board="auto",
+        limit=5,
+    )
+
+    assert result["status"] == "ok"
+    assert result["data"]["results"][0]["board"] == "ctf-website"
+    assert result["data"]["results"][0]["path"].endswith("02-auth/jwt.md")
+    assert result["next_actions"][0]["arguments"]["board"] == "ctf-website"
+
+
+def test_project_kb_search_prefers_query_coverage_over_repeated_generic_terms(workspace):
+    root = workspace / "kb" / "general" / "techniques"
+    (root / "reliability.md").write_text(
+        "# MCP Reliability\nDiagnostics configuration runtime timeout subprocess evidence quality.",
+        encoding="utf-8",
+    )
+    (root / "generic.md").write_text(
+        "# Generic\n" + "tool " * 80,
+        encoding="utf-8",
+    )
+
+    result = OpenTgtyLabWorkspaceAdapter().kb_search(
+        "MCP tool reliability diagnostics configuration runtime timeout subprocess evidence quality",
+        board="general",
+        limit=5,
+    )
+
+    assert result["data"]["results"][0]["path"] == "reliability.md"
+    assert result["data"]["results"][0]["matched_tokens"] >= 8
+    assert result["data"]["results"][0]["coverage"] > 0.8
+
+
 def test_artifact_routes_write_inside_workspace(workspace):
     adapter = OpenTgtyLabWorkspaceAdapter()
     evidence = adapter.evidence_save("demo", "idor/request.json", '{"id":2}')
@@ -104,3 +141,14 @@ def test_workspace_discovery_has_no_fixed_windows_drive(monkeypatch, tmp_path):
     from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
     root = OpenTgtyLabWorkspaceAdapter.discover_root()
     assert root == tmp_path.resolve()
+
+
+
+def test_workspace_recommend_routes_chinese_access_control_signals(workspace):
+    result = OpenTgtyLabWorkspaceAdapter().recommend(
+        signals=["\u8d8a\u6743", "\u6c34\u5e73\u8d8a\u6743"],
+        finding="cross-user object access",
+    )
+    tools = [item["tool"] for item in result["data"]["tool_recommendations"]]
+    assert "hunter_auto_idor" in tools
+    assert "hunter_auto_access_control" in tools

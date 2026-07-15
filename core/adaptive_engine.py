@@ -32,12 +32,12 @@ _PROFILES = {
         ("tech-detect", "port-scan", "subdomain"),
         ("js-analyze", "dir-enum", "info-leak"),
     )),
-    "standard": ModeProfile("standard", 1200, 24, 6, 32000, 7200, 12, (
+    "standard": ModeProfile("standard", 240, 24, 6, 32000, 7200, 12, (
         ("tech-detect", "port-scan", "subdomain", "dns-info"),
         ("js-analyze", "dir-enum", "api-discover", "endpoint-map"),
         ("auth-analysis", "info-leak", "cors-vuln", "jwt-vuln", "idor-vuln", "sqli-vuln", "xss-vuln", "ssrf-vuln"),
     )),
-    "deep": ModeProfile("deep", 3600, 50, 8, 64000, 21600, 20, (
+    "deep": ModeProfile("deep", 285, 50, 8, 64000, 21600, 20, (
         ("tech-detect", "port-scan", "subdomain", "dns-info"),
         ("js-analyze", "dir-enum", "api-discover", "param-discover", "endpoint-map", "auth-analysis"),
         ("sqli-vuln", "xss-vuln", "ssrf-vuln", "ssti-vuln", "lfi-vuln", "rce-vuln", "jwt-vuln", "upload-vuln", "xxe-vuln", "deser-vuln", "cors-vuln", "idor-vuln", "info-leak"),

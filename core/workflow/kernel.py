@@ -144,6 +144,7 @@ class WorkflowKernel:
         state.setdefault("target_profile", {})
         state.setdefault("attack_surface", {})
         state.setdefault("attack_queue", [])
+        state.setdefault("completed_attacks", [])
         state.setdefault("learning_updates", [])
         state.setdefault("report_path", "")
         return state
@@ -270,7 +271,9 @@ class WorkflowKernel:
                     state["orchestrator"]["status"] = p.get("status", "blocked")
                     state["orchestrator"]["stage_status"][stage] = p.get("status", "blocked")
                     if "result" in p:
-                        state["orchestrator"]["stage_results"][stage] = deepcopy(p["result"])
+                        result = deepcopy(p["result"])
+                        state["orchestrator"]["stage_results"][stage] = result
+                        self._apply_orchestrator_result(state, stage, result)
                     state["orchestrator"]["confirmation_required"] = deepcopy(
                         p.get("confirmation_required", [])
                     )
@@ -297,6 +300,11 @@ class WorkflowKernel:
         elif stage == "attack_surface":
             state["attack_surface"] = deepcopy(result.get("attack_surface", result))
             state["attack_queue"] = deepcopy(result.get("attack_queue", []))
+        elif stage == "attack_execution":
+            if "attack_queue" in result:
+                state["attack_queue"] = deepcopy(result["attack_queue"])
+            if "completed_attacks" in result:
+                state["completed_attacks"] = deepcopy(result["completed_attacks"])
         elif stage == "evidence_learning":
             state["learning_updates"] = deepcopy(result.get("learning_updates", []))
         elif stage == "report":
@@ -716,6 +724,8 @@ class UnifiedOrchestrator:
             "target_profile": deepcopy(state.get("target_profile", {})),
             "attack_surface": deepcopy(state.get("attack_surface", {})),
             "attack_queue": deepcopy(state.get("attack_queue", [])),
+            "completed_attacks": deepcopy(state.get("completed_attacks", [])),
+            "evidence": deepcopy(state.get("evidence", [])),
             "stage_results": deepcopy(orchestrator.get("stage_results", {})),
             "observations": deepcopy(state.get("orchestrator", {}).get("observations", {})),
             "approvals": deepcopy(orchestrator.get("approvals", [])),

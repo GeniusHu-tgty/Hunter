@@ -156,6 +156,21 @@ def test_fingerprint_database_has_seeded_catalog_and_detects_passive_observation
     assert result["confidence"] > 0.7
 
 
+
+def test_fingerprint_database_rejects_generic_path_only_product_match():
+    result = FingerprintDatabase().detect(
+        {
+            "url": "https://generic.example.test/login",
+            "headers": {"Content-Type": "text/html"},
+            "body": "<title>Sign in</title>",
+            "paths": ["/login"],
+        }
+    )
+
+    assert result["cms"] is None
+    assert result["framework"] is None
+
+
 def test_memory_mcp_tools_record_query_recommend_detect_and_stats(tmp_path):
     mcp_server._reset_memory_store(tmp_path / "targets.db")
 

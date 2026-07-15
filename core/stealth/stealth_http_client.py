@@ -24,6 +24,8 @@ FALLBACK_WARNING='curl_cffi not installed, falling back to requests (TLS fingerp
 _FALLBACK_WARNING_EMITTED=False
 CSRF_RE=re.compile(r'(?:name=["\'](?P<name>csrf(?:_token)?|_token|authenticity_token)["\'][^>]*value=["\'](?P<value>[^"\']+)|value=["\'](?P<value2>[^"\']+)["\'][^>]*name=["\'](?P<name2>csrf(?:_token)?|_token|authenticity_token)["\'])',re.I)
 FINGERPRINT_BLOCK_WORDS=('forbidden','access denied','\u62e6\u622a','\u5b89\u5168\u68c0\u6d4b')
+CAPTCHA_TEMPLATE_URL_RE=re.compile(r'\$\{|@\{|#\{|<%|%>',re.I)
+CAPTCHA_IMAGE_EXTENSION_RE=re.compile(r'\.(?:png|jpe?g|gif|webp|bmp|svg)(?:[?#]|$)',re.I)
 
 class _DetectionElapsed:
  def __init__(self,seconds): self._seconds=float(seconds)
@@ -115,8 +117,8 @@ class DetectionSession:
   return self.client.rotate_fingerprint(session_id=self.session_id,reason=reason)
 
 class StealthHTTPClient:
- def __init__(self,state_dir=None,transport_factory=None,sleep=time.sleep,fingerprint_manager=None,proxy_pool=None,persist_secrets=True,impersonate=None):
-  self.state_dir=Path(state_dir or 'sessions/stealth').resolve(); self.state_dir.mkdir(parents=True,exist_ok=True); self._uses_default_transport=transport_factory is None; self.transport_factory=transport_factory or self._default_transport; self.impersonate=impersonate; self.sleep=sleep; self.fingerprints=fingerprint_manager or FingerprintManager(); self.proxy_pool=proxy_pool or ProxyPool(); self.waf=WAFDetector(self.state_dir/'waf_history.json'); self.rate=AdaptiveRateLimiter(sleep=sleep); self.captcha=CaptchaHandler(artifact_dir=self.state_dir/'captcha'); self.persist_secrets=bool(persist_secrets); self._sessions={}
+ def __init__(self,state_dir=None,transport_factory=None,sleep=time.sleep,fingerprint_manager=None,proxy_pool=None,persist_secrets=True,impersonate=None,fallback_transport_factory=None,technique_memory=None):
+  self.state_dir=Path(state_dir or 'sessions/stealth').resolve(); self.state_dir.mkdir(parents=True,exist_ok=True); self._uses_default_transport=transport_factory is None; self.transport_factory=transport_factory or self._default_transport; self.fallback_transport_factory=fallback_transport_factory; self.technique_memory=technique_memory; self.impersonate=impersonate; self.sleep=sleep; self.fingerprints=fingerprint_manager or FingerprintManager(); self.proxy_pool=proxy_pool or ProxyPool(); self.waf=WAFDetector(self.state_dir/'waf_history.json'); self.rate=AdaptiveRateLimiter(sleep=sleep); self.captcha=CaptchaHandler(artifact_dir=self.state_dir/'captcha',technique_memory=technique_memory); self.persist_secrets=bool(persist_secrets); self._sessions={}
  def _default_transport(self,state=None):
   global _FALLBACK_WARNING_EMITTED
   if requests is None: raise RuntimeError('requests is required for live HTTP transport')
@@ -127,11 +129,41 @@ class StealthHTTPClient:
   kwargs={}
   if state and state.get('impersonate'): kwargs['impersonate']=state['impersonate']
   return requests.Session(**kwargs)
+ def _requests_fallback_transport(self):
+  if self.fallback_transport_factory is not None: return self.fallback_transport_factory()
+  if native_requests is None: return None
+  return native_requests.Session()
+ def _switch_transport_backend(self,runtime,reason,status_code=None):
+  previous_backend=runtime.get('transport_backend','custom')
+  if not str(previous_backend).startswith('curl_cffi'): return None
+  transport=self._requests_fallback_transport()
+  if transport is None: return None
+  state=runtime['state']; previous_transport=runtime['transport']; cookies=getattr(previous_transport,'cookies',None)
+  if cookies and hasattr(cookies,'get_dict'): state['cookies'].update(cookies.get_dict())
+  if state.get('cookies') and hasattr(transport,'cookies'):
+   try: transport.cookies.update(state['cookies'])
+   except Exception: pass
+  event={'at':time.time(),'reason':str(reason),'previous_backend':previous_backend,'new_backend':'requests-fallback','status_code':status_code,'effective':None}
+  runtime.update({'transport':transport,'transport_backend':'requests-fallback','is_curl_transport':False,'applied_impersonate':None}); state['transport_preference']='requests-fallback'; state.setdefault('transport_switches',[]).append(event); state['transport_switches']=state['transport_switches'][-100:]; self._save(state); return event
+ def _record_transport_effect(self,state,target,event,response=None,error=None):
+  if not event: return
+  status_code=int(getattr(response,'status_code',0) or 0); success=bool(response is not None and status_code not in {502,503} and status_code>0); event.update({'outcome_status_code':status_code,'outcome_error':str(error or ''),'effective':success})
+  memory=self.technique_memory
+  if memory is not None and hasattr(memory,'record_attempt'):
+   try: memory.record_attempt(target_url=str(target),technique_name='transport_backend_switch',waf_type='gateway',success=success,metadata=dict(event),notes='Automatic curl_cffi to requests fallback after gateway failure.')
+   except Exception as exc: state.setdefault('memory_warnings',[]).append(str(exc))
+ def _record_rotation_effect(self,state,event,response=None,error=None):
+  if not event: return
+  status_code=int(getattr(response,'status_code',0) or 0); failure=bool(error) or status_code in {403,502,503}; outcome={'outcome_status_code':status_code,'outcome_error':str(error or ''),'effective':not failure}
+  event.update(outcome)
+  for stored in reversed(state.get('fingerprint_rotations',[])):
+   if stored.get('count')==event.get('count'):
+    stored.update(outcome); break
  def _key(self,target):
   parsed=urlparse(target if '://' in target else 'https://'+target); scheme=parsed.scheme or 'https'; port=parsed.port or (443 if scheme=='https' else 80); return f'{scheme}://{(parsed.hostname or target).lower()}:{port}'
  def _path(self,key): return self.state_dir/f'{re.sub(r"[^a-zA-Z0-9_.-]","_",key)}.json'
  def _ensure_fingerprint_state(self,state):
-  original=deepcopy(state); state.setdefault('session_id',f'stealth-{uuid.uuid4().hex[:12]}'); state.setdefault('cookies',{}); state.setdefault('csrf_tokens',{}); state.setdefault('oauth_chain',[]); state.setdefault('steps',[]); state.setdefault('timeline',[]); state.setdefault('rate_limit',{}); state.setdefault('proxy',None); state.setdefault('fingerprint_rotation_count',0); state.setdefault('fingerprint_rotations',[])
+  original=deepcopy(state); state.setdefault('session_id',f'stealth-{uuid.uuid4().hex[:12]}'); state.setdefault('cookies',{}); state.setdefault('csrf_tokens',{}); state.setdefault('oauth_chain',[]); state.setdefault('steps',[]); state.setdefault('timeline',[]); state.setdefault('rate_limit',{}); state.setdefault('proxy',None); state.setdefault('fingerprint_rotation_count',0); state.setdefault('fingerprint_rotations',[]); state.setdefault('transport_preference',None); state.setdefault('transport_switches',[])
   failures=state.setdefault('fingerprint_failures',{}); failures.setdefault('gateway',0); failures.setdefault('timeout',0)
   self.fingerprints.bind_session(state['session_id'],state['fingerprint_id']); return original!=state
  def _prepare_transport_state(self,state,fingerprint_strategy='random',impersonate=None):
@@ -145,12 +177,12 @@ class StealthHTTPClient:
   changed=self._ensure_fingerprint_state(state)
   if prepare and self._prepare_transport_state(state): changed=True
   if changed: self._save(state)
-  transport=self._default_transport(state) if self._uses_default_transport else self.transport_factory()
+  transport=(self._requests_fallback_transport() if state.get('transport_preference')=='requests-fallback' else self._default_transport(state)) if self._uses_default_transport else self.transport_factory()
   if state.get('cookies') and hasattr(transport,'cookies'):
    try: transport.cookies.update(state['cookies'])
    except Exception as exc: state.setdefault('restore_warnings',[]).append(str(exc))
   module=type(transport).__module__
-  is_curl=bool(CURL_CFFI_AVAILABLE and (self._uses_default_transport or module.startswith('curl_cffi.')))
+  is_curl=bool(CURL_CFFI_AVAILABLE and state.get('transport_preference')!='requests-fallback' and (self._uses_default_transport or module.startswith('curl_cffi.')))
   backend='curl_cffi' if self._uses_default_transport and is_curl else 'requests-fallback' if self._uses_default_transport else 'curl_cffi-custom' if is_curl else 'custom'
   runtime={'state':state,'transport':transport,'transport_backend':backend,'is_curl_transport':is_curl,'applied_impersonate':getattr(transport,'impersonate',None) if is_curl else None}; self._sessions[state['target']]=runtime; return runtime
  def _runtime_for_session_id(self,session_id):
@@ -201,7 +233,7 @@ class StealthHTTPClient:
   event={'at':time.time(),'reason':str(reason),'automatic':bool(automatic),'previous_fingerprint_id':previous['id'],'new_fingerprint_id':selected['id'],'previous_browser':previous['browser'],'new_browser':selected['browser'],'count':state['fingerprint_rotation_count']}
   state['fingerprint_rotations'].append(event); state['fingerprint_rotations']=state['fingerprint_rotations'][-100:]
   if self._uses_default_transport:
-   transport=self._default_transport(state)
+   transport=self._requests_fallback_transport() if state.get('transport_preference')=='requests-fallback' else self._default_transport(state)
    if state.get('cookies') and hasattr(transport,'cookies'): transport.cookies.update(state['cookies'])
    module=type(transport).__module__; is_curl=bool(CURL_CFFI_AVAILABLE and module.startswith('curl_cffi.')); runtime.update({'transport':transport,'transport_backend':'curl_cffi' if is_curl else 'requests-fallback','is_curl_transport':is_curl,'applied_impersonate':getattr(transport,'impersonate',None) if is_curl else None})
   self._save(state); return deepcopy(event)
@@ -466,11 +498,19 @@ class StealthHTTPClient:
    return (headers,rotated,'applied') if rotated is not None else (headers,data,'unsupported')
   return headers,data,'unsupported'
  def _captcha_image_url(self,response):
-  text=str(getattr(response,'text','')); matches=re.findall(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)["\'][^>]*>',text,re.I)
-  candidate=next((x for x in matches if 'captcha' in x.lower() or 'verify' in x.lower()),matches[0] if matches and ('captcha' in text.lower() or 'verify' in text.lower()) else '')
-  return urljoin(getattr(response,'url',''),candidate) if candidate else ''
+  text=str(getattr(response,'text','')); candidates=[]
+  for tag in re.findall(r'<img\b[^>]*>',text,re.I|re.S):
+   match=re.search(r'(?:^|\s)(?P<name>src|data-src|th:src)\s*=\s*(?P<quote>["\'])(?P<value>.*?)(?P=quote)',tag,re.I|re.S)
+   if match: candidates.append((match.group('value').strip(),match.group('name').lower(),tag))
+  selected=next((item for item in candidates if re.search(r'captcha|kaptcha|verify',item[0]+' '+item[2],re.I)),candidates[0] if candidates and re.search(r'captcha|kaptcha|verify',text,re.I) else None)
+  if not selected: return '',None
+  raw_url,attribute_name,_tag=selected
+  if attribute_name.startswith('th:') or CAPTCHA_TEMPLATE_URL_RE.search(raw_url): return '','captcha image URL is a server-side template expression'
+  if not raw_url.lower().startswith(('http://','https://')) and not CAPTCHA_IMAGE_EXTENSION_RE.search(raw_url): return '','captcha image URL is not a fetchable image resource'
+  return urljoin(getattr(response,'url',''),raw_url),None
  def _solve_page_captcha(self,response,transport,state,request_headers,options,request_proxy,timeline):
-  image_url=self._captcha_image_url(response)
+  image_url,skip_reason=self._captcha_image_url(response)
+  if skip_reason: return {'solved':False,'text':'','type':None,'status':'not-required','reason':skip_reason}
   if not image_url: return self.captcha.handle(response,state['target'],options.get('captcha_engine','pytesseract'))
   image_origin=self._key(image_url); allowed_origins=set(options.get('allowed_origins') or [state['target']])
   if image_origin not in allowed_origins: return {'solved':False,'text':'','type':'image','status':'blocked','reason':'captcha image origin is outside authorized scope','url':image_url}
@@ -486,7 +526,7 @@ class StealthHTTPClient:
    if result['solved']: return {'solved':True,'text':result['text'],'type':'image','attempts':attempts}
   return {'solved':False,'text':'','type':'image','attempts':attempts}
  def stealth_request(self,method,url,headers=None,data=None,options=None):
-  options=options or {}; runtime=self._runtime(url); state=runtime['state']; transport=runtime['transport']; transport_backend=runtime.get('transport_backend','custom'); applied_impersonate=runtime.get('applied_impersonate'); is_curl_transport=bool(runtime.get('is_curl_transport')); max_retries=min(3,max(0,int(options.get('max_retries',3)))); strategy=deepcopy(options.get('initial_strategy')) if isinstance(options.get('initial_strategy'),dict) else None; timeline=[]; response=None; automatic_rotation_retries=0
+  options=options or {}; runtime=self._runtime(url); state=runtime['state']; transport=runtime['transport']; transport_backend=runtime.get('transport_backend','custom'); applied_impersonate=runtime.get('applied_impersonate'); is_curl_transport=bool(runtime.get('is_curl_transport')); max_retries=min(3,max(0,int(options.get('max_retries',3)))); strategy=deepcopy(options.get('initial_strategy')) if isinstance(options.get('initial_strategy'),dict) else None; timeline=[]; response=None; automatic_rotation_retries=0; pending_transport_switch=None; pending_fingerprint_rotation=None
   for attempt in range(max_retries+1):
    request_headers=self._headers(state,headers); request_data=deepcopy(data)
    for name,value in state['csrf_tokens'].items():
@@ -511,16 +551,24 @@ class StealthHTTPClient:
    kwargs.update(proxy_args); start=time.monotonic()
    try: response=transport.request(request_method,request_url,**kwargs); elapsed=round(time.monotonic()-start,4)
    except Exception as exc:
+    if pending_transport_switch:
+     self._record_transport_effect(state,request_url,pending_transport_switch,error=exc); pending_transport_switch=None
+    if pending_fingerprint_rotation:
+     self._record_rotation_effect(state,pending_fingerprint_rotation,error=exc); pending_fingerprint_rotation=None
     elapsed=round(time.monotonic()-start,4); timeout_failure=self._is_timeout_exception(exc); failures=state['fingerprint_failures']; failures['gateway']=0; failures['timeout']=failures['timeout']+1 if timeout_failure else 0
     row={'attempt':attempt+1,'error':str(exc),'elapsed':elapsed,'strategy':strategy and strategy['id'],'strategy_status':strategy_status,'fingerprint_id':state['fingerprint_id'],'impersonate':applied_impersonate,'requested_impersonate':state.get('impersonate'),'transport_backend':transport_backend,'proxy':request_proxy,'failure_class':'timeout' if timeout_failure else 'exception','gateway_streak':failures['gateway'],'timeout_streak':failures['timeout']}; timeline.append(row)
     if request_proxy: self.proxy_pool.record_request(request_proxy,False,state['target']); state['proxy']=None
     self.rate.record_failure(state['target'],request_proxy)
     if attempt<max_retries:
-     if timeout_failure and failures['timeout']>=3 and automatic_rotation_retries<2:
-      event=self._rotate_runtime_fingerprint(runtime,'consecutive-timeouts',automatic=True); automatic_rotation_retries+=1; row['fingerprint_rotation']=event; row['retry_reason']='consecutive-timeouts'
+     if timeout_failure and failures['timeout']>=2 and automatic_rotation_retries<2:
+      event=self._rotate_runtime_fingerprint(runtime,'consecutive-timeouts',automatic=True); pending_fingerprint_rotation=event; automatic_rotation_retries+=1; row['fingerprint_rotation']=event; row['retry_reason']='consecutive-timeouts'
       transport=runtime['transport']; transport_backend=runtime.get('transport_backend','custom'); applied_impersonate=runtime.get('applied_impersonate'); is_curl_transport=bool(runtime.get('is_curl_transport'))
-     self.sleep(self.rate.backoff(state['target'],request_proxy,failure_recorded=True)); continue
+     delay=self.rate.backoff(state['target'],request_proxy,failure_recorded=True); row['retry_delay']=delay; self.sleep(delay); continue
     self._finalize(state,timeline); return {'status':'error','error':str(exc),'attempts':attempt+1,'timeline':timeline}
+   if pending_transport_switch:
+    self._record_transport_effect(state,request_url,pending_transport_switch,response=response); pending_transport_switch=None
+   if pending_fingerprint_rotation:
+    self._record_rotation_effect(state,pending_fingerprint_rotation,response=response); pending_fingerprint_rotation=None
    self._capture_cookies(response,state,transport); waf=self.waf.detect_response(response); response_headers=dict(getattr(response,'headers',{})); response_text=str(getattr(response,'text','')); limited=self.rate.is_rate_limited(response.status_code,response_headers,response_text); gateway_streak=self._record_http_fingerprint_signal(state,response.status_code,limited)
    if request_proxy: self.proxy_pool.record_request(request_proxy,not waf['blocked'],state['target'],banned=False,latency_ms=elapsed*1000)
    self.rate.record_response(state['target'],response.status_code,request_proxy,response_headers,response_text,limited=limited); self._csrf(response_text,state)
@@ -535,11 +583,15 @@ class StealthHTTPClient:
     if waf['blocked']:
      choices=self.waf.strategies_for(waf['waf_type'])
      if choices: strategy=choices[min(attempt,len(choices)-1)]
-    event=self._rotate_runtime_fingerprint(runtime,'403-block-keyword',automatic=True); automatic_rotation_retries+=1; row['fingerprint_rotation']=event; row['retry_reason']='403-block-keyword'
+    event=self._rotate_runtime_fingerprint(runtime,'403-block-keyword',automatic=True); pending_fingerprint_rotation=event; automatic_rotation_retries+=1; row['fingerprint_rotation']=event; row['retry_reason']='403-block-keyword'
     transport=runtime['transport']; transport_backend=runtime.get('transport_backend','custom'); applied_impersonate=runtime.get('applied_impersonate'); is_curl_transport=bool(runtime.get('is_curl_transport')); continue
    if response.status_code in {502,503} and not limited:
+    if attempt<max_retries:
+     switch=self._switch_transport_backend(runtime,'gateway-502-503',response.status_code)
+     if switch:
+      row['transport_switch']=switch; row['retry_reason']='transport-backend-switch'; pending_transport_switch=switch; transport=runtime['transport']; transport_backend=runtime.get('transport_backend','custom'); applied_impersonate=runtime.get('applied_impersonate'); is_curl_transport=bool(runtime.get('is_curl_transport')); continue
     if gateway_streak>=2 and attempt<max_retries and automatic_rotation_retries<2:
-     event=self._rotate_runtime_fingerprint(runtime,'gateway-502-503-streak',automatic=True); automatic_rotation_retries+=1; row['fingerprint_rotation']=event; row['retry_reason']='gateway-502-503-streak'
+     event=self._rotate_runtime_fingerprint(runtime,'gateway-502-503-streak',automatic=True); pending_fingerprint_rotation=event; automatic_rotation_retries+=1; row['fingerprint_rotation']=event; row['retry_reason']='gateway-502-503-streak'
      transport=runtime['transport']; transport_backend=runtime.get('transport_backend','custom'); applied_impersonate=runtime.get('applied_impersonate'); is_curl_transport=bool(runtime.get('is_curl_transport')); continue
     if attempt<max_retries: row['retry_reason']='gateway-streak-observation'; continue
    if waf['blocked'] and attempt<max_retries:
@@ -598,4 +650,3 @@ class StealthHTTPClient:
   waf=self.waf.active_probe(target,sender) if options.get('active_waf',True) else {'passive':baseline['timeline'][-1].get('waf') if baseline.get('timeline') else {}}
   rates=options.get('rate_probe_rates',[1,2,5,10,20]); rate_result=self.rate.probe_threshold(target,lambda:sender('GET',target),rates=rates,requests_per_rate=options.get('requests_per_rate',5))
   return {'target':target,'baseline':baseline,'waf':waf,'rate_limit':rate_result,'captcha':captcha,'session':self.session_state(target)}
-

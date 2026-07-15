@@ -288,11 +288,10 @@ def test_rate_limited_503_does_not_rotate_fingerprint(tmp_path):
     assert state['fingerprint_failures']['gateway']==0
 
 
-def test_third_consecutive_timeout_rotates_then_retries(tmp_path):
+def test_second_consecutive_timeout_rotates_then_retries(tmp_path):
     transport=ExceptionTransport([
         TimeoutError('one'),
         TimeoutError('two'),
-        TimeoutError('three'),
         Response(200,'ok'),
     ])
     client=StealthHTTPClient(
@@ -304,18 +303,112 @@ def test_third_consecutive_timeout_rotates_then_retries(tmp_path):
     result=client.stealth_request(
         'GET',
         'https://fixture/',
-        options={'max_retries':3,'jitter':False},
+        options={'max_retries':2,'jitter':False},
     )
     state=client.session_state('https://fixture')
 
     assert result['status_code']==200
-    assert result['attempts']==4
+    assert result['attempts']==3
     assert state['fingerprint_rotations'][-1]['reason']==(
         'consecutive-timeouts'
     )
     assert state['fingerprint_rotations'][-1]['previous_browser']!=(
         state['fingerprint_rotations'][-1]['new_browser']
     )
+    assert state['fingerprint_rotations'][-1]['effective'] is True
+    assert state['fingerprint_rotations'][-1]['outcome_status_code']==200
+
+
+def test_timeout_retries_use_exponential_backoff(tmp_path):
+    transport=ExceptionTransport([
+        TimeoutError('one'),
+        TimeoutError('two'),
+        Response(200,'ok'),
+    ])
+    slept=[]
+    client=StealthHTTPClient(
+        state_dir=tmp_path,
+        transport_factory=lambda:transport,
+        sleep=slept.append,
+    )
+    client.rate.before_request=lambda *args,**kwargs:0
+
+    result=client.stealth_request(
+        'GET',
+        'https://fixture/',
+        options={'max_retries':2,'jitter':False},
+    )
+
+    assert slept==[1,2]
+    assert [row['retry_delay'] for row in result['timeline'][:2]]==[1,2]
+
+
+def test_timeout_rotation_is_session_scoped_across_requests(tmp_path):
+    transport=ExceptionTransport([
+        TimeoutError('first request'),
+        TimeoutError('second request'),
+        Response(200,'ok'),
+    ])
+    client=StealthHTTPClient(
+        state_dir=tmp_path,
+        transport_factory=lambda:transport,
+        sleep=lambda _:None,
+    )
+
+    first=client.stealth_request(
+        'GET',
+        'https://fixture/one',
+        options={'max_retries':0,'jitter':False},
+    )
+    second=client.stealth_request(
+        'GET',
+        'https://fixture/two',
+        options={'max_retries':1,'jitter':False},
+    )
+
+    assert first['status']=='error'
+    assert second['status_code']==200
+    assert second['timeline'][0]['retry_reason']=='consecutive-timeouts'
+    assert client.session_state('https://fixture')[
+        'fingerprint_rotation_count'
+    ]==1
+
+
+def test_gateway_switches_transport_and_records_effect(tmp_path):
+    primary=Transport([Response(502,'gateway')])
+    fallback=Transport([Response(200,'ok')])
+
+    class Memory:
+        def __init__(self): self.attempts=[]
+        def record_attempt(self,**kwargs): self.attempts.append(kwargs)
+
+    memory=Memory()
+    client=StealthHTTPClient(
+        state_dir=tmp_path,
+        transport_factory=lambda:primary,
+        fallback_transport_factory=lambda:fallback,
+        technique_memory=memory,
+        sleep=lambda _:None,
+    )
+    client.session_create('https://fixture',resume=False)
+    runtime=client._runtime('https://fixture')
+    runtime['transport_backend']='curl_cffi'
+    runtime['is_curl_transport']=True
+
+    result=client.stealth_request(
+        'GET',
+        'https://fixture/',
+        options={'max_retries':1,'jitter':False},
+    )
+
+    assert result['status_code']==200
+    assert result['timeline'][0]['transport_switch'][
+        'new_backend'
+    ]=='requests-fallback'
+    assert memory.attempts[-1]['technique_name']==(
+        'transport_backend_switch'
+    )
+    assert memory.attempts[-1]['success'] is True
 
 
 def test_http_response_resets_timeout_streak(tmp_path):

@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qs, urljoin, urlparse
 
+from core.reasoning.attack_reasoning import AttackReasoner
+
 
 SPA_SCRIPT_THRESHOLD = 64 * 1024
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
@@ -533,7 +535,8 @@ class UnifiedOrchestrationBridge:
                             }
                         )
                     )
-            return _json_result(self._resolve_operation(value))
+            if value is not NotImplemented:
+                return _json_result(self._resolve_operation(value))
 
         try:
             import mcp_server
@@ -2114,10 +2117,228 @@ class UnifiedOrchestrationBridge:
             unique_ranked.append(item)
         return unique_ranked[:limit]
 
+    @staticmethod
+    def _reasoning_technologies(fingerprints: Mapping[str, Any]) -> list[str]:
+        technologies = []
+        for value in fingerprints.values():
+            if isinstance(value, Mapping):
+                value = value.get("name") or value.get("value") or value.get("type")
+            values = value if isinstance(value, (list, tuple, set)) else [value]
+            for item in values:
+                name = str(item or "").strip()
+                if name and name not in technologies:
+                    technologies.append(name)
+        return technologies
+
+    @staticmethod
+    def _reasoning_cookies(profile: Mapping[str, Any]) -> dict[str, str]:
+        cookies = dict(profile.get("cookies") or {})
+        raw_cookie = str(
+            profile.get("session", {}).get("cookie", "")
+            or profile.get("session_cookie", "")
+        )
+        for part in raw_cookie.split(";"):
+            name, separator, value = part.strip().partition("=")
+            if separator and name and value:
+                cookies.setdefault(name, value)
+        return cookies
+
+    def _reasoning_facts(self, context: Mapping[str, Any]) -> dict[str, Any]:
+        profile = dict(context.get("target_profile") or {})
+        fingerprints = dict(profile.get("fingerprints") or {})
+        cookies = self._reasoning_cookies(profile)
+        target_type = str(profile.get("target_type") or "general_web")
+        authentication = str(profile.get("authentication") or "")
+        if not authentication:
+            if target_type == "cas_authentication":
+                authentication = "cas_sso"
+            elif cookies:
+                authentication = "session_cookie"
+            else:
+                authentication = "none"
+        endpoints = list(profile.get("api_endpoints") or [])
+        endpoints.extend(
+            item.get("target")
+            for item in context.get("attack_queue", [])
+            if isinstance(item, Mapping) and item.get("target")
+        )
+        waf = (
+            profile.get("waf")
+            or fingerprints.get("waf")
+            or profile.get("stealth_scan", {}).get("waf")
+        )
+        if waf and not isinstance(waf, Mapping):
+            waf = {"type": str(waf), "confidence": 1.0}
+        captcha = profile.get("captcha") or profile.get("stealth_scan", {}).get("captcha")
+        forms = []
+        for raw_form in profile.get("forms") or []:
+            form = dict(raw_form) if isinstance(raw_form, Mapping) else {}
+            form.setdefault("fields", list(form.get("inputs") or []))
+            forms.append(form)
+        return {
+            "target_url": str(context.get("target_url") or profile.get("target_url") or ""),
+            "target_type": target_type,
+            "authentication": authentication,
+            "captcha": captcha or None,
+            "waf": waf or None,
+            "endpoints": endpoints,
+            "params": list(profile.get("params") or []),
+            "forms": forms,
+            "cookies": cookies,
+            "technologies": self._reasoning_technologies(fingerprints),
+        }
+
+    @staticmethod
+    def _merge_reasoned_queue(existing: Sequence[dict], reasoned: Sequence[dict]) -> list[dict]:
+        replacements = {
+            str(item.get("strategy_id")): dict(item)
+            for item in reasoned
+            if item.get("strategy_id")
+        }
+        merged = []
+        seen = set()
+        for raw_item in existing:
+            item = dict(raw_item)
+            strategy_id = str(item.get("strategy_id") or "")
+            if strategy_id and strategy_id in seen:
+                continue
+            if strategy_id in replacements:
+                replacement = replacements.pop(strategy_id)
+                if str(item.get("status") or "") != "completed":
+                    item = {**item, **replacement}
+            if strategy_id:
+                seen.add(strategy_id)
+            merged.append(item)
+        for strategy_id, item in replacements.items():
+            if strategy_id not in seen:
+                merged.append(item)
+        return merged
+
+    @staticmethod
+    def _expand_reasoned_queue(queue: Sequence[dict]) -> list[dict]:
+        tool_kinds = {
+            "hunter_session_execute_chain": "authentication",
+            "hunter_auto_sqli": "sqli",
+            "hunter_auto_xss": "xss",
+            "hunter_auto_ssrf": "ssrf_open_redirect",
+            "hunter_auto_access_control": "api_access_control",
+            "hunter_auto_idor": "api_access_control",
+            "hunter_auto_csrf": "registration",
+            "hunter_auto_jwt": "api_access_control",
+            "hunter_browser_navigate": "authentication",
+            "hunter_scan_plan": "baseline",
+        }
+        expanded = []
+        for item in queue:
+            actions = item.get("actions") if isinstance(item, Mapping) else None
+            if not actions:
+                expanded.append(dict(item))
+                continue
+            for action_index, raw_action in enumerate(actions, start=1):
+                action = dict(raw_action)
+                tool = str(action.get("tool") or "hunter_scan_plan")
+                params = dict(action.get("params") or {})
+                target = str(
+                    params.get("target")
+                    or params.get("target_url")
+                    or item.get("target")
+                    or ""
+                )
+                parameter = str(action.get("param") or params.get("param") or "")
+                tool_args = dict(params)
+                tool_args.pop("target", None)
+                tool_args.pop("target_url", None)
+                allowed_args = {
+                    "hunter_auto_access_control": {"cookie"},
+                    "hunter_auto_idor": {"cookie", "endpoint"},
+                    "hunter_auto_sqli": {"param", "method", "case_slug", "deep_action"},
+                    "hunter_auto_xss": {"param", "method", "verify_with_browser"},
+                    "hunter_auto_ssrf": {"param", "method", "collaborator"},
+                    "hunter_auto_csrf": {"cookie"},
+                    "hunter_auto_jwt": {"cookie", "token"},
+                    "hunter_browser_navigate": {"wait_for"},
+                    "hunter_scan_plan": {"mode", "phases"},
+                }
+                if tool == "hunter_session_execute_chain":
+                    tool_args = {
+                        "chain_name": str(action.get("chain") or "login_to_admin"),
+                        "params": params,
+                    }
+                    login_path = str(params.get("login_path") or "")
+                    if login_path:
+                        tool_args["endpoint"] = login_path
+                elif tool in allowed_args:
+                    tool_args = {
+                        key: value
+                        for key, value in tool_args.items()
+                        if key in allowed_args[tool]
+                    }
+                expanded.append({
+                    "kind": str(action.get("kind") or tool_kinds.get(tool, "baseline")),
+                    "priority": str(action.get("priority") or "P2"),
+                    "target": target,
+                    "method": str(action.get("method") or params.get("method") or "GET").upper(),
+                    "parameters": [parameter] if parameter else [],
+                    "strategy_id": item.get("strategy_id"),
+                    "reasoning_action_id": f"{item.get('strategy_id', 'reasoned')}:{action_index}",
+                    "strategy_title": item.get("title", ""),
+                    "condition": item.get("condition", ""),
+                    "status": item.get("status", ""),
+                    "tool": tool,
+                    "tool_args": tool_args,
+                })
+        return expanded
+
     def stage_attack_execution(
         self,
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
+        facts = self._reasoning_facts(context)
+        evidence = list(context.get("evidence") or [])
+        observations = context.get("observations") or {}
+
+        def collect_observations(value: Any) -> None:
+            if isinstance(value, Mapping):
+                if any(key in value for key in ("type", "summary", "status_code")):
+                    evidence.append(dict(value))
+                for nested in value.values():
+                    collect_observations(nested)
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                for nested in value:
+                    collect_observations(nested)
+
+        collect_observations(observations)
+        evidence.extend(
+            item
+            for item in context.get("target_profile", {}).get("browser_evidence", [])
+            if isinstance(item, Mapping)
+        )
+        try:
+            recommendations = self._technique_recommendations(context)
+        except Exception:
+            recommendations = []
+        technique_memory = {"recommendations": recommendations}
+        provided_strategies = context.get("strategies")
+        if provided_strategies is not None:
+            reasoned_strategies = [
+                dict(item)
+                for item in provided_strategies
+                if isinstance(item, Mapping)
+            ]
+        else:
+            reasoner = self._service("attack_reasoner", AttackReasoner)
+            reasoned_strategies = reasoner.reason(
+                facts,
+                evidence,
+                technique_memory,
+            )
+        attack_queue = self._merge_reasoned_queue(
+            list(context.get("attack_queue") or []),
+            reasoned_strategies,
+        )
+        if isinstance(context, dict):
+            context["attack_queue"] = attack_queue
+        execution_queue = self._expand_reasoned_queue(attack_queue)
         tools = {
             "authentication_bypass": "hunter_auto_access_control",
             "authentication": "hunter_auto_access_control",
@@ -2164,17 +2385,31 @@ class UnifiedOrchestrationBridge:
                 for name in self.services
             )
         )
-        executable_session = callable(
-            getattr(self._stealth_client(), "detection_session", None)
-        )
+        executable_session = False
+        if session_id and not has_injected_executor:
+            executable_session = callable(
+                getattr(self._stealth_client(), "detection_session", None)
+            )
+        execution_mode = str(
+            context.get("profile", {}).get("mode") or "interactive"
+        ).casefold()
         executed = bool(
-            session_id and (has_injected_executor or executable_session)
+            has_injected_executor
+            or (
+                session_id
+                and execution_mode == "autopilot"
+                and executable_session
+            )
         )
         explicit_tools = {
             "hunter_auto_access_control",
+            "hunter_auto_idor",
             "hunter_auto_sqli",
             "hunter_auto_ssrf",
             "hunter_auto_xss",
+            "hunter_auto_csrf",
+            "hunter_auto_jwt",
+            "hunter_browser_navigate",
             "hunter_scan_plan",
             "hunter_session_execute_chain",
         }
@@ -2278,7 +2513,7 @@ class UnifiedOrchestrationBridge:
                 for marker in ("/login", "/signin", "/auth", "/cas/")
             )
 
-        for index, item in enumerate(context.get("attack_queue", []), start=1):
+        for index, item in enumerate(execution_queue, start=1):
             kind = str(item.get("kind") or "baseline")
             target = str(item.get("target") or context["target_url"])
             parameters = _parameter_names(item.get("parameters", []))
@@ -2330,9 +2565,14 @@ class UnifiedOrchestrationBridge:
                 arguments["param"] = parameters[0] if parameters else "url"
             elif tool in {
                 "hunter_auto_access_control",
+                "hunter_auto_idor",
                 "hunter_auto_csrf",
             }:
                 arguments = {"target": target, "cookie": cookie}
+            elif tool == "hunter_auto_jwt":
+                arguments = {"target": target, "cookie": cookie}
+            elif tool == "hunter_browser_navigate":
+                arguments = {"target_url": target}
             elif tool == "hunter_scan_plan":
                 arguments = {
                     "target": target,
@@ -2603,9 +2843,7 @@ class UnifiedOrchestrationBridge:
                         },
                     },
                 })
-        if any(item.get("strategy_id") for item in context.get("attack_queue", [])):
-            executed = False
-        if not executed:
+        if handoffs:
             return {
                 "status": "deferred",
                 "handoffs": handoffs,
@@ -2613,6 +2851,8 @@ class UnifiedOrchestrationBridge:
                 "browser_operations": browser_operations,
                 "browser_evidence": browser_evidence,
                 "http_transport": "stealth_http_client",
+                "attack_queue": attack_queue,
+                "completed_attacks": sorted(completed_attacks),
             }
         return {
             "status": "completed",
@@ -2622,6 +2862,8 @@ class UnifiedOrchestrationBridge:
             "browser_evidence": browser_evidence,
             "http_transport": "stealth_http_client",
             "session_id": session_id,
+            "attack_queue": attack_queue,
+            "completed_attacks": sorted(completed_attacks),
         }
 
     @staticmethod
@@ -2936,6 +3178,283 @@ class UnifiedOrchestrationBridge:
                 "post_exploitation_handoffs",
                 [],
             ),
+        }
+
+
+class OrchestratorRunner:
+    """Execute the six native orchestration bridge stages end to end."""
+
+    _PRIORITY = {"P0": 0, "P1": 1, "P2": 2}
+
+    def __init__(
+        self,
+        bridge: UnifiedOrchestrationBridge,
+        stealth_client: "StealthHTTPClient",
+        reasoner: AttackReasoner,
+    ) -> None:
+        self.bridge = bridge
+        self.stealth_client = stealth_client
+        self.reasoner = reasoner
+        services = getattr(self.bridge, "services", None)
+        if isinstance(services, dict):
+            services.setdefault("stealth_http_client", stealth_client)
+            services.setdefault("attack_reasoner", reasoner)
+
+    def run(self, target: str, options: dict | None = None) -> dict:
+        """Run memory, recon, reasoning, execution, confirmation, and learning."""
+        config = dict(options or {})
+        profile = dict(config.get("profile") or {})
+        for key in (
+            "policy",
+            "mode",
+            "modules",
+            "max_endpoints",
+            "timeout",
+            "session_id",
+        ):
+            if key in config:
+                profile.setdefault(key, config[key])
+        target_info: dict[str, Any] = {
+            "url": target,
+            "target_url": target,
+            "profile": profile,
+            "options": config,
+            "phases_completed": [],
+            "stage_results": {},
+            "errors": [],
+        }
+        if config.get("session_id"):
+            target_info["session_id"] = config["session_id"]
+        if config.get("session_cookie") or config.get("cookie"):
+            target_info["session_cookie"] = str(
+                config.get("session_cookie") or config.get("cookie")
+            )
+
+        memory = self._run_stage("memory", self.bridge.stage_memory, target_info)
+        self._apply_stage(target_info, "memory", memory)
+
+        recon = self._run_stage("recon", self.bridge.stage_recon, target_info)
+        self._apply_stage(target_info, "recon", recon)
+
+        attack_surface = self._run_stage(
+            "attack_surface",
+            self.bridge.stage_attack_surface,
+            target_info,
+        )
+        self._apply_stage(target_info, "attack_surface", attack_surface)
+
+        facts = self._build_facts(target_info)
+        evidence = self._evidence_items(recon.get("observations", []))
+        memory_data = {
+            "recommendations": list(
+                memory.get("memo", {}).get("best_techniques", [])
+            )
+        }
+        try:
+            strategies = self.reasoner.reason(facts, evidence, memory_data)
+        except Exception as exc:
+            target_info["errors"].append(self._error("attack_surface", exc))
+            strategies = []
+        target_info["strategies"] = list(strategies or [])
+
+        attack_results = [
+            self._execute_strategy(strategy, target_info)
+            for strategy in sorted(target_info["strategies"], key=self._priority)
+        ]
+        target_info["attack_results"] = attack_results
+        execution = self._merge_attack_results(attack_results)
+        target_info["stage_results"]["attack_execution"] = execution
+        target_info.update(execution)
+        target_info["phases_completed"].append("attack_execution")
+
+        confirmation = self._run_stage(
+            "confirmation",
+            self.bridge.stage_confirmation,
+            target_info,
+        )
+        target_info["stage_results"]["vulnerability_confirmation"] = confirmation
+        target_info.update(confirmation)
+        target_info["phases_completed"].append("confirmation")
+
+        learning = self._run_stage(
+            "evidence_learning",
+            self.bridge.stage_evidence_learning,
+            target_info,
+        )
+        self._apply_stage(target_info, "evidence_learning", learning)
+        return target_info
+
+    def _run_stage(self, name: str, operation, info: dict) -> dict:
+        try:
+            result = operation(info)
+            return dict(result) if isinstance(result, Mapping) else {"result": result}
+        except Exception as exc:
+            info["errors"].append(self._error(name, exc))
+            return {
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _error(stage: str, exc: Exception) -> dict[str, str]:
+        return {
+            "stage": stage,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+
+    @staticmethod
+    def _apply_stage(info: dict, name: str, result: Mapping[str, Any]) -> None:
+        value = dict(result)
+        info["stage_results"][name] = value
+        info.update(value)
+        info["phases_completed"].append(name)
+
+    @staticmethod
+    def _evidence_items(value: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+
+        def collect(current: Any) -> None:
+            if isinstance(current, Mapping):
+                if any(key in current for key in ("type", "summary", "status_code")):
+                    items.append(dict(current))
+                else:
+                    for nested in current.values():
+                        collect(nested)
+            elif isinstance(current, Sequence) and not isinstance(current, (str, bytes)):
+                for nested in current:
+                    collect(nested)
+
+        collect(value)
+        return items
+
+    def _build_facts(self, info: dict) -> dict:
+        """Build the normalized fact dictionary consumed by AttackReasoner."""
+        profile = dict(info.get("target_profile") or {})
+        endpoints = list(
+            profile.get("api_endpoints")
+            or profile.get("endpoints")
+            or info.get("endpoints")
+            or []
+        )
+        params = _parameter_names(
+            profile.get("params")
+            or info.get("params")
+            or []
+        )
+        forms = []
+        for raw_form in profile.get("forms") or info.get("forms") or []:
+            form = dict(raw_form) if isinstance(raw_form, Mapping) else {}
+            form.setdefault("fields", list(form.get("inputs") or []))
+            forms.append(form)
+
+        cookies = dict(profile.get("cookies") or {})
+        raw_cookie = str(
+            profile.get("session", {}).get("cookie", "")
+            or profile.get("session_cookie", "")
+            or info.get("session_cookie", "")
+        )
+        for part in raw_cookie.split(";"):
+            name, separator, value = part.strip().partition("=")
+            if separator and name:
+                cookies.setdefault(name, value)
+
+        fingerprints = dict(profile.get("fingerprints") or {})
+        technologies = []
+        raw_technologies = list(profile.get("technologies") or [])
+        raw_technologies.extend(fingerprints.values())
+        for raw_value in raw_technologies:
+            if isinstance(raw_value, Mapping):
+                raw_value = (
+                    raw_value.get("name")
+                    or raw_value.get("value")
+                    or raw_value.get("type")
+                )
+            values = raw_value if isinstance(raw_value, (list, tuple, set)) else [raw_value]
+            for value in values:
+                name = str(value or "").strip()
+                if name and name not in technologies:
+                    technologies.append(name)
+
+        waf = (
+            profile.get("waf")
+            or fingerprints.get("waf")
+            or profile.get("stealth_scan", {}).get("waf")
+        )
+        if waf and not isinstance(waf, Mapping):
+            waf = {"type": str(waf), "confidence": 1.0}
+        captcha = (
+            profile.get("captcha")
+            or profile.get("stealth_scan", {}).get("captcha")
+        )
+        target_type = str(profile.get("target_type") or "general_web")
+        authentication = str(profile.get("authentication") or "")
+        if not authentication:
+            if target_type == "cas_authentication":
+                authentication = "cas_sso"
+            elif cookies:
+                authentication = "session_cookie"
+            else:
+                authentication = "none"
+        return {
+            "target_url": str(info.get("target_url") or info.get("url") or ""),
+            "target_type": target_type,
+            "authentication": authentication,
+            "captcha": captcha or None,
+            "waf": dict(waf) if isinstance(waf, Mapping) else None,
+            "endpoints": endpoints,
+            "params": params,
+            "forms": forms,
+            "cookies": cookies,
+            "technologies": technologies,
+        }
+
+    def _execute_strategy(self, strategy: dict, info: dict) -> dict:
+        """Execute one reasoned strategy through the bridge's auto-tool dispatcher."""
+        execution_context = dict(info)
+        execution_context["stage_results"] = dict(info.get("stage_results") or {})
+        execution_context["attack_queue"] = []
+        execution_context["strategies"] = [dict(strategy)]
+        result = self._run_stage(
+            "attack_execution",
+            self.bridge.stage_attack_execution,
+            execution_context,
+        )
+        return {"strategy_id": strategy.get("strategy_id", ""), **result}
+
+    @classmethod
+    def _priority(cls, strategy: Mapping[str, Any]) -> tuple[int, str]:
+        action_priorities = [
+            cls._PRIORITY.get(str(action.get("priority") or "P2"), 2)
+            for action in strategy.get("actions", [])
+            if isinstance(action, Mapping)
+        ]
+        priority = min(
+            action_priorities,
+            default=cls._PRIORITY.get(str(strategy.get("priority") or "P2"), 2),
+        )
+        return priority, str(strategy.get("strategy_id") or "")
+
+    @staticmethod
+    def _merge_attack_results(results: Sequence[Mapping[str, Any]]) -> dict:
+        attempts = []
+        handoffs = []
+        browser_operations = []
+        browser_evidence = []
+        statuses = []
+        for result in results:
+            attempts.extend(result.get("attempts") or [])
+            handoffs.extend(result.get("handoffs") or [])
+            browser_operations.extend(result.get("browser_operations") or [])
+            browser_evidence.extend(result.get("browser_evidence") or [])
+            statuses.append(str(result.get("status") or ""))
+        return {
+            "status": "deferred" if handoffs or "deferred" in statuses else "completed",
+            "attempts": attempts,
+            "handoffs": handoffs,
+            "browser_operations": browser_operations,
+            "browser_evidence": browser_evidence,
         }
 
 

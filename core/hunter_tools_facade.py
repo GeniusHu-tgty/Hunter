@@ -418,7 +418,7 @@ class HunterToolsFacade:
             if not any(item["tool"] == tool for item in recs):
                 recs.append({"tool": tool, "reason": reason, "priority": priority})
 
-        if any(token in text for token in ["idor", "userid", "user_id", "object", "authorization", "x-id-token"]):
+        if any(token in text for token in ["idor", "userid", "user_id", "object", "authorization", "access control", "x-id-token", "\u8d8a\u6743", "\u6c34\u5e73\u8d8a\u6743", "\u5782\u76f4\u8d8a\u6743", "\u8bbf\u95ee\u63a7\u5236"]):
             add("hunter_auto_idor", "object or authorization boundary signal", 10)
             add("hunter_auto_access_control", "compare role/token access matrix", 9)
             add("hunter_burp_repeater", "manual differential proof in Repeater", 8)

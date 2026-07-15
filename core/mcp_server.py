@@ -7,6 +7,7 @@ Provides structured access to all Hunter pentest tools
 import subprocess
 import json
 import os
+import shlex
 import sys
 import socket
 import threading
@@ -22,6 +23,8 @@ from datetime import datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+from .process_runner import ExternalProcessRunner
 
 try:
     import dns.exception as dns_exception
@@ -45,43 +48,38 @@ class HunterMCPServer:
         self.wordlist_dir = self.base_dir / "wordlists"
         self.output_dir = self.base_dir / "evidence" / "tool_output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.process_runner = ExternalProcessRunner()
         
         # Set environment
         os.environ["GOPROXY"] = "https://goproxy.cn,direct"
         
     def run_tool(self, tool_name, args, timeout=300):
         """Execute a tool and return structured output"""
-        tool_path = self.tools_dir / f"{tool_name}.exe"
+        direct_path = Path(str(tool_name))
+        tool_path = direct_path if direct_path.exists() else self.tools_dir / f"{tool_name}.exe"
         if not tool_path.exists():
-            # Try system PATH
-            tool_path = tool_name
-            
-        cmd = f'"{tool_path}" {args}'
-        
+            tool_path = str(tool_name)
+        if isinstance(args, str):
+            arguments = shlex.split(args, posix=True)
+        else:
+            arguments = [str(value) for value in args]
         try:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=timeout,
-                env=os.environ
+            return self.process_runner.run(
+                [str(tool_path), *arguments],
+                timeout=timeout,
+                env=os.environ,
             )
-            return {
-                "status": "success" if result.returncode == 0 else "error",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode
-            }
-        except subprocess.TimeoutExpired:
-            return {"status": "timeout", "stdout": "", "stderr": "Command timed out", "returncode": -1}
         except Exception as e:
             return {"status": "error", "stdout": "", "stderr": str(e), "returncode": -1}
     
-    def nuclei_scan(self, target, tags=None, severity=None):
+    def nuclei_scan(self, target, tags=None, severity=None, timeout=240):
         """Run nuclei vulnerability scanner"""
-        args = f"-u {target} -timeout 10"
+        args = ["-u", str(target), "-timeout", "10"]
         if tags:
-            args += f" -tags {tags}"
+            args.extend(["-tags", str(tags)])
         if severity:
-            args += f" -severity {severity}"
-        return self.run_tool("nuclei", args, timeout=600)
+            args.extend(["-severity", str(severity)])
+        return self.run_tool("nuclei", args, timeout=timeout)
 
     @staticmethod
     def _valid_subdomain(name, domain):
@@ -376,7 +374,7 @@ class HunterMCPServer:
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
 
-    def subfinder_enum(self, domain):
+    def subfinder_enum(self, domain, timeout=SUBDOMAIN_ENUM_TIMEOUT_SECONDS):
         """Enumerate through crt.sh, then bounded local DNS brute force."""
         started = time.monotonic()
         normalized = str(domain or "").strip().lower().rstrip(".")
@@ -406,16 +404,18 @@ class HunterMCPServer:
                 "attempts": [],
             }
 
+        total_budget = max(0.1, float(timeout))
+        crt_timeout = min(CRT_SH_TIMEOUT_SECONDS, total_budget)
         crt_result = self._crtsh_enum(
             normalized,
-            timeout=CRT_SH_TIMEOUT_SECONDS,
+            timeout=crt_timeout,
         )
         attempts = [
             {
                 "source": "crt.sh",
                 "status": crt_result.get("status", "error"),
                 "count": len(crt_result.get("subdomains", [])),
-                "timeout_seconds": CRT_SH_TIMEOUT_SECONDS,
+                "timeout_seconds": crt_timeout,
                 "elapsed_seconds": crt_result.get("elapsed_seconds"),
                 "error": crt_result.get("error", ""),
             }
@@ -436,11 +436,11 @@ class HunterMCPServer:
         elapsed = time.monotonic() - started
         remaining = max(
             0.0,
-            SUBDOMAIN_ENUM_TIMEOUT_SECONDS - elapsed,
+            total_budget - elapsed,
         )
         dns_budget = min(
             remaining,
-            SUBDOMAIN_ENUM_TIMEOUT_SECONDS - CRT_SH_TIMEOUT_SECONDS,
+            max(0.0, total_budget - crt_timeout),
         )
         if dns_budget <= 0:
             dns_result = {
@@ -521,83 +521,69 @@ class HunterMCPServer:
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
     
-    def httpx_probe(self, targets):
+    def httpx_probe(self, targets, timeout=120):
         """Probe HTTP services"""
-        return self.run_tool("httpx", f'-u "{targets}" -silent -status-code -title -tech-detect', timeout=120)
+        return self.run_tool("httpx", ["-u", targets, "-silent", "-status-code", "-title", "-tech-detect"], timeout=timeout)
     
-    def naabu_scan(self, host, ports="top-100"):
+    def naabu_scan(self, host, ports="top-100", timeout=120):
         """Scan ports"""
         if ports == "top-100":
-            port_args = "-top-ports 100"
+            port_args = ["-top-ports", "100"]
         elif ports == "top-1000":
-            port_args = "-top-ports 1000"
+            port_args = ["-top-ports", "1000"]
         elif ports == "full":
-            port_args = "-p 1-65535"
+            port_args = ["-p", "1-65535"]
         else:
-            port_args = f"-p {ports}"
-        return self.run_tool("naabu", f'-host "{host}" {port_args} -silent', timeout=120)
+            port_args = ["-p", str(ports)]
+        return self.run_tool("naabu", ["-host", host, *port_args, "-silent"], timeout=timeout)
     
-    def ffuf_fuzz(self, url, wordlist=None, mode="dir"):
+    def ffuf_fuzz(self, url, wordlist=None, mode="dir", timeout=240):
         """Fuzz web application"""
         if not wordlist:
             wordlist = str(self.wordlist_dir / "common.txt")
         fuzz_url = url if "FUZZ" in url else url.rstrip("/") + "/FUZZ"
-        return self.run_tool("ffuf", f'-u "{fuzz_url}" -w "{wordlist}" -t 50 -mc all -json', timeout=300)
+        return self.run_tool("ffuf", ["-u", fuzz_url, "-w", wordlist, "-t", "50", "-mc", "all", "-json"], timeout=timeout)
     
-    def dalfox_xss(self, url):
+    def dalfox_xss(self, url, timeout=120):
         """Test for XSS vulnerabilities"""
-        return self.run_tool("dalfox", f"url {url} -silent", timeout=120)
+        return self.run_tool("dalfox", ["url", url, "-silent"], timeout=timeout)
     
-    def sqlmap_test(self, url, level=1, risk=1):
+    def sqlmap_test(self, url, level=1, risk=1, timeout=240):
         """Test for SQL injection"""
         sqlmap_path = r"C:\Program Files\Python314\Scripts\sqlmap.exe"
         if Path(sqlmap_path).exists():
-            cmd = f'"{sqlmap_path}" -u "{url}" --batch --level={level} --risk={risk}'
-            try:
-                result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, timeout=300, env=os.environ
-                )
-                return {
-                    "status": "success" if result.returncode == 0 else "error",
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                    "returncode": result.returncode,
-                }
-            except subprocess.TimeoutExpired:
-                return {"status": "timeout", "stdout": "", "stderr": "Command timed out", "returncode": -1}
-            except Exception as e:
-                return {"status": "error", "stdout": "", "stderr": str(e), "returncode": -1}
-        return self.run_tool("sqlmap", f'-u "{url}" --batch --level={level} --risk={risk}', timeout=300)
+            return self.run_tool(sqlmap_path, ["-u", url, "--batch", f"--level={level}", f"--risk={risk}"], timeout=timeout)
+        return self.run_tool("sqlmap", ["-u", url, "--batch", f"--level={level}", f"--risk={risk}"], timeout=timeout)
     
-    def gobuster_dir(self, url, wordlist=None):
+    def gobuster_dir(self, url, wordlist=None, timeout=240):
         """Directory brute force"""
         if not wordlist:
             wordlist = str(self.wordlist_dir / "common.txt")
-        return self.run_tool("gobuster", f"dir -u {url} -w {wordlist} -t 50 -q", timeout=300)
+        return self.run_tool("gobuster", ["dir", "-u", url, "-w", wordlist, "-t", "50", "-q"], timeout=timeout)
     
-    def katana_crawl(self, url, depth=2):
+    def katana_crawl(self, url, depth=2, timeout=150):
         """Crawl web application"""
-        return self.run_tool("katana", f"-u {url} -d {depth} -jc -silent", timeout=180)
+        return self.run_tool("katana", ["-u", url, "-d", str(depth), "-jc", "-silent"], timeout=timeout)
     
-    def gau_urls(self, domain):
+    def gau_urls(self, domain, timeout=60):
         """Fetch URLs from Wayback Machine"""
-        return self.run_tool("gau", f"{domain}", timeout=60)
+        return self.run_tool("gau", [domain], timeout=timeout)
     
-    def js_analyze(self, url):
+    def js_analyze(self, url, timeout=60):
         """Analyze JavaScript files"""
-        return self.run_tool("getjs", f"-u {url}", timeout=60)
+        return self.run_tool("getjs", ["-u", url], timeout=timeout)
     
-    def waf_detect(self, url):
+    def waf_detect(self, url, timeout=30):
         """Detect WAF"""
-        return self.run_tool("wafw00f", f"{url}", timeout=30)
+        return self.run_tool("wafw00f", [url], timeout=timeout)
     
-    def whatweb_identify(self, url):
+    def whatweb_identify(self, url, timeout=30):
         """Identify web technologies"""
-        return self.run_tool("whatweb", f"{url} -v", timeout=30)
+        return self.run_tool("whatweb", [url, "-v"], timeout=timeout)
     
-    def amass_enum(self, domain):
+    def amass_enum(self, domain, timeout=240):
         """Attack surface mapping"""
-        return self.run_tool("amass", f"enum -d {domain}", timeout=600)
+        return self.run_tool("amass", ["enum", "-d", domain], timeout=timeout)
 
 
 # Global instance

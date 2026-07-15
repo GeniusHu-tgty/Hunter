@@ -110,3 +110,19 @@ def test_recommend_next_prioritizes_logic_and_proof_goals():
     assert "hunter_auto_cors" in tools
     assert result["proof_goals"]
     assert all("reason" in item for item in result["recommendations"])
+
+
+
+def test_recommend_next_routes_chinese_access_control_signals():
+    result = load_json(
+        run_async(
+            mcp_server.hunter_recommend_next(
+                target="https://example.test/api/user/1",
+                signals=["\u8d8a\u6743", "\u6c34\u5e73\u8d8a\u6743"],
+                finding="",
+            )
+        )
+    )
+    tools = [item["tool"] for item in result["recommendations"]]
+    assert "hunter_auto_idor" in tools
+    assert "hunter_auto_access_control" in tools

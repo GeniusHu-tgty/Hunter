@@ -49,16 +49,12 @@ def test_dir_enum_decodes_standard_and_urlsafe_base64_paths(monkeypatch):
     payload, stdout = _run_dir_enum(monkeypatch, records)
 
     assert payload["stdout_preview"] == stdout
-    assert payload["results"] == records
-    assert payload["parsed_results"][0]["url"] == (
-        "https://target.test/.well-known/browserid"
-        "?source=ffuf#browser"
-    )
-    assert payload["parsed_results"][0]["raw_url"] == records[0]["url"]
-    assert payload["parsed_results"][1]["url"] == (
-        f"https://target.test/{urlsafe_text}"
-    )
-    assert payload["parsed_results"][1]["raw_url"] == records[1]["url"]
+    assert payload["200"] == [
+        "/.well-known/browserid?source=ffuf",
+        f"/{urlsafe_text}",
+    ]
+    assert payload["found"] == 2
+    assert payload["scanned"] == 2
 
 
 def test_dir_enum_keeps_plain_invalid_and_binary_paths(monkeypatch):
@@ -74,12 +70,8 @@ def test_dir_enum_keeps_plain_invalid_and_binary_paths(monkeypatch):
 
     payload, _ = _run_dir_enum(monkeypatch, records)
 
-    assert [record["url"] for record in payload["parsed_results"]] == [
-        record["url"] for record in records
-    ]
-    assert [record["raw_url"] for record in payload["parsed_results"]] == [
-        record["url"] for record in records
-    ]
+    assert payload["200"] == ["/admin/", "/AP8B"]
+    assert payload["403"] == ["/not_base64!/"]
 
 
 def test_dir_enum_summary_groups_statuses_and_resolves_redirects(monkeypatch):
@@ -94,17 +86,13 @@ def test_dir_enum_summary_groups_statuses_and_resolves_redirects(monkeypatch):
     ]
 
     payload, _ = _run_dir_enum(monkeypatch, records)
-    summary = payload["human_readable"]
-
-    assert "HTTP 200 (1个):" in summary
-    assert "  https://target.test/admin/" in summary
-    assert "HTTP 302 (1个):" in summary
-    assert (
-        "  https://target.test/user/ -> "
-        "https://target.test/user/login"
-    ) in summary
-    assert "HTTP 404 (1个):" in summary
-    assert "  https://target.test/config/" in summary
+    assert payload["200"] == ["/admin/"]
+    assert payload["302"] == [{
+        "path": "/user/",
+        "redirect": "https://target.test/user/login",
+    }]
+    assert payload["found"] == 2
+    assert payload["scanned"] == 3
 
 
 def test_dir_enum_summary_excludes_404_when_total_is_at_least_twenty(
@@ -125,9 +113,46 @@ def test_dir_enum_summary_excludes_404_when_total_is_at_least_twenty(
     )
 
     payload, _ = _run_dir_enum(monkeypatch, records)
-    summary = payload["human_readable"]
-
     assert payload["count"] == 20
-    assert "HTTP 200 (19个):" in summary
-    assert "HTTP 404" not in summary
-    assert "https://target.test/missing/" not in summary
+    assert payload["found"] == 19
+    assert payload["scanned"] == 20
+    assert len(payload["200"]) == 19
+    assert "404" not in payload
+
+
+def test_dir_enum_returns_compact_filtered_groups(monkeypatch):
+    records = [
+        {"url": "https://target.test/ok", "status": 200},
+        {
+            "url": "https://target.test/login",
+            "status": 302,
+            "redirectlocation": "/cas/login",
+        },
+        {"url": "https://target.test/private", "status": 403},
+        {"url": "https://target.test/missing", "status": 404},
+    ]
+
+    payload, _ = _run_dir_enum(monkeypatch, records)
+
+    assert payload["200"] == ["/ok"]
+    assert payload["302"] == [{
+        "path": "/login",
+        "redirect": "https://target.test/cas/login",
+    }]
+    assert payload["403"] == ["/private"]
+    assert payload["found"] == 3
+    assert payload["scanned"] == 4
+    assert "results" not in payload
+    assert "parsed_results" not in payload
+
+
+def test_dir_enum_compact_groups_are_capped_at_fifty(monkeypatch):
+    records = [
+        {"url": f"https://target.test/path-{index}", "status": 200}
+        for index in range(60)
+    ]
+
+    payload, _ = _run_dir_enum(monkeypatch, records)
+
+    assert payload["found"] == 60
+    assert len(payload["200"]) == 50

@@ -134,26 +134,158 @@ class OpenTgtyLabWorkspaceAdapter:
         if not root.is_dir(): raise FileNotFoundError(f"KB board not found: {key}")
         return root
 
+    def _board_roots(self, board: str) -> List[tuple[str, Path]]:
+        key = (board or "auto").lower()
+        if key in {"auto", "all"}:
+            names = ("ctf-website", "apk-reverse", "pe-reverse", "general")
+        else:
+            aliases = {
+                "web": "ctf-website",
+                "android": "apk-reverse",
+                "pe": "pe-reverse",
+            }
+            names = (aliases.get(key, key),)
+        roots = []
+        for name in names:
+            try:
+                roots.append((name, self._board_root(name)))
+            except FileNotFoundError:
+                if key not in {"auto", "all"}:
+                    raise
+        if not roots:
+            raise FileNotFoundError(f"No KB boards available for: {board}")
+        return roots
+
     @staticmethod
     def _tokens(query: str) -> List[str]:
-        return [x for x in re.findall(r"[A-Za-z0-9_\-\u4e00-\u9fff]+", query.lower()) if len(x) > 1]
+        tokens = [
+            item
+            for item in re.findall(
+                r"[A-Za-z0-9_\-\u4e00-\u9fff]+",
+                query.lower(),
+            )
+            if len(item) > 1
+        ]
+        return list(dict.fromkeys(tokens))
 
-    def kb_search(self, query: str, board: str = "general", limit: int = 20) -> Dict[str, Any]:
+    def kb_search(self, query: str, board: str = "auto", limit: int = 20) -> Dict[str, Any]:
         try:
-            root = self._board_root(board); tokens = self._tokens(query)
-            if not tokens: raise ValueError("query must contain searchable terms")
-            hits=[]; searched=0
-            for path in root.rglob("*.md"):
-                searched += 1
-                text = path.read_text(encoding="utf-8", errors="replace")
-                lower = text.lower(); rel = path.relative_to(root).as_posix()
-                score = sum(lower.count(t) * 2 + rel.lower().count(t) * 5 for t in tokens)
-                if score:
-                    pos=min((lower.find(t) for t in tokens if lower.find(t)>=0), default=0)
-                    hits.append({"path": rel, "board": board, "score": score, "snippet": text[max(0,pos-100):pos+300].replace("\n", " ")})
-            hits.sort(key=lambda x: (-x["score"], x["path"])); hits=hits[:max(1,min(limit,100))]
-            return self._ok("hunter_project_kb_search", {"query": query, "board": board, "results": hits, "returned": len(hits)}, evidence={"searched_files": searched})
-        except Exception as exc: return self._error("hunter_project_kb_search", exc)
+            roots = self._board_roots(board)
+            tokens = self._tokens(query)
+            if not tokens:
+                raise ValueError("query must contain searchable terms")
+            if not 1 <= int(limit) <= 100:
+                raise ValueError("limit must be between 1 and 100")
+            hits = []
+            searched = 0
+            query_phrase = " ".join(tokens)
+            for result_board, root in roots:
+                for path in root.rglob("*.md"):
+                    searched += 1
+                    content = path.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    lower = content.lower()
+                    rel = path.relative_to(root).as_posix()
+                    rel_lower = rel.lower()
+                    heading = next(
+                        (
+                            line.lstrip("# ").strip().lower()
+                            for line in content.splitlines()
+                            if line.startswith("#")
+                        ),
+                        "",
+                    )
+                    matched = [
+                        token
+                        for token in tokens
+                        if token in lower or token in rel_lower
+                    ]
+                    if not matched:
+                        continue
+                    coverage = len(matched) / len(tokens)
+                    if len(tokens) >= 6 and coverage < 0.5:
+                        continue
+                    if 4 <= len(tokens) < 6 and len(matched) < 2:
+                        continue
+                    body_score = sum(
+                        min(lower.count(token), 3) * 2
+                        for token in matched
+                    )
+                    title_score = sum(
+                        18 for token in matched if token in heading
+                    )
+                    path_score = sum(
+                        14 for token in matched if token in rel_lower
+                    )
+                    phrase_score = (
+                        40
+                        if query_phrase
+                        and query_phrase in f"{heading} {lower}"
+                        else 0
+                    )
+                    score = round(
+                        coverage * 100
+                        + body_score
+                        + title_score
+                        + path_score
+                        + phrase_score,
+                        3,
+                    )
+                    pos = min(
+                        (
+                            lower.find(token)
+                            for token in matched
+                            if lower.find(token) >= 0
+                        ),
+                        default=0,
+                    )
+                    hits.append(
+                        {
+                            "path": rel,
+                            "board": result_board,
+                            "score": score,
+                            "matched_tokens": len(matched),
+                            "coverage": round(coverage, 3),
+                            "snippet": content[
+                                max(0, pos - 100):pos + 300
+                            ].replace("\n", " "),
+                        }
+                    )
+            hits.sort(
+                key=lambda item: (
+                    -item["score"],
+                    -item["coverage"],
+                    item["board"],
+                    item["path"],
+                )
+            )
+            hits = hits[: int(limit)]
+            next_actions = []
+            if hits:
+                next_actions.append(
+                    {
+                        "tool": "hunter_project_kb_read",
+                        "arguments": {
+                            "board": hits[0]["board"],
+                            "technique_path": hits[0]["path"],
+                        },
+                    }
+                )
+            return self._ok(
+                "hunter_project_kb_search",
+                {
+                    "query": query,
+                    "board": board,
+                    "results": hits,
+                    "returned": len(hits),
+                },
+                evidence={"searched_files": searched},
+                next_actions=next_actions,
+            )
+        except Exception as exc:
+            return self._error("hunter_project_kb_search", exc)
 
     def kb_read(self, technique_path: str, board: str = "general", max_chars: int = 12000) -> Dict[str, Any]:
         try:
@@ -193,8 +325,19 @@ class OpenTgtyLabWorkspaceAdapter:
             if result["status"] == "ok": hits.extend(result["data"]["results"])
         hits=sorted(hits,key=lambda x:-x["score"])[:limit]
         rec=[]
-        mapping=(("jwt", "hunter_auto_jwt"),("token", "hunter_auto_jwt"),("idor", "hunter_auto_idor"),("authorization", "hunter_auto_access_control"),("cors", "hunter_auto_cors"),("graphql", "hunter_auto_graphql"),("xss", "hunter_auto_xss"),("sql", "hunter_auto_sqli"),("ssrf", "hunter_auto_ssrf"))
-        for token,tool in mapping:
-            if token in raw and tool not in [x["tool"] for x in rec]: rec.append({"tool":tool,"reason":f"Observed {token} signal"})
+        mapping = (
+            (("jwt", "token"), "hunter_auto_jwt"),
+            (("idor", "\u8d8a\u6743", "\u6c34\u5e73\u8d8a\u6743", "\u5782\u76f4\u8d8a\u6743"), "hunter_auto_idor"),
+            (("authorization", "access control", "\u8bbf\u95ee\u63a7\u5236", "\u8d8a\u6743"), "hunter_auto_access_control"),
+            (("cors",), "hunter_auto_cors"),
+            (("graphql",), "hunter_auto_graphql"),
+            (("xss",), "hunter_auto_xss"),
+            (("sql",), "hunter_auto_sqli"),
+            (("ssrf",), "hunter_auto_ssrf"),
+        )
+        for aliases, tool in mapping:
+            matched = next((token for token in aliases if token in raw), "")
+            if matched and tool not in [item["tool"] for item in rec]:
+                rec.append({"tool": tool, "reason": f"Observed {matched} signal"})
         if not rec: rec=[{"tool":"hunter_recon","reason":"No specific vulnerability signal yet"}]
         return self._ok("hunter_workspace_recommend", {"target": target or case.get("target", ""), "case": case, "case_next_steps": steps, "project_kb_hits": hits, "tool_recommendations": rec, "protocol": {"http_priority": ["Burp send_http2_request", "http_probe"], "source_priority": ["search_in_sources"], "evidence_required": True}, "artifact_routes": {"evidence": str(self.root / "exports/evidence" / (case_slug or "<case>")), "notes": str(self.root / "exports/notes"), "reports": str(self.root / "exports/reports")}})

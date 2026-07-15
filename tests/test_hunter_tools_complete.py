@@ -21,7 +21,7 @@ def test_fastmcp_registry_matches_hunter_tool_functions():
     registry = set(mcp_server.mcp._tool_manager._tools)
     functions = registered_functions(mcp_server)
     assert registry == functions
-    assert len(registry) == 111
+    assert len(registry) == 113
 
 
 def test_internal_tool_inventory_uses_fastmcp_registry(monkeypatch):
@@ -45,7 +45,7 @@ def test_complete_server_exposes_all_legacy_and_v81_tools():
         "hunter_dir_enum", "hunter_js_analyze", "hunter_js_unpack",
         "hunter_js_deobfuscate", "hunter_js_extract_api",
         "hunter_js_extract_signature", "hunter_js_full_analysis",
-        "hunter_auto_sqli", "hunter_auto_xss", "hunter_auto_ssrf",
+        "hunter_auto_attack", "hunter_auto_sqli", "hunter_auto_xss", "hunter_auto_ssrf",
         "hunter_auto_ssti", "hunter_auto_cmd", "hunter_auto_xxe",
         "hunter_auto_idor", "hunter_auto_csrf", "hunter_auto_cors",
         "hunter_auto_jwt", "hunter_auto_graphql", "hunter_auto_websocket",
@@ -64,7 +64,7 @@ def test_complete_server_exposes_all_legacy_and_v81_tools():
         "hunter_reverse_decrypt_plan",
     }
     assert required - registered_functions(mcp_server) == set()
-    assert len(required) == 60
+    assert len(required) == 61
 
 
 def test_project_mcp_config_has_only_hunter_tools():

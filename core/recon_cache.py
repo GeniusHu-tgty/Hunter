@@ -4,10 +4,16 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+
+_LOCKS_GUARD = threading.Lock()
+_KEY_LOCKS: dict[str, threading.RLock] = {}
 
 
 class ReconCache:
@@ -34,28 +40,39 @@ class ReconCache:
     def _path(self, key: str) -> Path:
         return self.root / f"{key}.json"
 
+    def _lock(self, key: str) -> threading.RLock:
+        lock_key = f"{self.root.resolve()}::{key}"
+        with _LOCKS_GUARD:
+            return _KEY_LOCKS.setdefault(lock_key, threading.RLock())
+
     def get(self, target: str, profile: str, plan_signature: str = "", ttl_s: int | None = None) -> dict[str, Any] | None:
-        path = self._path(self.key(target, profile, plan_signature))
-        if not path.exists():
-            return None
-        try:
-            record = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        ttl = self.default_ttl_s if ttl_s is None else int(ttl_s)
-        if ttl >= 0 and time.time() - float(record.get("created_at", 0)) > ttl:
-            path.unlink(missing_ok=True)
-            return None
-        record["cache_path"] = str(path)
-        return record
+        key = self.key(target, profile, plan_signature)
+        path = self._path(key)
+        with self._lock(key):
+            if not path.exists():
+                return None
+            try:
+                record = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            ttl = self.default_ttl_s if ttl_s is None else int(ttl_s)
+            if ttl >= 0 and time.time() - float(record.get("created_at", 0)) > ttl:
+                path.unlink(missing_ok=True)
+                return None
+            record["cache_path"] = str(path)
+            return record
 
     def put(self, target: str, profile: str, data: dict[str, Any], plan_signature: str = "") -> Path:
         key = self.key(target, profile, plan_signature)
         path = self._path(key)
         record = {"key": key, "target": self.normalize_target(target), "profile": profile, "created_at": time.time(), "data": data}
-        temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        temp.replace(path)
+        temp = self.root / f"{key}.{uuid.uuid4().hex}.tmp"
+        with self._lock(key):
+            try:
+                temp.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+                temp.replace(path)
+            finally:
+                temp.unlink(missing_ok=True)
         return path
 
     def status(self) -> dict[str, Any]:

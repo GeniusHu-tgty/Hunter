@@ -1,6 +1,8 @@
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
@@ -16,11 +18,12 @@ class AuditEntry:
 
 
 class AuditSession:
-    def __init__(self, session_id: str, target: str):
+    def __init__(self, session_id: str, target: str, status: str = "running"):
         self.session_id = session_id
         self.target = target
         self.entries: List[AuditEntry] = []
         self.start_time = datetime.now()
+        self.status = status
         self.report_data: Dict[str, Any] = {
             "reportable_findings": [],
             "lead_findings": [],
@@ -119,11 +122,43 @@ class AuditSession:
             "session_id": self.session_id,
             "target": self.target,
             "start_time": self.start_time.isoformat(),
+            "status": self.status,
             "reportable_findings": self.report_data.get("reportable_findings", []),
             "lead_findings": self.report_data.get("lead_findings", []),
             "summary": self.report_data.get("summary", {}),
             "audit_log": [asdict(entry) for entry in self.entries],
         }
+
+    def save(self, directory) -> str:
+        directory_path = Path(directory)
+        directory_path.mkdir(parents=True, exist_ok=True)
+        path = directory_path / f"{self.session_id}.json"
+        temporary_path = directory_path / f".{self.session_id}.{os.getpid()}.tmp"
+        payload = self.export_report_json()
+        payload["entries"] = payload.pop("audit_log")
+        temporary_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, path)
+        return str(path)
+
+    @classmethod
+    def load(cls, path):
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        session = cls(
+            str(payload["session_id"]),
+            str(payload["target"]),
+            status=str(payload.get("status", "running")),
+        )
+        session.start_time = datetime.fromisoformat(payload["start_time"])
+        session.report_data = {
+            "reportable_findings": payload.get("reportable_findings", []),
+            "lead_findings": payload.get("lead_findings", []),
+            "summary": payload.get("summary", {}),
+        }
+        session.entries = [AuditEntry(**entry) for entry in payload.get("entries", payload.get("audit_log", []))]
+        return session
 
     def export_markdown(self) -> str:
         lines = [

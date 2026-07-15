@@ -2252,6 +2252,104 @@ def test_explicit_strategy_stays_deferred_with_live_session():
     assert result["status"] == "deferred"
     assert result["handoffs"][0]["tool"] == "hunter_session_execute_chain"
 
+
+def test_attack_execution_merges_reasoned_strategies_and_deduplicates_ids():
+    class FakePatternEngine:
+        @staticmethod
+        def match_parameter(parameter, context=""):
+            return {"parameter": parameter, "vulnerability_types": []}
+
+    class EmptyTechniqueMemory:
+        @staticmethod
+        def best_for_waf(waf_type, limit=5):
+            return []
+
+    class EmptyTargetMemory:
+        @staticmethod
+        def query_target(target):
+            return {"attack_history": []}
+
+        @staticmethod
+        def similar_targets(target, limit=5):
+            return []
+
+    bridge = core.unified_scanner.UnifiedOrchestrationBridge(
+        {
+            "pattern_engine": FakePatternEngine(),
+            "technique_memory": EmptyTechniqueMemory(),
+            "target_memory": EmptyTargetMemory(),
+        }
+    )
+    context = {
+        "target_url": "https://cas.example.test",
+        "profile": {"name": "standard"},
+        "evidence": [{"type": "login_page", "summary": "CAS 登录页"}],
+        "target_profile": {
+            "target_type": "cas_authentication",
+            "authentication": "cas_sso",
+            "forms": [
+                {
+                    "action": "/lyuapServer/login",
+                    "fields": ["username", "password"],
+                }
+            ],
+            "api_endpoints": ["/lyuapServer/login"],
+            "fingerprints": {"edu_system": "金智 CAS"},
+        },
+        "attack_queue": [
+            {
+                "strategy_id": "cas_default_creds",
+                "title": "existing placeholder",
+                "actions": [],
+            }
+        ],
+    }
+
+    result = bridge.stage_attack_execution(context)
+
+    matching = [
+        item
+        for item in context["attack_queue"]
+        if item.get("strategy_id") == "cas_default_creds"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["actions"]
+    assert any(
+        item["tool"] == "hunter_session_execute_chain"
+        and item["arguments"]["chain_name"] == "login_to_admin"
+        for item in result["handoffs"]
+    )
+    assert any(item["tool"] == "hunter_auto_sqli" for item in result["handoffs"])
+
+
+
+def test_reasoned_access_control_action_filters_non_mcp_metadata():
+    queue = core.unified_scanner.UnifiedOrchestrationBridge._expand_reasoned_queue(
+        [
+            {
+                "strategy_id": "system_session_followup",
+                "title": "session follow-up",
+                "condition": "JSESSIONID available",
+                "actions": [
+                    {
+                        "tool": "hunter_auto_access_control",
+                        "priority": "P0",
+                        "params": {
+                            "target": "https://example.test/system/",
+                            "cookie": "JSESSIONID=abc",
+                            "session_cookie": "JSESSIONID=abc",
+                            "probe_path": "/system/",
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert queue[0]["tool_args"] == {"cookie": "JSESSIONID=abc"}
+    assert queue[0]["target"] == "https://example.test/system/"
+
+
 def test_deferred_stage_waits_for_external_result_then_resume_consumes_it(tmp_path):
     kernel = WorkflowKernel(tmp_path)
     slug = _workflow(kernel)
@@ -2287,6 +2385,100 @@ def test_deferred_stage_waits_for_external_result_then_resume_consumes_it(tmp_pa
     )
     assert resumed["status"] == "completed"
     assert resumed["learning_updates"][0]["technique"] == "case-variation"
+
+
+
+def test_reasoned_queue_merge_preserves_completed_strategy_state():
+    existing = [
+        {
+            "strategy_id": "cas_default_creds",
+            "status": "completed",
+            "actions": [{"tool": "hunter_scan_plan"}],
+            "result": {"status": "ok"},
+        }
+    ]
+    reasoned = [
+        {
+            "strategy_id": "cas_default_creds",
+            "title": "new reasoning",
+            "actions": [{"tool": "hunter_auto_sqli"}],
+        }
+    ]
+
+    merged = core.unified_scanner.UnifiedOrchestrationBridge._merge_reasoned_queue(
+        existing,
+        reasoned,
+    )
+
+    assert merged == existing
+
+
+def test_completed_reasoned_strategy_does_not_create_empty_deferred_stage():
+    class EmptyTechniqueMemory:
+        @staticmethod
+        def best_for_waf(waf_type, limit=5):
+            return []
+
+    class EmptyTargetMemory:
+        @staticmethod
+        def query_target(target):
+            return {"attack_history": []}
+
+        @staticmethod
+        def similar_targets(target, limit=5):
+            return []
+
+    bridge = core.unified_scanner.UnifiedOrchestrationBridge(
+        {
+            "technique_memory": EmptyTechniqueMemory(),
+            "target_memory": EmptyTargetMemory(),
+        }
+    )
+    result = bridge.stage_attack_execution(
+        {
+            "target_url": "https://example.test",
+            "profile": {"name": "standard"},
+            "target_profile": {"fingerprints": {}},
+            "attack_queue": [
+                {
+                    "strategy_id": "finished",
+                    "status": "completed",
+                    "actions": [{"tool": "hunter_scan_plan"}],
+                }
+            ],
+        }
+    )
+
+    assert result["status"] == "completed"
+    assert result["handoffs"] == []
+
+
+def test_blocked_attack_execution_persists_reasoned_queue_and_completion_keys(tmp_path):
+    kernel = WorkflowKernel(tmp_path)
+    slug = _workflow(kernel)
+    kernel._append(
+        slug,
+        "orchestrator.stage.blocked",
+        {
+            "stage": "attack_execution",
+            "status": "awaiting_external",
+            "result": {
+                "status": "deferred",
+                "attack_queue": [
+                    {"strategy_id": "cas_default_creds", "actions": []}
+                ],
+                "completed_attacks": ["sqli|hunter_auto_sqli|https://example.test"],
+                "handoffs": [{"tool": "hunter_auto_sqli"}],
+            },
+        },
+    )
+
+    state = kernel.materialize(slug)
+
+    assert state["attack_queue"][0]["strategy_id"] == "cas_default_creds"
+    assert state["completed_attacks"] == [
+        "sqli|hunter_auto_sqli|https://example.test"
+    ]
 
 
 def test_checkpoint_resume_recovers_from_corrupt_event_tail(tmp_path):

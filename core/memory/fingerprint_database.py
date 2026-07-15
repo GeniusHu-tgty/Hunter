@@ -140,6 +140,16 @@ _WEAK_COOKIE_NAMES = {
     "_session",
 }
 
+_WEAK_PATH_EVIDENCE = {
+    "/admin",
+    "/api",
+    "/docs",
+    "/login",
+    "/static",
+    "/system",
+    "/user/login",
+}
+
 
 def _seed_header_rules(
     values: Iterable[Any],
@@ -472,7 +482,7 @@ class FingerprintDatabase:
                 if expected and self._meta_matches(expected, body):
                     evidence.append({"source": "meta", "match": expected[:160]})
             for expected in signature.body_rules:
-                if expected and expected in body:
+                if expected and self._body_matches(expected, body):
                     evidence.append({"source": "body", "match": expected[:160]})
             for expected in signature.path_rules:
                 if any(expected in path for path in paths):
@@ -488,6 +498,15 @@ class FingerprintDatabase:
                     evidence.append({"source": "screenshot_text", "match": expected[:160]})
             if len(evidence) < signature.minimum_evidence:
                 continue
+            if signature.kind in {"cms", "framework", "api"} and evidence:
+                only_paths = all(item.get("source") == "path" for item in evidence)
+                weak_paths = all(
+                    str(item.get("match") or "").rstrip("/")
+                    in _WEAK_PATH_EVIDENCE
+                    for item in evidence
+                )
+                if only_paths and weak_paths:
+                    continue
             score = min(0.99, 0.5 + 0.15 * len(evidence))
             public = self._public(signature)
             detected_version = self._detect_version(
@@ -575,6 +594,18 @@ class FingerprintDatabase:
             if allow_prefix and cookie_name.startswith(expected_name):
                 return True
         return False
+
+    @staticmethod
+    def _body_matches(expected: str, body: str) -> bool:
+        if not expected:
+            return False
+        if re.fullmatch(r"[a-z0-9 .+#_-]+", expected):
+            return re.search(
+                rf"(?<![a-z0-9_]){re.escape(expected)}(?![a-z0-9_])",
+                body,
+                flags=re.IGNORECASE,
+            ) is not None
+        return expected in body
 
     @staticmethod
     def _meta_matches(expected: str, body: str) -> bool:

@@ -1,4 +1,5 @@
-﻿import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 import json
 from pathlib import Path
 
@@ -60,6 +61,32 @@ async def test_cache_hit_skips_runner(tmp_path):
     assert calls == 2
     assert first["metrics"]["cache_hit"] is False
     assert second["metrics"]["cache_hit"] is True
+
+
+
+def test_recon_cache_supports_concurrent_same_key_writers(tmp_path):
+    cache = ReconCache(tmp_path / "cache")
+
+    def write(index):
+        return cache.put(
+            "https://same.example.test",
+            "fast",
+            {"writer": index},
+            "same-plan",
+        )
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        paths = list(executor.map(write, range(32)))
+
+    assert len(set(paths)) == 1
+    record = cache.get(
+        "https://same.example.test",
+        "fast",
+        "same-plan",
+    )
+    assert record is not None
+    assert record["data"]["writer"] in range(32)
+    assert list((tmp_path / "cache").glob("*.tmp")) == []
 
 
 def test_result_compactor_persists_raw_and_returns_small_envelope(tmp_path):

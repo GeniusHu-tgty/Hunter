@@ -15,6 +15,7 @@ Tools:
 import asyncio
 import base64
 import binascii
+import functools
 import hashlib
 import http.client
 import ipaddress
@@ -37,6 +38,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 # Ensure hunter package is importable
 HUNTER_DIR = Path(__file__).parent
@@ -56,6 +58,8 @@ from core.workspace_adapter import OpenTgtyLabWorkspaceAdapter
 from core.doctor import HunterDoctor
 from core.adaptive_engine import AdaptiveEngine, get_mode_profile
 from core.recon_cache import ReconCache
+from core.reasoning.attack_reasoning import AttackReasoner
+from core.unified_scanner import OrchestratorRunner, UnifiedOrchestrationBridge
 from core.workflow import UnifiedOrchestrator, WorkflowKernel, WorkflowPolicy
 from core.workflow.locking import WorkflowFileLock
 from core.session import AttackChain, AttackSessionStore, PostExploitation
@@ -96,6 +100,7 @@ _hunter_tools = HunterToolsFacade(HUNTER_DIR)
 _workspace = OpenTgtyLabWorkspaceAdapter()
 _adaptive_cache = ReconCache(HUNTER_DIR / "evidence" / "adaptive_cache")
 _adaptive_engine = AdaptiveEngine(_adaptive_cache, HUNTER_DIR / "evidence" / "adaptive_raw")
+SCAN_SESSION_DIR = HUNTER_DIR / "sessions" / "scans"
 JS_ANALYSIS_EVIDENCE_DIR = HUNTER_DIR / "evidence" / "js_analysis"
 JS_REPLAY_DIR = Path(os.getenv("OPEN_TGTYLAB_ROOT", r"D:\Open-tgtylab")) / "exports" / "scripts"
 JS_ANALYSIS_MAX_BYTES = 10 * 1024 * 1024
@@ -290,6 +295,9 @@ _target_memory = None
 _technique_memory = None
 _pattern_engine = PatternEngine()
 _fingerprint_database = FingerprintDatabase()
+COMMON_WEB_PORTS = (80, 443, 8080, 8443, 9090, 9000, 3000, 5000, 8888)
+FAST_RECON_INFO_PATHS = ("/robots.txt", "/sitemap.xml", "/.well-known/")
+FAST_RECON_BASIC_PATHS = ("/login", "/admin", "/api", "/system", "/actuator")
 
 def _reset_stealth_client(state_dir: Optional[str | Path] = None):
     global _stealth_client
@@ -369,11 +377,79 @@ def _threadsafe_browser_mcp_caller(owner_loop=None):
     return proxy
 
 
+def _orchestrator_auto_tool_runner(tool_name, arguments):
+    implementations = {
+        "hunter_auto_sqli": ("core.auto_sqli", "auto_sqli_impl", "base_url"),
+        "hunter_auto_xss": ("core.auto_xss", "auto_xss_impl", "base_url"),
+        "hunter_auto_ssrf": ("core.auto_ssrf", "auto_ssrf_impl", "base_url"),
+        "hunter_auto_ssti": ("core.auto_ssti", "auto_ssti_impl", "base_url"),
+        "hunter_auto_cmd": ("core.auto_cmd", "auto_cmd_impl", "base_url"),
+        "hunter_auto_xxe": ("core.auto_xxe", "auto_xxe_impl", "base_url"),
+        "hunter_auto_idor": ("core.auto_idor", "auto_idor_impl", "url"),
+        "hunter_auto_jwt": ("core.auto_jwt", "auto_jwt_impl", "url"),
+        "hunter_auto_csrf": ("core.auto_csrf", "scan", "url"),
+        "hunter_auto_cors": ("core.auto_cors", "scan", "url"),
+        "hunter_auto_access_control": (
+            "core.auto_access_control",
+            "scan",
+            "url",
+        ),
+        "hunter_auto_graphql": ("core.auto_graphql", "full_scan", "base_url"),
+        "hunter_auto_race": ("core.auto_race", "full_scan", "url"),
+        "hunter_auto_websocket": (
+            "core.auto_websocket",
+            "full_scan",
+            "url",
+        ),
+    }
+    implementation = implementations.get(str(tool_name))
+    if implementation is None:
+        return NotImplemented
+    module_name, function_name, target_name = implementation
+    module = __import__(module_name, fromlist=[function_name])
+    function = getattr(module, function_name)
+    call_arguments = dict(arguments or {})
+    target = str(
+        call_arguments.pop("target", "")
+        or call_arguments.pop("target_url", "")
+        or call_arguments.pop(target_name, "")
+    )
+    if not target:
+        raise ValueError(f"{tool_name} requires target")
+    if tool_name == "hunter_auto_sqli" and call_arguments.get("session_id"):
+        call_arguments.setdefault(
+            "stealth_session_id",
+            call_arguments.pop("session_id"),
+        )
+    else:
+        call_arguments.pop("session_id", None)
+    if tool_name == "hunter_auto_xxe" and call_arguments.get("collaborator"):
+        call_arguments.setdefault("oob_domain", call_arguments.pop("collaborator"))
+    return _call_with_supported_kwargs(function, target, **call_arguments)
+
+
 def _orchestration_services(call_mcp_tool=None):
-    services = {"stealth_http_client": _get_stealth_client()}
+    services = {
+        "stealth_http_client": _get_stealth_client(),
+        "attack_reasoner": AttackReasoner(),
+    }
     if call_mcp_tool is not None:
         services["call_mcp_tool"] = call_mcp_tool
     return services
+
+
+def _orchestrator_runner(call_mcp_tool=None):
+    services = _orchestration_services(call_mcp_tool)
+    services["auto_tool_runner"] = _orchestrator_auto_tool_runner
+    bridge = UnifiedOrchestrationBridge(
+        services=services,
+        call_mcp_tool=call_mcp_tool,
+    )
+    return OrchestratorRunner(
+        bridge,
+        services["stealth_http_client"],
+        services["attack_reasoner"],
+    )
 
 
 def _browser_controller() -> BrowserController:
@@ -693,6 +769,39 @@ def _normalize_ffuf_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _compact_ffuf_results(records: List[Dict[str, Any]], limit: int = 50) -> Dict[str, Any]:
+    allowed = {200, 301, 302, 401, 403}
+    grouped: Dict[str, List[Any]] = {}
+    seen = set()
+    valid = []
+    for record in records:
+        status = _ffuf_status(record.get("status"))
+        if status not in allowed:
+            continue
+        parsed = urlsplit(str(record.get("url") or ""))
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        key = (status, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        valid.append((status, path, record))
+    for status, path, record in valid[:max(0, int(limit))]:
+        key = str(status)
+        if status in {301, 302}:
+            redirect = str(record.get("redirectlocation") or record.get("redirect") or "")
+            grouped.setdefault(key, []).append({
+                "path": path,
+                "redirect": urljoin(str(record.get("url") or ""), redirect) if redirect else "",
+            })
+        else:
+            grouped.setdefault(key, []).append(path)
+    grouped["found"] = len(valid)
+    grouped["scanned"] = len(records)
+    return grouped
+
+
 def _ffuf_status(value: Any) -> Any:
     try:
         return int(value)
@@ -931,9 +1040,32 @@ def _dns_lookup(host: str) -> Dict[str, Any]:
 def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
     host = _normalize_host(target)
     url = _normalize_url(target)
+    agent_timeout = kwargs.pop("_agent_timeout", None)
+    deadline = time.monotonic() + float(agent_timeout) if agent_timeout is not None else None
+
+    def remaining(default: float) -> float:
+        if deadline is None:
+            return float(default)
+        return max(0.1, min(float(default), deadline - time.monotonic()))
+
+    def has_budget() -> bool:
+        return deadline is None or deadline - time.monotonic() > 0.25
+
+    def budget_exhausted(tool: str) -> Dict[str, Any]:
+        return {
+            "status": "timeout",
+            "stdout": "",
+            "stderr": f"Agent deadline exhausted before starting {tool}",
+            "returncode": -1,
+        }
+
+    def timed_call(function, *args, default: float, **call_kwargs):
+        if deadline is not None:
+            call_kwargs["timeout"] = remaining(default)
+        return function(*args, **call_kwargs)
 
     if agent_name == "subdomain":
-        raw = _hunter.subfinder_enum(host)
+        raw = timed_call(_hunter.subfinder_enum, host, default=120)
         subdomains = _dedupe(_nonempty_lines(raw.get("stdout", "")))
         return _tool_payload(
             "subfinder",
@@ -957,7 +1089,7 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
 
     if agent_name == "port-scan":
         ports = kwargs.get("ports", "top-1000")
-        raw = _hunter.naabu_scan(host, ports=ports)
+        raw = timed_call(_hunter.naabu_scan, host, ports=ports, default=120)
         entries = _dedupe(_nonempty_lines(raw.get("stdout", "")))
         return _tool_payload("naabu", raw, {
             "target": host,
@@ -967,8 +1099,8 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
         })
 
     if agent_name == "tech-detect":
-        probe_raw = _hunter.httpx_probe(url)
-        tech_raw = _hunter.whatweb_identify(url)
+        probe_raw = timed_call(_hunter.httpx_probe, url, default=120)
+        tech_raw = timed_call(_hunter.whatweb_identify, url, default=30) if has_budget() else budget_exhausted("whatweb")
         status = "success" if "success" in {probe_raw.get("status"), tech_raw.get("status")} else "error"
         return {
             "status": status,
@@ -986,22 +1118,21 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
 
     if agent_name == "dir-enum":
         wordlist = _resolve_wordlist(kwargs.get("wordlist", "default"))
-        raw = _hunter.ffuf_fuzz(url, wordlist=wordlist)
+        raw = timed_call(_hunter.ffuf_fuzz, url, wordlist=wordlist, default=240)
         records = _parse_json_lines(raw.get("stdout", ""))
         parsed_records = [_normalize_ffuf_record(record) for record in records]
+        compact = _compact_ffuf_results(parsed_records, limit=50)
         return _tool_payload("ffuf", raw, {
             "target": url,
             "wordlist": wordlist,
-            "results": records[:200],
-            "parsed_results": parsed_records[:200],
-            "human_readable": _summarize_ffuf_results(parsed_records),
+            **compact,
             "count": len(records),
         })
 
     if agent_name == "js-analyze":
-        js_raw = _hunter.js_analyze(url)
-        crawl_raw = _hunter.katana_crawl(url)
-        wayback_raw = _hunter.gau_urls(host)
+        js_raw = timed_call(_hunter.js_analyze, url, default=60)
+        crawl_raw = timed_call(_hunter.katana_crawl, url, default=150) if has_budget() else budget_exhausted("katana")
+        wayback_raw = timed_call(_hunter.gau_urls, host, default=60) if has_budget() else budget_exhausted("gau")
         return {
             "status": "success" if "success" in {js_raw.get("status"), crawl_raw.get("status"), wayback_raw.get("status")} else "error",
             "target": url,
@@ -1017,9 +1148,9 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
         }
 
     if agent_name in {"api-discover", "param-discover", "endpoint-map"}:
-        crawl_raw = _hunter.katana_crawl(url)
-        wayback_raw = _hunter.gau_urls(host)
-        js_raw = _hunter.js_analyze(url)
+        crawl_raw = timed_call(_hunter.katana_crawl, url, default=150)
+        wayback_raw = timed_call(_hunter.gau_urls, host, default=60) if has_budget() else budget_exhausted("gau")
+        js_raw = timed_call(_hunter.js_analyze, url, default=60) if has_budget() else budget_exhausted("getjs")
         combined = _dedupe(
             _nonempty_lines(crawl_raw.get("stdout", ""))
             + _nonempty_lines(wayback_raw.get("stdout", ""))
@@ -1038,8 +1169,8 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
         }
 
     if agent_name == "auth-analysis":
-        probe_raw = _hunter.httpx_probe(url)
-        waf_raw = _hunter.waf_detect(url)
+        probe_raw = timed_call(_hunter.httpx_probe, url, default=120)
+        waf_raw = timed_call(_hunter.waf_detect, url, default=30) if has_budget() else budget_exhausted("wafw00f")
         return {
             "status": "success" if "success" in {probe_raw.get("status"), waf_raw.get("status")} else "error",
             "target": url,
@@ -1052,7 +1183,7 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
         }
 
     if agent_name == "xss-vuln" or agent_name == "xss-exploit":
-        raw = _hunter.dalfox_xss(url)
+        raw = timed_call(_hunter.dalfox_xss, url, default=120)
         findings = _dedupe(_nonempty_lines(raw.get("stdout", "")))
         return _tool_payload("dalfox", raw, {
             "target": url,
@@ -1062,14 +1193,14 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
 
     if agent_name == "sqli-vuln" or agent_name == "sqli-exploit":
         if "?" in url:
-            raw = _hunter.sqlmap_test(url, level=2, risk=2)
+            raw = timed_call(_hunter.sqlmap_test, url, level=2, risk=2, default=240)
             findings = _dedupe(_nonempty_lines(raw.get("stdout", "")))
             return _tool_payload("sqlmap", raw, {
                 "target": url,
                 "findings": findings[:200],
                 "count": len(findings),
             })
-        raw = _hunter.nuclei_scan(url, tags="sqli")
+        raw = timed_call(_hunter.nuclei_scan, url, tags="sqli", default=240)
         findings = _dedupe(_nonempty_lines(raw.get("stdout", "")))
         return _tool_payload("nuclei", raw, {
             "target": url,
@@ -1078,7 +1209,7 @@ def _execute_agent(agent_name: str, target: str, **kwargs) -> Dict[str, Any]:
         })
 
     if agent_name in _NUCLEI_TAGS:
-        raw = _hunter.nuclei_scan(url, tags=_NUCLEI_TAGS[agent_name])
+        raw = timed_call(_hunter.nuclei_scan, url, tags=_NUCLEI_TAGS[agent_name], default=240)
         findings = _dedupe(_nonempty_lines(raw.get("stdout", "")))
         return _tool_payload("nuclei", raw, {
             "target": url,
@@ -1128,16 +1259,206 @@ async def _execute_agent_async(agent_name: str, target: str, **kwargs) -> Dict[s
         else:
             timeout = 90
     try:
+        worker_timeout = max(0.1, float(timeout) - min(2.0, float(timeout) * 0.1))
         return await asyncio.wait_for(
-            asyncio.to_thread(_execute_agent, agent_name, target, **kwargs),
+            asyncio.to_thread(
+                _execute_agent,
+                agent_name,
+                target,
+                _agent_timeout=worker_timeout,
+                **kwargs,
+            ),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        return {
+        result = {
             "status": "timeout",
             "message": f"Agent '{agent_name}' timed out after {timeout}s.",
             "target": target,
+            "timeline": [{
+                "event": f"{agent_name}_timeout",
+                "timeout_seconds": timeout,
+                "continued": True,
+            }],
         }
+        if agent_name == "port-scan":
+            result.update({"open_ports": [], "count": 0})
+        return result
+
+
+async def _stealth_probe_url(client, url: str, timeout: float = 3.0) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            client.stealth_request,
+            "GET",
+            url,
+            options={
+                "max_retries": 0,
+                "jitter": False,
+                "timeout": timeout,
+                "max_body_chars": 4096,
+                "follow_redirects": False,
+            },
+        )
+    except Exception as exc:
+        return {"status": "error", "status_code": 0, "headers": {}, "body": "", "error": str(exc)}
+
+
+def _target_probe_ports(target: str) -> tuple[int, ...]:
+    parsed = urlsplit(_normalize_url(target))
+    try:
+        explicit_port = parsed.port
+    except ValueError:
+        explicit_port = None
+    if explicit_port is not None:
+        return (int(explicit_port),)
+    return tuple(int(port) for port in COMMON_WEB_PORTS)
+
+
+def _port_probe_url(target: str, port: int) -> str:
+    parsed = urlsplit(_normalize_url(target))
+    try:
+        explicit_port = parsed.port
+    except ValueError:
+        explicit_port = None
+    if explicit_port == int(port) and parsed.scheme in {"http", "https"}:
+        scheme = parsed.scheme
+    else:
+        scheme = "https" if int(port) in {443, 8443} else "http"
+    host = parsed.hostname or _normalize_host(target)
+    return f"{scheme}://{host}:{int(port)}/"
+
+
+async def _passive_port_scan(target: str, fallback_reason: str = "external-tool-timeout") -> Dict[str, Any]:
+    client = _get_stealth_client()
+    ports = _target_probe_ports(target)
+    urls = [_port_probe_url(target, port) for port in ports]
+    responses = await asyncio.gather(*(_stealth_probe_url(client, url) for url in urls))
+    probes = []
+    open_ports = []
+    for port, url, response in zip(ports, urls, responses):
+        status_code = int(response.get("status_code", 0) or 0)
+        headers = dict(response.get("headers") or {})
+        if status_code > 0:
+            open_ports.append(int(port))
+        probes.append({
+            "port": int(port),
+            "url": url,
+            "status_code": status_code,
+            "server": headers.get("Server") or headers.get("server") or "",
+            "error": str(response.get("error") or ""),
+        })
+    return {
+        "status": "success",
+        "target": _normalize_host(target),
+        "scan_type": "passive_scan",
+        "method": "http_application_probe",
+        "open_ports": open_ports,
+        "count": len(open_ports),
+        "probes": probes,
+        "fallback_reason": fallback_reason,
+        "timeline": [{
+            "event": "port_scan_timeout",
+            "fallback": "passive_scan",
+            "continued": True,
+            "reason": fallback_reason,
+        }],
+    }
+
+
+def _technology_names(fingerprints: Dict[str, Any], observations: Dict[str, Any]) -> List[str]:
+    names = []
+    for value in fingerprints.values():
+        if isinstance(value, dict):
+            name = str(value.get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+    text = (str(observations.get("body") or "") + " " + " ".join(observations.get("paths") or [])).lower()
+    headers = {str(key).lower(): str(value).lower() for key, value in (observations.get("headers") or {}).items()}
+    if any(signal in text for signal in ("cas login", "cas/login", "authserver", "lyuapserver")) or "tgc=" in headers.get("set-cookie", ""):
+        names.append("CAS") if "CAS" not in names else None
+    if "actuator" in text or "whitelabel error page" in text or "spring" in text:
+        names.append("Spring Boot") if "Spring Boot" not in names else None
+    if "jsessionid" in headers.get("set-cookie", "") and "Java" not in names:
+        names.append("Java")
+    for value in headers.values():
+        if "nginx" in value and "nginx" not in names:
+            names.append("nginx")
+    return names
+
+
+async def _fast_recon_impl(target: str) -> Dict[str, Any]:
+    started = time.monotonic()
+    client = _get_stealth_client()
+    base = _normalize_url(target).rstrip("/")
+    paths = ["/", "/favicon.ico", *FAST_RECON_INFO_PATHS, *FAST_RECON_BASIC_PATHS]
+    responses = []
+    for path in paths:
+        responses.append(await _stealth_probe_url(client, base + path))
+    port_result = await _passive_port_scan(target, "fast-recon")
+    by_path = dict(zip(paths, responses))
+    favicon_response = by_path["/favicon.ico"]
+    favicon_body = str(favicon_response.get("body") or "")
+    favicon_status = int(favicon_response.get("status_code", 0) or 0)
+    favicon_hash = (
+        hashlib.sha256(
+            favicon_body.encode("utf-8", errors="replace")
+        ).hexdigest()
+        if favicon_status == 200 and favicon_body
+        else ""
+    )
+    evidence_statuses = {200, 204, 301, 302, 307, 308, 401, 405}
+    root_response = by_path["/"]
+    combined_headers: Dict[str, Any] = dict(root_response.get("headers") or {})
+    root_body = str(root_response.get("body") or "")
+    bodies = [root_body[:4096]] if root_body else []
+    observed_paths = []
+    for path, response in by_path.items():
+        if path == "/":
+            continue
+        status_code = int(response.get("status_code", 0) or 0)
+        if status_code not in evidence_statuses:
+            continue
+        observed_paths.append(path)
+        combined_headers.update(dict(response.get("headers") or {}))
+        body = str(response.get("body") or "")
+        if body:
+            bodies.append(body[:4096])
+    observations = {
+        "target_url": base,
+        "host": _normalize_host(target),
+        "headers": combined_headers,
+        "body": "\n".join(bodies),
+        "paths": observed_paths,
+        "favicon_hash": favicon_hash,
+    }
+    fingerprints = _fingerprint_database.detect(observations)
+    information_disclosure = {
+        path: {
+            "status_code": int(by_path[path].get("status_code", 0) or 0),
+            "server": dict(by_path[path].get("headers") or {}).get("Server", ""),
+        }
+        for path in FAST_RECON_INFO_PATHS
+        if int(by_path[path].get("status_code", 0) or 0) in {200, 301, 302, 401, 403}
+    }
+    basic_paths = {
+        path: int(by_path[path].get("status_code", 0) or 0)
+        for path in FAST_RECON_BASIC_PATHS
+    }
+    return {
+        "status": "success",
+        "target": base,
+        "scan_type": "passive_scan",
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "open_ports": port_result.get("open_ports", []),
+        "port_probes": port_result.get("probes", []),
+        "technology_stack": _technology_names(fingerprints, observations),
+        "fingerprints": fingerprints,
+        "favicon": {"status_code": int(favicon_response.get("status_code", 0) or 0), "hash": favicon_hash, "algorithm": "sha256"},
+        "information_disclosure": information_disclosure,
+        "basic_paths": basic_paths,
+        "timeline": port_result.get("timeline", []),
+    }
 
 
 # ============================================================
@@ -1151,6 +1472,12 @@ async def hunter_scan(
     phases: Optional[List[str]] = None,
 ) -> str:
     """Run a budgeted, cache-aware adaptive scan. Modes: fast/standard/deep; quick/aggressive remain aliases."""
+    session_id = f"hunter-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    session = AuditSession(session_id, target)
+    _sessions[session_id] = session
+    session.log_event("adaptive_scan_started", {"mode": mode, "phases": phases or []})
+    session.save(SCAN_SESSION_DIR)
+
     async def adaptive_runner(agent_name: str, scan_target: str, **kwargs) -> Dict[str, Any]:
         execution = await _execute_agent_async(agent_name, scan_target, **kwargs)
         execution.update(_discover_evidence_attachments(agent_name, scan_target))
@@ -1163,11 +1490,22 @@ async def hunter_scan(
 
     try:
         result = await _adaptive_engine.execute(target, mode=mode, phases=phases, runner=adaptive_runner)
+    except asyncio.CancelledError:
+        session.status = "cancelled"
+        session.log_event("adaptive_scan_cancelled", {"mode": mode})
+        session.save(SCAN_SESSION_DIR)
+        raise
     except ValueError as exc:
-        return _json_dumps({"status": "error", "error": str(exc), "target": target, "mode": mode})
-    session_id = f"hunter-{int(time.time() * 1000)}"
-    session = AuditSession(session_id, target)
-    _sessions[session_id] = session
+        session.status = "error"
+        session.log_event("adaptive_scan_error", {"mode": mode, "error": str(exc)})
+        session.save(SCAN_SESSION_DIR)
+        return _json_dumps({"status": "error", "error": str(exc), "target": target, "mode": mode, "session_id": session_id})
+    except Exception as exc:
+        session.status = "error"
+        session.log_event("adaptive_scan_error", {"mode": mode, "error": str(exc)})
+        session.save(SCAN_SESSION_DIR)
+        return _json_dumps({"status": "error", "error": str(exc), "target": target, "mode": mode, "session_id": session_id})
+    session.status = "completed"
     session.log_event("adaptive_scan_complete", result.get("metrics", {}))
     raw_results = result.get("results", [])
     reportable_findings = [_result_to_report_item(item) for item in raw_results if item.get("reportable")]
@@ -1175,6 +1513,7 @@ async def hunter_scan(
     summary = dict(result.get("compact", {}).get("summary", {}))
     summary.update(result.get("metrics", {}))
     session.set_report_data(reportable_findings=reportable_findings, lead_findings=lead_findings, summary=summary)
+    session.save(SCAN_SESSION_DIR)
     compact = result.get("compact", {})
     output = {
         "session_id": session_id,
@@ -1279,6 +1618,7 @@ async def _run_single_agent(agent_name: str, target: str, **kwargs) -> str:
     _sessions[session_id] = session
 
     session.log_agent_start(agent_name)
+    session.save(SCAN_SESSION_DIR)
     start = time.time()
 
     execution = await _execute_agent_async(agent_name, target, **kwargs)
@@ -1307,7 +1647,10 @@ async def _run_single_agent(agent_name: str, target: str, **kwargs) -> str:
     )
 
     duration = time.time() - start
-    session.log_agent_end(agent_name, execution.get("status") != "error", duration)
+    succeeded = execution.get("status") not in {"error", "timeout"}
+    session.log_agent_end(agent_name, succeeded, duration)
+    session.status = "completed" if succeeded else "error"
+    session.save(SCAN_SESSION_DIR)
 
     return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -1338,7 +1681,10 @@ async def hunter_port_scan(target: str, ports: str = "top-1000") -> str:
     Returns:
         JSON with open ports and services.
     """
-    return await _run_single_agent("port-scan", target, ports=ports)
+    execution = await _execute_agent_async("port-scan", target, ports=ports, timeout=10)
+    if execution.get("status") in {"timeout", "error"}:
+        return _json_dumps(await _passive_port_scan(target, execution.get("status", "timeout")))
+    return _json_dumps(execution)
 
 
 @mcp.tool()
@@ -1352,7 +1698,19 @@ async def hunter_tech_detect(target: str) -> str:
     Returns:
         JSON with detected technologies.
     """
-    return await _run_single_agent("tech-detect", target)
+    execution = await _execute_agent_async("tech-detect", target, timeout=10)
+    if execution.get("status") in {"timeout", "error"}:
+        fallback = await asyncio.wait_for(_fast_recon_impl(target), timeout=30)
+        return _json_dumps({
+            "status": "success",
+            "target": fallback["target"],
+            "scan_type": "passive_scan",
+            "technology_stack": fallback["technology_stack"],
+            "fingerprints": fallback["fingerprints"],
+            "open_ports": fallback["open_ports"],
+            "timeline": [{"event": "tech_detect_timeout", "fallback": "passive_scan", "continued": True}],
+        })
+    return _json_dumps(execution)
 
 
 @mcp.tool()
@@ -1368,6 +1726,24 @@ async def hunter_dir_enum(target: str, wordlist: str = "default") -> str:
         JSON with discovered directories and files.
     """
     return await _run_single_agent("dir-enum", target, wordlist=wordlist)
+
+
+@mcp.tool()
+async def hunter_fast_recon(target: str) -> str:
+    """30-second passive recon using stealth_request instead of external CLIs."""
+    try:
+        return _json_dumps(await asyncio.wait_for(_fast_recon_impl(target), timeout=30))
+    except asyncio.TimeoutError:
+        return _json_dumps({
+            "status": "timeout",
+            "target": _normalize_url(target),
+            "scan_type": "passive_scan",
+            "open_ports": [],
+            "technology_stack": [],
+            "information_disclosure": {},
+            "basic_paths": {},
+            "timeline": [{"event": "fast_recon_timeout", "continued": True}],
+        })
 
 
 @mcp.tool()
@@ -2353,25 +2729,51 @@ async def hunter_auto_access_control(target: str, cookie: str = "",
 
 
 @mcp.tool()
-async def hunter_unified_scan(target: str, cookie: str = "", collaborator: str = "",
-                               phases: Optional[List[str]] = None) -> str:
-    """Unified scan engine - runs selected phases automatically."""
-    from core.unified_scanner import UnifiedScanner
+async def hunter_auto_attack(target: str, options: str = "{}") -> str:
+    """Run the complete six-stage Hunter attack pipeline automatically."""
+    try:
+        config = json.loads(options) if isinstance(options, str) else dict(options or {})
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _json_dumps({
+            "tool": "hunter_auto_attack",
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "data": {},
+            "evidence": {},
+            "next_actions": [],
+        })
     call_mcp_tool = _threadsafe_browser_mcp_caller(
         asyncio.get_running_loop()
     )
+    return await _safe_json_tool(
+        "hunter_auto_attack",
+        _orchestrator_runner(call_mcp_tool).run,
+        target,
+        config,
+        timeout=240,
+    )
 
-    def _scan():
-        scanner = UnifiedScanner(
-            target=target,
-            session_cookie=cookie,
-            collaborator_domain=collaborator,
-            services=_orchestration_services(call_mcp_tool),
-            call_mcp_tool=call_mcp_tool,
-        )
-        return scanner.run_full_scan(phases=phases)
 
-    return await _safe_json_tool("hunter_unified_scan", _scan, timeout=240)
+@mcp.tool()
+async def hunter_unified_scan(target: str, cookie: str = "", collaborator: str = "",
+                               phases: Optional[List[str]] = None) -> str:
+    """Run the unified scanner through the six-stage orchestration runner."""
+    call_mcp_tool = _threadsafe_browser_mcp_caller(
+        asyncio.get_running_loop()
+    )
+    options = {
+        "session_cookie": cookie,
+        "collaborator": collaborator,
+        "requested_phases": list(phases or []),
+    }
+    return await _safe_json_tool(
+        "hunter_unified_scan",
+        _orchestrator_runner(call_mcp_tool).run,
+        target,
+        options,
+        timeout=240,
+    )
 
 
 # ============================================================
@@ -2463,7 +2865,7 @@ async def hunter_healthcheck() -> str:
         "hunter_auto_cors", "hunter_auto_jwt", "hunter_auto_graphql", "hunter_auto_websocket",
         "hunter_auto_race", "hunter_auto_access_control", "hunter_unified_scan",
         "hunter_healthcheck", "hunter_capabilities", "hunter_recommend_next",
-        "hunter_fast_scan", "hunter_scan_plan", "hunter_scan_benchmark", "hunter_cache_status", "hunter_cache_clear",
+        "hunter_fast_scan", "hunter_fast_recon", "hunter_scan_plan", "hunter_scan_benchmark", "hunter_cache_status", "hunter_cache_clear",
         "hunter_kb_list", "hunter_kb_search", "hunter_kb_read", "hunter_kb_recommend",
         "hunter_burp_bridge", "hunter_burp_repeater", "hunter_burp_proxy_search",
         "hunter_burp_scanner_issues", "hunter_burp_collaborator_workflow",
@@ -2547,6 +2949,7 @@ async def hunter_capabilities() -> str:
         "hunter_vuln_scan": ("pipeline", "Recon + vulnerability-analysis pipeline"),
         "hunter_scan": ("pipeline", "Configurable full pipeline"),
         "hunter_fast_scan": ("adaptive", "Low-cost fast adaptive DAG scan"),
+        "hunter_fast_recon": ("recon", "30-second passive stealth reconnaissance"),
         "hunter_scan_plan": ("adaptive", "Preview adaptive DAG and budget"),
         "hunter_scan_benchmark": ("adaptive", "Benchmark parallelism, cache and compaction"),
         "hunter_cache_status": ("adaptive", "Inspect target/profile recon cache"),
@@ -2678,7 +3081,7 @@ async def hunter_recommend_next(target: str = "", signals: Optional[List[str]] =
             "proof_goal": proof_goal,
         })
 
-    if any(token in raw for token in ["idor", "user_id", "userid", "uid", "object", "瓒婃潈", "x-id-token", "authorization"]):
+    if any(token in raw for token in ["idor", "user_id", "userid", "uid", "object", "x-id-token", "authorization", "access control", "\u8d8a\u6743", "\u6c34\u5e73\u8d8a\u6743", "\u5782\u76f4\u8d8a\u6743", "\u8bbf\u95ee\u63a7\u5236"]):
         add("hunter_auto_idor", "Object identifiers suggest possible IDOR.", "Use two authorized identities to prove cross-user data access or modification.", 10)
         add("hunter_auto_access_control", "Authorization signals suggest an access-control boundary.", "Compare anonymous, low-privilege, and authorized responses for the same resource.", 9)
     if any(token in raw for token in ["jwt", "token", "idtoken", "secret", "hs256", "hs512", "kid"]):
@@ -2757,7 +3160,7 @@ async def hunter_case_next_steps(case_slug: str) -> str:
     return _json_dumps(_workspace.case_next_steps(case_slug))
 
 @mcp.tool()
-async def hunter_project_kb_search(query: str, board: str = "general", limit: int = 20) -> str:
+async def hunter_project_kb_search(query: str, board: str = "auto", limit: int = 20) -> str:
     """Search an OpenTgtyLab knowledge-base board."""
     return _json_dumps(_workspace.kb_search(query, board=board, limit=limit))
 
@@ -2987,12 +3390,21 @@ async def hunter_session_list() -> str:
     Returns:
         JSON with session list and status.
     """
+    SCAN_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    for path in SCAN_SESSION_DIR.glob("*.json"):
+        if path.stem not in _sessions:
+            try:
+                loaded = AuditSession.load(path)
+                _sessions[loaded.session_id] = loaded
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                continue
     sessions = []
     for sid, session in _sessions.items():
         sessions.append({
             "session_id": sid,
             "target": session.target,
             "start_time": session.start_time.isoformat(),
+            "status": session.status,
             "entries": len(session.entries),
         })
 
@@ -3015,12 +3427,21 @@ async def hunter_session_status(session_id: str) -> str:
     """
     session = _sessions.get(session_id)
     if not session:
+        path = SCAN_SESSION_DIR / f"{session_id}.json"
+        if path.exists():
+            try:
+                session = AuditSession.load(path)
+                _sessions[session_id] = session
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                session = None
+    if not session:
         return json.dumps({"error": f"Session '{session_id}' not found"})
 
     return json.dumps({
         "session_id": session_id,
         "target": session.target,
         "start_time": session.start_time.isoformat(),
+        "status": session.status,
         "total_entries": len(session.entries),
         "audit_log": json.loads(session.export_json()),
     }, indent=2, ensure_ascii=False)
@@ -3110,6 +3531,14 @@ async def hunter_report(session_id: str, format: str = "markdown", style: str = 
         Formatted report.
     """
     session = _sessions.get(session_id)
+    if not session:
+        path = SCAN_SESSION_DIR / f"{session_id}.json"
+        if path.exists():
+            try:
+                session = AuditSession.load(path)
+                _sessions[session_id] = session
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                session = None
     if not session:
         return json.dumps({"error": f"Session '{session_id}' not found"})
 
@@ -4127,19 +4556,35 @@ async def hunter_auto_pentest(
             profile=profile,
             modules=modules,
         )
-        result = UnifiedOrchestrator(
-            kernel,
-            services=_orchestration_services(call_mcp_tool),
-        ).orchestrate(
-            slug,
-            target_url=target_url,
-            modules=modules,
-            policy=profile,
-            resume=bool(config.get("resume", False)),
-            observations=config.get("observations"),
-            approval=config.get("approval"),
-            checkpoint_id=config.get("checkpoint_id", ""),
-        )
+        use_runner = bool(config.get("use_runner", False))
+        if use_runner:
+            result = _orchestrator_runner(call_mcp_tool).run(
+                target_url,
+                {
+                    **config,
+                    "policy": profile,
+                    "mode": mode,
+                    "modules": modules,
+                },
+            )
+            result.setdefault(
+                "execution",
+                "deferred" if result.get("handoffs") else "completed",
+            )
+        else:
+            result = UnifiedOrchestrator(
+                kernel,
+                services=_orchestration_services(call_mcp_tool),
+            ).orchestrate(
+                slug,
+                target_url=target_url,
+                modules=modules,
+                policy=profile,
+                resume=bool(config.get("resume", False)),
+                observations=config.get("observations"),
+                approval=config.get("approval"),
+                checkpoint_id=config.get("checkpoint_id", ""),
+            )
         if session_id is not None:
             def bind_session(value):
                 if isinstance(value, dict):
@@ -4204,6 +4649,120 @@ async def hunter_backend_status() -> str:
 @mcp.tool()
 async def hunter_lane_catalog() -> str:
     return _workflow_result("hunter_lane_catalog", _workflow_kernel().lane_catalog)
+
+
+
+def _tool_result_summary(payload: Dict[str, Any], fallback_name: str) -> str:
+    tool = str(payload.get("tool") or fallback_name)
+    status = str(payload.get("status") or "ok")
+    data = payload.get("data")
+    details = []
+    if isinstance(data, dict):
+        for key in ("returned", "count", "registered_tool_count"):
+            if key in data:
+                details.append(f"{key}={data[key]}")
+        if data.get("path"):
+            details.append(f"path={data['path']}")
+    if payload.get("error"):
+        details.append(f"error={payload['error']}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    return f"{tool}: {status}{suffix}"
+
+
+def _enable_structured_mcp_results() -> None:
+    for tool_name, tool in mcp._tool_manager._tools.items():
+        if not tool_name.startswith("hunter_"):
+            continue
+        original = tool.fn
+
+        @functools.wraps(original)
+        async def structured_tool(*args, __original=original, __name=tool_name, **kwargs):
+            raw = await __original(*args, **kwargs)
+            if not isinstance(raw, str):
+                return raw
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return raw
+            if not isinstance(payload, dict):
+                return raw
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=_tool_result_summary(payload, __name),
+                    )
+                ],
+                structuredContent=payload,
+                isError=str(payload.get("status") or "").lower() == "error",
+            )
+
+        tool.fn = structured_tool
+        tool.fn_metadata.output_schema = None
+        tool.fn_metadata.output_model = None
+        tool.fn_metadata.wrap_output = False
+
+
+_enable_structured_mcp_results()
+
+
+# ============================================================
+# ReverseLab Tools Integration
+# Merges reverse_lab_tools_mcp tools into hunter_tools MCP server.
+# All reverse-engineering tools get "re_" prefix to avoid name collision.
+# ============================================================
+
+def _import_reverse_lab_tools() -> None:
+    """Dynamically load reverse_lab_tools_mcp.py and merge its tools into hunter's mcp."""
+    import importlib.util
+
+    candidates = [
+        os.environ.get("REVERSELAB_MCP_PATH", ""),
+        r"D:\Open-tgtylab-repo\tools\skills\mcp\ReverseLabToolsMCP\reverse_lab_tools_mcp.py",
+        r"D:\Open-tgtylab\tools\skills\mcp\ReverseLabToolsMCP\reverse_lab_tools_mcp.py",
+    ]
+    rlt_path = next((Path(p) for p in candidates if p and Path(p).is_file()), None)
+    if rlt_path is None:
+        print("[hunter_tools] reverse_lab_tools not found, skipping merge", file=sys.stderr)
+        return
+
+    project_dir = rlt_path.parent
+    if str(project_dir) not in sys.path:
+        sys.path.insert(0, str(project_dir))
+
+    spec = importlib.util.spec_from_file_location(
+        "reverse_lab_tools_mcp_shim", str(rlt_path)
+    )
+    if spec is None or spec.loader is None:
+        print("[hunter_tools] failed to build reverselab spec", file=sys.stderr)
+        return
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        print(f"[hunter_tools] reverselab load failed: {exc}", file=sys.stderr)
+        return
+
+    rlt_mcp = getattr(module, "mcp", None)
+    if rlt_mcp is None or not hasattr(rlt_mcp, "_tool_manager"):
+        print("[hunter_tools] reverselab mcp missing _tool_manager", file=sys.stderr)
+        return
+
+    merged = 0
+    for tool_name, tool in list(rlt_mcp._tool_manager._tools.items()):
+        new_name = tool_name if tool_name.startswith("re_") else f"re_{tool_name}"
+        if new_name in mcp._tool_manager._tools:
+            continue
+        try:
+            tool.name = new_name
+        except Exception:
+            pass
+        mcp._tool_manager._tools[new_name] = tool
+        merged += 1
+    print(f"[hunter_tools] merged {merged} reverse_lab tools (re_* prefix)", file=sys.stderr)
+
+
+_import_reverse_lab_tools()
 
 
 # ============================================================
