@@ -2363,10 +2363,12 @@ def test_attack_execution_merges_reasoned_strategies_and_deduplicates_ids():
     matching = [
         item
         for item in context["attack_queue"]
-        if item.get("strategy_id") == "cas_default_creds"
+        if "cas_default_creds" in item.get("strategy_ids", [])
     ]
-    assert len(matching) == 1
-    assert matching[0]["actions"]
+    assert matching
+    assert len(
+        {item["idempotency_key"] for item in context["attack_queue"]}
+    ) == len(context["attack_queue"])
     assert any(
         item["tool"] == "hunter_session_execute_chain"
         and item["arguments"]["chain_name"] == "login_to_admin"

@@ -1,5 +1,36 @@
 from __future__ import annotations
-from dataclasses import asdict, dataclass
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+@dataclass
+class CanonicalAction:
+    action_id: str
+    tool: str
+    target: str
+    arguments: dict[str, Any]
+    kind: str = "baseline"
+    priority: str = "P2"
+    sources: list[str] = field(default_factory=list)
+    strategy_ids: list[str] = field(default_factory=list)
+    idempotency_key: str = ""
+    requires_approval: bool = False
+    status: str = "pending"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ActionBudget:
+    max_actions: int
+    proposed_actions: int = 0
+    started_actions: int = 0
+    filtered_actions: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
 
 
 @dataclass

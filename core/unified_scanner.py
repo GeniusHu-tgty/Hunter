@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from core.reasoning.attack_reasoning import AttackReasoner
+from core.workflow.action_planner import ActionPlanner
 
 
 SPA_SCRIPT_THRESHOLD = 64 * 1024
@@ -2332,13 +2333,31 @@ class UnifiedOrchestrationBridge:
                 evidence,
                 technique_memory,
             )
-        attack_queue = self._merge_reasoned_queue(
+        workflow_profile = dict(context.get("profile") or {})
+        planning = ActionPlanner().plan(
             list(context.get("attack_queue") or []),
             reasoned_strategies,
+            modules=workflow_profile.get("modules"),
+            requested_phases=(
+                workflow_profile.get("requested_phases")
+                or context.get("requested_phases")
+                or context.get("options", {}).get("requested_phases")
+            ),
+            max_actions=(
+                workflow_profile.get("max_tool_calls")
+                or context.get("options", {}).get("max_tool_calls")
+                or 8
+            ),
+            completed_keys=context.get("completed_action_keys", []),
         )
+        attack_queue = list(planning["actions"])
         if isinstance(context, dict):
             context["attack_queue"] = attack_queue
-        execution_queue = self._expand_reasoned_queue(attack_queue)
+            context["filtered_actions"] = list(
+                planning["filtered_actions"]
+            )
+            context["budget"] = dict(planning["budget"])
+        execution_queue = attack_queue
         tools = {
             "authentication_bypass": "hunter_auto_access_control",
             "authentication": "hunter_auto_access_control",
@@ -2517,6 +2536,13 @@ class UnifiedOrchestrationBridge:
             kind = str(item.get("kind") or "baseline")
             target = str(item.get("target") or context["target_url"])
             parameters = _parameter_names(item.get("parameters", []))
+            planned_arguments = dict(
+                item.get("arguments")
+                or item.get("tool_args")
+                or {}
+            )
+            if not parameters and planned_arguments.get("param"):
+                parameters = [str(planned_arguments["param"])]
             parameter = parameters[0] if parameters else (
                 "url" if kind == "ssrf_open_redirect" else "category"
             )
@@ -2579,7 +2605,11 @@ class UnifiedOrchestrationBridge:
                     "mode": context.get("profile", {}).get("name", "standard"),
                 }
             if explicit_tool:
-                supplied = dict(item.get("tool_args") or {})
+                supplied = dict(
+                    item.get("tool_args")
+                    or item.get("arguments")
+                    or {}
+                )
                 if tool == "hunter_session_execute_chain":
                     endpoint = str(supplied.get("endpoint") or "").strip()
                     chain_name = str(
@@ -2615,6 +2645,7 @@ class UnifiedOrchestrationBridge:
                     arguments.update(supplied)
             elif session_id:
                 arguments["session_id"] = session_id
+            parameter = str(arguments.get("param") or parameter)
             attempt = {
                 "action_id": str(
                     item.get("action_id")
@@ -2881,6 +2912,8 @@ class UnifiedOrchestrationBridge:
                 "browser_evidence": browser_evidence,
                 "http_transport": "stealth_http_client",
                 "attack_queue": attack_queue,
+                "filtered_actions": planning["filtered_actions"],
+                "budget": planning["budget"],
                 "completed_attacks": sorted(completed_attacks),
             }
         return {
@@ -2892,6 +2925,8 @@ class UnifiedOrchestrationBridge:
             "http_transport": "stealth_http_client",
             "session_id": session_id,
             "attack_queue": attack_queue,
+            "filtered_actions": planning["filtered_actions"],
+            "budget": planning["budget"],
             "completed_attacks": sorted(completed_attacks),
         }
 
@@ -3286,15 +3321,12 @@ class OrchestratorRunner:
             strategies = []
         target_info["strategies"] = list(strategies or [])
 
-        attack_results = [
-            self._execute_strategy(strategy, target_info)
-            for strategy in sorted(target_info["strategies"], key=self._priority)
-        ]
-        target_info["attack_results"] = attack_results
-        execution = self._merge_attack_results(attack_results)
-        target_info["stage_results"]["attack_execution"] = execution
-        target_info.update(execution)
-        target_info["phases_completed"].append("attack_execution")
+        execution = self._run_stage(
+            "attack_execution",
+            self.bridge.stage_attack_execution,
+            target_info,
+        )
+        self._apply_stage(target_info, "attack_execution", execution)
 
         confirmation = self._run_stage(
             "confirmation",

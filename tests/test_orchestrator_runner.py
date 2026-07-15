@@ -1,4 +1,5 @@
 from core.unified_scanner import OrchestratorRunner
+from core.workflow.action_planner import ActionPlanner
 
 
 class StubReasoner:
@@ -63,15 +64,20 @@ class StubBridge:
         return {"attack_queue": []}
 
     def stage_attack_execution(self, context):
+        plan = ActionPlanner().plan(
+            context.get("attack_queue", []),
+            context.get("strategies", []),
+        )
+        context["attack_queue"] = plan["actions"]
         self.execution_contexts.append(context)
-        strategy = context["strategies"][0]
         return {
             "status": "completed",
             "attempts": [
                 {
-                    "tool": strategy["actions"][0]["tool"],
+                    "tool": action["tool"],
                     "success": True,
                 }
+                for action in context["attack_queue"]
             ],
             "handoffs": [],
         }
@@ -99,7 +105,9 @@ def test_runner_completes_all_six_stages_and_feeds_reasoning_to_execution():
         "evidence_learning",
     ]
     assert result["strategies"][0]["strategy_id"] == "sqli-probe"
-    assert result["attack_results"][0]["attempts"][0]["tool"] == "hunter_auto_sqli"
+    assert result["stage_results"]["attack_execution"]["attempts"][0][
+        "tool"
+    ] == "hunter_auto_sqli"
     assert bridge.execution_contexts[0]["strategies"] == result["strategies"]
     assert result["findings"][0]["status"] == "confirmed"
     assert result["errors"] == []
@@ -160,9 +168,12 @@ def test_runner_sorts_strategies_by_action_priority():
         "https://example.test"
     )
 
-    assert [item["strategy_id"] for item in result["attack_results"]] == [
-        "first",
-        "later",
+    assert [
+        item["tool"]
+        for item in bridge.execution_contexts[0]["attack_queue"]
+    ] == [
+        "hunter_auto_xss",
+        "hunter_scan_plan",
     ]
 
 
