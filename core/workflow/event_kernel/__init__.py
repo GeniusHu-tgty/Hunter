@@ -94,6 +94,7 @@ from .errors import (
     WorkflowNotFoundError,
     issue_to_error,
 )
+from .service import EventKernel
 
 
 __all__ = (
@@ -155,6 +156,7 @@ __all__ = (
     "VerdictStatus",
     "VerificationObservation",
     "WorkflowOwnershipClaim",
+    "EventKernel",
     "CheckpointBindingError",
     "CommandConflictError",
     "ConcurrencyConflictError",

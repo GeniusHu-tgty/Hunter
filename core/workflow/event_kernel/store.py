@@ -21,6 +21,7 @@ from .contracts import (
     HashMode,
 )
 from .envelope import build_event, canonical_event_line, command_digest
+from .envelope import make_attempt_id
 from .errors import (
     CommandConflictError,
     ConcurrencyConflictError,
@@ -89,7 +90,7 @@ class EventStore:
     def cache_path(self, slug: str) -> Path:
         return self._workflow_dir(slug) / "workflow.event-kernel.json"
 
-    def append_command(
+    def _commit_command(
         self,
         slug: str,
         meta: CommandMeta,
@@ -169,6 +170,31 @@ class EventStore:
                     event_id=replay.head.event_id,
                 )
 
+            if command_type is CommandType.START_ATTEMPT:
+                attempt_data = payload.get("attempt")
+                if not isinstance(attempt_data, dict):
+                    raise InvalidCommandError("start_attempt payload requires an attempt object", slug=slug)
+                action_id = attempt_data.get("action_id")
+                action = next(
+                    (record for record in replay.state.actions if record.action_id == action_id),
+                    None,
+                )
+                if action is None:
+                    raise InvalidCommandError("start_attempt action does not exist", slug=slug)
+                attempt_no = max(
+                    (
+                        attempt.attempt_no
+                        for attempt in replay.state.attempts
+                        if attempt.action_id == action_id
+                    ),
+                    default=0,
+                ) + 1
+                generated_attempt = dict(attempt_data)
+                generated_attempt["attempt_no"] = attempt_no
+                generated_attempt["attempt_id"] = make_attempt_id(action_id, attempt_no)
+                payload = dict(payload)
+                payload["attempt"] = generated_attempt
+
             if command_type is CommandType.CLAIM_WORKFLOW:
                 if replay.command_index or replay.ownership.value != "unclaimed_legacy":
                     raise WorkflowAlreadyClaimedError("workflow ownership was already claimed", slug=slug)
@@ -219,7 +245,23 @@ class EventStore:
                 cache_updated=cache_updated,
             )
 
+    def append_command(
+        self,
+        slug: str,
+        meta: CommandMeta,
+        command_type: CommandType | str,
+        payload: dict[str, Any],
+        workflow_id: str | None = None,
+    ) -> CommandResult:
+        """Compatibility entry point retained for Stage 3 callers."""
+        return self._commit_command(slug, meta, command_type, payload, workflow_id)
+
     def _result_from_index(self, entry, *, idempotent: bool) -> CommandResult:
+        generated = {
+            "event_kernel.action.proposed": (entry.action_id, None, None, None, None),
+            "event_kernel.attempt.started": (None, entry.attempt_id, None, None, None),
+            "event_kernel.process.started": (None, None, entry.process_id, None, None),
+        }.get(entry.event_type, (None, None, None, None, None))
         return CommandResult(
             command_id=entry.command_id,
             event_id=entry.event_id,
@@ -228,11 +270,11 @@ class EventStore:
             event_hash=entry.event_hash,
             generation=entry.generation,
             idempotent=idempotent,
-            action_id=entry.action_id,
-            attempt_id=entry.attempt_id,
-            process_id=entry.process_id,
-            outbox_id=entry.outbox_id,
-            checkpoint_id=entry.checkpoint_id,
+            action_id=generated[0],
+            attempt_id=generated[1],
+            process_id=generated[2],
+            outbox_id=generated[3],
+            checkpoint_id=generated[4],
         )
 
     def _result_from_event(self, event: dict[str, Any], *, cache_updated: bool) -> CommandResult:
@@ -244,6 +286,13 @@ class EventStore:
             "outbox_id": None,
             "checkpoint_id": None,
         }
+        allowed = {
+            "event_kernel.action.proposed": {"action"},
+            "event_kernel.attempt.started": {"attempt"},
+            "event_kernel.process.started": {"process"},
+            "event_kernel.memory.enqueued": {"outbox"},
+            "event_kernel.checkpoint.created": {"checkpoint"},
+        }.get(event["type"], set())
         for container, identifier in (
             ("action", "action_id"),
             ("attempt", "attempt_id"),
@@ -251,7 +300,7 @@ class EventStore:
             ("outbox", "outbox_id"),
             ("checkpoint", "checkpoint_id"),
         ):
-            value = payload.get(container)
+            value = payload.get(container) if container in allowed else None
             if isinstance(value, Mapping) and isinstance(value.get(identifier), str):
                 ids[identifier] = value[identifier]
         return CommandResult(

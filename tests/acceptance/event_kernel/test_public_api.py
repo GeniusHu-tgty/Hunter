@@ -20,7 +20,8 @@ EXPECTED_STAGE1_EXPORTS = (
     "RecoveryRequest", "ReplayIssue", "ReplayIssueKind", "ReplayResult",
     "ReplayStats", "SensitiveOutputRejectedError", "StageResultDigest",
     "StageStatusRecord", "VerdictRecord", "VerdictStateRecord", "VerdictStatus",
-    "VerificationObservation", "WorkflowOwnershipClaim", "CheckpointBindingError",
+    "VerificationObservation", "WorkflowOwnershipClaim", "EventKernel",
+    "CheckpointBindingError",
     "CommandConflictError", "ConcurrencyConflictError", "CorruptEventLogError",
     "DuplicateCommittedCommandError", "DuplicateEventIdError", "EventKernelError",
     "IllegalTransitionError", "MixedWriterError", "OutboxConflictError",
@@ -40,12 +41,13 @@ def test_event_kernel_package_explicitly_reexports_stage1_surface() -> None:
     contracts = importlib.import_module("core.workflow.event_kernel.contracts")
     envelope = importlib.import_module("core.workflow.event_kernel.envelope")
     errors = importlib.import_module("core.workflow.event_kernel.errors")
+    service = importlib.import_module("core.workflow.event_kernel.service")
 
     assert api.__all__ == EXPECTED_STAGE1_EXPORTS
     for name in EXPECTED_STAGE1_EXPORTS:
         source = next(
             module
-            for module in (contracts, errors, envelope)
+            for module in (contracts, errors, envelope, service)
             if name in module.__all__
         )
         assert getattr(api, name) is getattr(source, name)

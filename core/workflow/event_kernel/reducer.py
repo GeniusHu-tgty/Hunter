@@ -7,13 +7,20 @@ from collections.abc import Mapping
 from typing import Any
 
 from .contracts import (
+    ActionState,
+    AttemptState,
+    BudgetMetrics,
     EvidenceAttestation,
     EvidenceOrigin,
     EvidenceRecord,
     EventKernelState,
+    ExecutionAttemptRecord,
     FindingRecord,
     LegacyCheckpointHint,
+    LogicalActionRecord,
     OwnershipState,
+    ProcessRecord,
+    ProcessState,
     StageResultDigest,
     StageStatusRecord,
     VerificationObservation,
@@ -27,6 +34,7 @@ from .errors import (
     OwnershipClaimRequiredError,
 )
 from .upcast import SemanticEvent
+from .envelope import canonical_json_bytes
 
 
 def _payload(event: SemanticEvent) -> Mapping[str, Any]:
@@ -59,6 +67,280 @@ def _replace_record(records: tuple[Any, ...], record: Any, identifier: str) -> t
                 return records
             return records[:index] + (record,) + records[index + 1 :]
     return records + (record,)
+
+
+def _find_record(records: tuple[Any, ...], identifier: str, value: str) -> Any | None:
+    return next((record for record in records if getattr(record, identifier) == value), None)
+
+
+def _tuple_union(existing: tuple[str, ...], additions: Any) -> tuple[str, ...]:
+    values = additions if isinstance(additions, (list, tuple)) else ()
+    return existing + tuple(value for value in values if value not in existing)
+
+
+def _action_key(*, generation: int, tool: str, target: str, arguments: Any, kind: str) -> str:
+    identity = {
+        "generation": generation,
+        "tool": tool,
+        "target": target,
+        "arguments": _thaw(arguments),
+        "kind": kind,
+    }
+    return hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+
+
+def _budget(state: EventKernelState, **changes: int) -> BudgetMetrics:
+    values = {
+        name: getattr(state.budget, name)
+        for name in (
+            "actions_proposed",
+            "actions_deferred",
+            "actions_blocked",
+            "attempts_started",
+            "attempts_completed",
+            "attempts_blocked",
+            "attempts_cancelled",
+            "budget_charges",
+        )
+    }
+    values.update(changes)
+    return BudgetMetrics(**values)
+
+
+def _action_decision(
+    state: EventKernelState,
+    event: SemanticEvent,
+    *,
+    target: ActionState,
+) -> EventKernelState:
+    item = _mapping(_payload(event).get("decision"))
+    action_id = _first(item, "action_id")
+    action = _find_record(state.actions, "action_id", action_id)
+    allowed = {
+        ActionState.DEFERRED: {ActionState.PROPOSED},
+        ActionState.BLOCKED: {ActionState.PROPOSED, ActionState.DEFERRED, ActionState.RETRYABLE},
+    }[target]
+    if action is None or action.state not in allowed:
+        raise IllegalTransitionError(f"action cannot transition to {target.value}")
+    updated = replace(action, state=target)
+    budget = state.budget
+    if target is ActionState.DEFERRED:
+        budget = _budget(state, actions_deferred=state.budget.actions_deferred + 1)
+    else:
+        budget = _budget(state, actions_blocked=state.budget.actions_blocked + 1)
+    return replace(state, actions=_replace_record(state.actions, updated, "action_id"), budget=budget)
+
+
+def _reduce_action(state: EventKernelState, event: SemanticEvent) -> EventKernelState:
+    payload = _payload(event)
+    if event.event_type == "event_kernel.action.proposed":
+        item = _mapping(payload.get("action"))
+        generation = _first(item, "generation", default=event.generation)
+        tool = _first(item, "tool")
+        target = _first(item, "target")
+        arguments = _first(item, "arguments", default={})
+        kind = _first(item, "kind")
+        action_key = _action_key(
+            generation=generation, tool=tool, target=target, arguments=arguments, kind=kind
+        )
+        action_id = _first(item, "action_id")
+        if _find_record(state.actions, "action_id", action_id) is not None:
+            raise IllegalTransitionError("action_id was already proposed")
+        if not isinstance(action_id, str) or action_id != f"act-g{generation:06d}-{action_key[:16]}":
+            raise IllegalTransitionError("action_id does not match the action identity")
+        action = LogicalActionRecord(
+            action_id=action_id,
+            action_key=action_key,
+            generation=generation,
+            tool=tool,
+            target=target,
+            arguments=_thaw(arguments),
+            kind=kind,
+            sources=tuple(_first(item, "sources", default=())),
+            strategy_ids=tuple(_first(item, "strategy_ids", default=())),
+            labels=tuple(_first(item, "labels", default=())),
+            expected_evidence=tuple(_first(item, "expected_evidence", default=())),
+            priority=_first(item, "priority", default="P2"),
+        )
+        return replace(
+            state,
+            actions=state.actions + (action,),
+            budget=_budget(state, actions_proposed=state.budget.actions_proposed + 1),
+        )
+
+    if event.event_type == "event_kernel.action.merged":
+        item = _mapping(payload.get("merge"))
+        action_id = _first(item, "action_id")
+        action = _find_record(state.actions, "action_id", action_id)
+        if action is None or action.state not in {
+            ActionState.PROPOSED,
+            ActionState.DEFERRED,
+            ActionState.RETRYABLE,
+        }:
+            raise IllegalTransitionError("action cannot be merged in its current state")
+        priority = _first(item, "priority")
+        rank = {"P0": 0, "P1": 1, "P2": 2}
+        if priority is not None and rank[priority] > rank[action.priority]:
+            raise IllegalTransitionError("action priority may only improve")
+        updated = replace(
+            action,
+            sources=_tuple_union(action.sources, _first(item, "sources", default=())),
+            strategy_ids=_tuple_union(action.strategy_ids, _first(item, "strategy_ids", default=())),
+            labels=_tuple_union(action.labels, _first(item, "labels", default=())),
+            expected_evidence=_tuple_union(
+                action.expected_evidence, _first(item, "expected_evidence", default=())
+            ),
+            priority=priority if priority is not None and rank[priority] < rank[action.priority] else action.priority,
+        )
+        return replace(state, actions=_replace_record(state.actions, updated, "action_id"))
+
+    if event.event_type == "event_kernel.action.deferred":
+        return _action_decision(state, event, target=ActionState.DEFERRED)
+    if event.event_type == "event_kernel.action.blocked":
+        return _action_decision(state, event, target=ActionState.BLOCKED)
+    return state
+
+
+def _process_terminal(state: EventKernelState, attempt: ExecutionAttemptRecord) -> bool:
+    processes = {process.process_id: process for process in state.processes}
+    return all(
+        process_id in processes and processes[process_id].state is ProcessState.TERMINATED
+        for process_id in attempt.process_ids
+    )
+
+
+def _reduce_attempt(state: EventKernelState, event: SemanticEvent) -> EventKernelState:
+    payload = _payload(event)
+    item = _mapping(payload.get("attempt"))
+    attempt_id = _first(item, "attempt_id", "id")
+    action_id = _first(item, "action_id")
+    if event.event_type == "event_kernel.attempt.started":
+        action = _find_record(state.actions, "action_id", action_id)
+        if action is None or action.state not in {
+            ActionState.PROPOSED,
+            ActionState.DEFERRED,
+            ActionState.RETRYABLE,
+        }:
+            raise IllegalTransitionError("action cannot start an attempt in its current state")
+        if any(
+            attempt.action_id == action_id and attempt.state is AttemptState.STARTED
+            for attempt in state.attempts
+        ):
+            raise IllegalTransitionError("only one attempt may be started for an action")
+        if _find_record(state.attempts, "attempt_id", attempt_id) is not None:
+            raise IllegalTransitionError("attempt_id was already used")
+        attempt = ExecutionAttemptRecord(
+            attempt_id=attempt_id,
+            action_id=action_id,
+            generation=_first(item, "generation", default=event.generation),
+            attempt_no=_first(item, "attempt_no"),
+            executor=_first(item, "executor"),
+            budget_class=_first(item, "budget_class"),
+            state=AttemptState.STARTED,
+        )
+        updated_action = replace(
+            action,
+            state=ActionState.RUNNING,
+            attempt_ids=action.attempt_ids + (attempt_id,),
+            active_attempt_id=attempt_id,
+        )
+        return replace(
+            state,
+            actions=_replace_record(state.actions, updated_action, "action_id"),
+            attempts=state.attempts + (attempt,),
+            budget=_budget(
+                state,
+                attempts_started=state.budget.attempts_started + 1,
+                budget_charges=state.budget.budget_charges + 1,
+            ),
+        )
+
+    attempt = _find_record(state.attempts, "attempt_id", attempt_id)
+    if attempt is None or attempt.state is not AttemptState.STARTED:
+        raise IllegalTransitionError("terminal attempt command requires a started attempt")
+    if not _process_terminal(state, attempt):
+        raise IllegalTransitionError("all processes bound to an attempt must be terminal")
+    action = _find_record(state.actions, "action_id", attempt.action_id)
+    assert action is not None
+    if event.event_type == "event_kernel.attempt.completed":
+        updated_attempt = replace(
+            attempt,
+            state=AttemptState.COMPLETED,
+            result_code=_first(item, "result_code"),
+            result_digest=_first(item, "result_digest"),
+        )
+        updated_action = replace(
+            action, state=ActionState.COMPLETED, active_attempt_id=None
+        )
+        budget = _budget(state, attempts_completed=state.budget.attempts_completed + 1)
+    else:
+        target = (
+            AttemptState.BLOCKED
+            if event.event_type == "event_kernel.attempt.blocked"
+            else AttemptState.CANCELLED
+        )
+        updated_attempt = replace(attempt, state=target, terminal_reason=_first(item, "reason"))
+        updated_action = replace(action, state=ActionState.RETRYABLE, active_attempt_id=None)
+        counter = "attempts_blocked" if target is AttemptState.BLOCKED else "attempts_cancelled"
+        budget = _budget(state, **{counter: getattr(state.budget, counter) + 1})
+    return replace(
+        state,
+        actions=_replace_record(state.actions, updated_action, "action_id"),
+        attempts=_replace_record(state.attempts, updated_attempt, "attempt_id"),
+        budget=budget,
+    )
+
+
+def _reduce_process(state: EventKernelState, event: SemanticEvent) -> EventKernelState:
+    item = _mapping(_payload(event).get("process"))
+    process_id = _first(item, "process_id")
+    attempt_id = _first(item, "attempt_id")
+    attempt = _find_record(state.attempts, "attempt_id", attempt_id)
+    if attempt is None:
+        raise IllegalTransitionError("process must bind to an existing attempt")
+    if event.event_type == "event_kernel.process.started":
+        if attempt.state is not AttemptState.STARTED or _find_record(state.processes, "process_id", process_id):
+            raise IllegalTransitionError("process cannot be started for this attempt")
+        process = ProcessRecord(
+            process_id=process_id,
+            attempt_id=attempt_id,
+            process_name=_first(item, "process_name", default=""),
+            state=ProcessState.STARTED,
+            last_sequence=0,
+            stdout_bytes_total=0,
+            stderr_bytes_total=0,
+            combined_bytes_total=0,
+            stdout_omitted_bytes_total=0,
+            stderr_omitted_bytes_total=0,
+            combined_omitted_bytes_total=0,
+            redacted_head_excerpt="",
+            redacted_tail_excerpt="",
+            exit_code=None,
+            termination_reason=None,
+        )
+        updated_attempt = replace(attempt, process_ids=attempt.process_ids + (process_id,))
+        return replace(
+            state,
+            attempts=_replace_record(state.attempts, updated_attempt, "attempt_id"),
+            processes=state.processes + (process,),
+        )
+
+    process = _find_record(state.processes, "process_id", process_id)
+    if process is None or process.attempt_id != attempt_id or process.state is ProcessState.TERMINATED:
+        raise IllegalTransitionError("process cannot be terminated in its current state")
+    process = replace(
+        process,
+        state=ProcessState.TERMINATED,
+        exit_code=_first(item, "exit_code"),
+        termination_reason=_first(item, "termination_reason"),
+        stdout_bytes_total=_first(item, "stdout_bytes_total", default=0),
+        stderr_bytes_total=_first(item, "stderr_bytes_total", default=0),
+        combined_bytes_total=_first(item, "combined_bytes_total", default=0),
+        stdout_omitted_bytes_total=_first(item, "stdout_omitted_bytes_total", default=0),
+        stderr_omitted_bytes_total=_first(item, "stderr_omitted_bytes_total", default=0),
+        combined_omitted_bytes_total=_first(item, "combined_omitted_bytes_total", default=0),
+    )
+    return replace(state, processes=_replace_record(state.processes, process, "process_id"))
 
 
 def _workflow_id(state: EventKernelState, event: SemanticEvent) -> str | None:
@@ -272,6 +554,25 @@ def reduce_event(state: EventKernelState, semantic_event: SemanticEvent) -> Even
         )
     if state.ownership is not OwnershipState.EVENT_KERNEL_OWNED:
         raise OwnershipClaimRequiredError("schema 2.0 event requires an ownership claim")
+    if semantic_event.event_type in {
+        "event_kernel.action.proposed",
+        "event_kernel.action.merged",
+        "event_kernel.action.deferred",
+        "event_kernel.action.blocked",
+    }:
+        return _reduce_action(state, semantic_event)
+    if semantic_event.event_type in {
+        "event_kernel.attempt.started",
+        "event_kernel.attempt.completed",
+        "event_kernel.attempt.blocked",
+        "event_kernel.attempt.cancelled",
+    }:
+        return _reduce_attempt(state, semantic_event)
+    if semantic_event.event_type in {
+        "event_kernel.process.started",
+        "event_kernel.process.terminated",
+    }:
+        return _reduce_process(state, semantic_event)
     if semantic_event.event_type == "event_kernel.evidence.attested":
         return _schema2_evidence(state, semantic_event)
     return state
