@@ -2669,8 +2669,10 @@ async def hunter_auto_cmd(target: str, param: str = "cmd", method: str = "GET",
 
 @mcp.tool()
 async def hunter_auto_idor(target: str, endpoint: str = "", cookie: str = "",
-                           session_id: Optional[str] = None) -> str:
-    """Automated IDOR vulnerability scanner."""
+                           session_id: Optional[str] = None,
+                           owner_cookie: str = "", attacker_id: str = "",
+                           owner_id: str = "", repetitions: int = 3) -> str:
+    """Automated IDOR scanner with optional two-account differential proof."""
     from core import auto_idor
     url = _join_endpoint(target, endpoint)
     return await _safe_auto_json_tool(
@@ -2679,6 +2681,10 @@ async def hunter_auto_idor(target: str, endpoint: str = "", cookie: str = "",
         auto_idor.auto_idor_impl,
         url=url,
         cookie=cookie,
+        owner_cookie=owner_cookie,
+        attacker_id=attacker_id,
+        owner_id=owner_id,
+        repetitions=repetitions,
         session_id=session_id,
     )
 

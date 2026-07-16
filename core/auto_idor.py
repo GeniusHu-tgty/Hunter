@@ -8,9 +8,11 @@ Automates Insecure Direct Object Reference detection:
 4. Parameter fuzzing for hidden ID fields
 """
 
+import hashlib
+import json
 import re
 import time
-import json
+from urllib.parse import quote, urljoin
 try:
     from tools.probe import _get_session
 except (ImportError, ModuleNotFoundError):
@@ -22,34 +24,351 @@ except (ImportError, ModuleNotFoundError):
         return s
 
 
+def _new_isolated_session():
+    """Create a cookie-isolated control session even under MCP session injection."""
+    import requests
+
+    session = requests.Session()
+    session.verify = False
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    return session
+
+
 class AutoIDOR:
     """Automated IDOR detection engine."""
 
+    _VOLATILE_FIELDS = {
+        "csrf",
+        "csrf_token",
+        "generated_at",
+        "nonce",
+        "request_id",
+        "requestid",
+        "server_time",
+        "timestamp",
+        "trace_id",
+        "traceid",
+        "updated_at",
+    }
+    _DENIAL_MARKERS = (
+        "access denied",
+        "forbidden",
+        "login required",
+        "not authorized",
+        "permission denied",
+        "please log in",
+        "sign in",
+        "unauthorized",
+    )
+    _SENSITIVE_HEADERS = {
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "set-cookie",
+        "x-api-key",
+    }
+
     def __init__(self, base_url: str, method: str = "GET",
-                 session=None, session2=None):
+                 session=None, session2=None, anonymous_session=None,
+                 endpoint: str = ""):
+        if endpoint:
+            self.endpoint = endpoint if endpoint.startswith(("http://", "https://")) else urljoin(
+                base_url.rstrip("/") + "/", endpoint.lstrip("/")
+            )
+        else:
+            self.endpoint = base_url
         self.base_url = base_url
         self.method = method.upper()
         self.session = session or _get_session()  # Attacker session
         self.session2 = session2  # Victim session (optional)
+        self.anonymous_session = anonymous_session
         self.vulnerable = False
         self.findings = []
 
     def _send(self, session, url: str, method: str = None, headers: dict = None) -> dict:
         """Send request with given session."""
         try:
-            m = method or self.method
-            if m == "GET":
-                resp = session.get(url, headers=headers or {}, timeout=10, allow_redirects=False)
+            m = (method or self.method).upper()
+            kwargs = {
+                "headers": headers or {},
+                "timeout": 10,
+                "allow_redirects": False,
+            }
+            if hasattr(session, "request"):
+                resp = session.request(m, url, **kwargs)
+            elif m == "GET":
+                resp = session.get(url, **kwargs)
             else:
-                resp = session.post(url, headers=headers or {}, timeout=10, allow_redirects=False)
+                resp = session.post(url, **kwargs)
+            response_text = str(resp.text or "")
             return {
                 "status": resp.status_code,
-                "body": resp.text[:5000],
-                "length": len(resp.text),
+                "body": response_text[:5000],
+                "length": len(response_text),
                 "headers": dict(resp.headers),
+                "_semantic": self._normalize_body(response_text),
             }
         except Exception as e:
             return {"status": 0, "body": "", "error": str(e)}
+
+    @classmethod
+    def _normalize_json(cls, value):
+        if isinstance(value, dict):
+            return {
+                key: cls._normalize_json(item)
+                for key, item in sorted(value.items())
+                if str(key).casefold() not in cls._VOLATILE_FIELDS
+            }
+        if isinstance(value, list):
+            return [cls._normalize_json(item) for item in value]
+        return value
+
+    @classmethod
+    def _normalize_body(cls, body: str) -> str:
+        stripped = str(body or "").strip()
+        if not stripped:
+            return ""
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return re.sub(r"\s+", " ", stripped)
+        return json.dumps(
+            cls._normalize_json(parsed),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @classmethod
+    def _public_response(cls, response: dict) -> dict:
+        public = {
+            key: value
+            for key, value in response.items()
+            if not str(key).startswith("_")
+        }
+        headers = public.get("headers")
+        if isinstance(headers, dict):
+            public["headers"] = {
+                key: "REDACTED" if str(key).casefold() in cls._SENSITIVE_HEADERS else value
+                for key, value in headers.items()
+            }
+        return public
+
+    @classmethod
+    def _is_meaningful_success(cls, response: dict) -> bool:
+        status = int(response.get("status") or 0)
+        body = str(response.get("body") or "")
+        if not 200 <= status < 300 or not response.get("_semantic"):
+            return False
+        return not any(marker in body.casefold() for marker in cls._DENIAL_MARKERS)
+
+    @staticmethod
+    def _semantic_digest(response: dict) -> str:
+        semantic = str(response.get("_semantic") or "")
+        if not semantic:
+            return ""
+        return hashlib.sha256(semantic.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _response_contains_identifier(cls, response: dict, identifier: str) -> bool:
+        expected = str(identifier)
+        semantic = str(response.get("_semantic") or "")
+        if not semantic or not expected:
+            return False
+        try:
+            parsed = json.loads(semantic)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return bool(re.search(
+                rf"(?<![A-Za-z0-9_-]){re.escape(expected)}(?![A-Za-z0-9_-])",
+                semantic,
+            ))
+
+        def matches(value) -> bool:
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                return str(value) == expected
+            if isinstance(value, list):
+                return any(matches(item) for item in value)
+            return False
+
+        def walk(value) -> bool:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    normalized = re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")
+                    identity_field = (
+                        normalized in {"id", "ids", "guid", "guids", "uuid", "uuids"}
+                        or normalized.endswith("_id")
+                        or normalized.endswith("_ids")
+                        or (normalized.endswith("id") and len(normalized) > 2)
+                    )
+                    if identity_field and matches(item):
+                        return True
+                    if isinstance(item, (dict, list)) and walk(item):
+                        return True
+                return False
+            if isinstance(value, list):
+                return any(walk(item) for item in value if isinstance(item, (dict, list)))
+            return False
+
+        return walk(parsed)
+
+    @classmethod
+    def _control_summary(cls, response: dict, owner_digest: str = "") -> dict:
+        digest = cls._semantic_digest(response)
+        return {
+            "status": int(response.get("status") or 0),
+            "body_length": int(response.get("length") or len(str(response.get("body") or ""))),
+            "semantic_digest": digest,
+            "matches_owner": bool(owner_digest and digest == owner_digest and cls._is_meaningful_success(response)),
+        }
+
+    def test_authorization_differential(
+        self,
+        url_template: str,
+        attacker_id: str,
+        owner_id: str,
+        attacker_cookie: str = "",
+        owner_cookie: str = "",
+        repetitions: int = 3,
+    ) -> dict:
+        """Prove cross-user reads with owner, attacker-own, and anonymous controls."""
+        controls = {
+            "attacker_own": {},
+            "owner": {},
+            "anonymous": {},
+            "cross_user": {
+                "attempts": 0,
+                "semantic_matches": 0,
+                "semantic_digests": [],
+            },
+        }
+
+        def result(classification: str, reason: str, evidence=None) -> dict:
+            return {
+                "test": "authorization_differential",
+                "target": url_template,
+                "vulnerable": classification == "verified",
+                "classification": classification,
+                "reason": reason,
+                "controls": controls,
+                "evidence": evidence or {},
+                "findings": list(self.findings),
+            }
+
+        if "{id}" not in str(url_template):
+            return result("inconclusive", "The endpoint must contain an {id} resource placeholder")
+        if not attacker_id or not owner_id or str(attacker_id) == str(owner_id):
+            return result("inconclusive", "Distinct attacker and owner resource IDs are required")
+        try:
+            repetitions = int(repetitions)
+        except (TypeError, ValueError):
+            return result("inconclusive", "Repetitions must be an integer between 1 and 5")
+        if not 1 <= repetitions <= 5:
+            return result("inconclusive", "Repetitions must be between 1 and 5")
+
+        attacker_url = url_template.replace("{id}", quote(str(attacker_id), safe=""))
+        owner_url = url_template.replace("{id}", quote(str(owner_id), safe=""))
+        attacker_headers = {"Cookie": attacker_cookie} if attacker_cookie else {}
+        owner_headers = {"Cookie": owner_cookie} if owner_cookie else {}
+
+        attacker_control = self._send(self.session, attacker_url, headers=attacker_headers)
+        owner_session = self.session2 or _new_isolated_session()
+        owner_control = self._send(owner_session, owner_url, headers=owner_headers)
+        owner_digest = self._semantic_digest(owner_control)
+        controls["attacker_own"] = self._control_summary(attacker_control, owner_digest)
+        controls["owner"] = self._control_summary(owner_control, owner_digest)
+
+        def build_evidence(response: dict, matches: int, owner_data_returned: bool) -> dict:
+            return {
+                "request": {
+                    "method": self.method,
+                    "url": owner_url,
+                    "headers": {"Cookie": "REDACTED"} if attacker_cookie else {},
+                },
+                "response": self._public_response(response),
+                "baseline_response": self._public_response(attacker_control),
+                "payload": str(owner_id),
+                "reproduction_count": matches,
+                "metadata": {
+                    "request_user": str(attacker_id),
+                    "resource_owner": str(owner_id),
+                    "owner_data_returned": owner_data_returned,
+                    "attacker_resource_url": attacker_url,
+                    "owner_resource_url": owner_url,
+                    "control_matrix": controls,
+                },
+            }
+
+        if not self._is_meaningful_success(owner_control):
+            evidence = build_evidence({}, 0, False)
+            return result("inconclusive", "Owner control was not an authenticated successful response", evidence)
+        if not self._is_meaningful_success(attacker_control):
+            evidence = build_evidence({}, 0, False)
+            return result("inconclusive", "Attacker own-resource control was not successful", evidence)
+
+        anonymous_session = self.anonymous_session or _new_isolated_session()
+        anonymous_control = self._send(anonymous_session, owner_url, headers={})
+        controls["anonymous"] = self._control_summary(anonymous_control, owner_digest)
+
+        if controls["attacker_own"]["matches_owner"]:
+            evidence = build_evidence({}, 0, False)
+            return result("refuted", "Attacker-own and owner controls are identical generic responses", evidence)
+        if controls["anonymous"]["matches_owner"]:
+            evidence = build_evidence(anonymous_control, 0, False)
+            return result("refuted", "The owner resource is public to the anonymous control", evidence)
+        if not self._response_contains_identifier(owner_control, str(owner_id)):
+            evidence = build_evidence({}, 0, False)
+            return result("inconclusive", "Owner control was not bound to the requested owner resource ID", evidence)
+
+        matched_response = {}
+        semantic_digests = []
+        matches = 0
+        for _ in range(repetitions):
+            probe = self._send(self.session, owner_url, headers=attacker_headers)
+            controls["cross_user"]["attempts"] += 1
+            probe_digest = self._semantic_digest(probe)
+            semantic_digests.append(probe_digest)
+            if (
+                self._is_meaningful_success(probe)
+                and probe_digest == owner_digest
+                and self._response_contains_identifier(probe, str(owner_id))
+            ):
+                matches += 1
+                if not matched_response:
+                    matched_response = probe
+
+        controls["cross_user"]["semantic_matches"] = matches
+        controls["cross_user"]["semantic_digests"] = semantic_digests
+        owner_data_returned = matches > 0
+        evidence = build_evidence(matched_response, matches, owner_data_returned)
+
+        if matches == repetitions and repetitions >= 3:
+            self.vulnerable = True
+            self.findings.append({
+                "type": "idor_cross_user_verified",
+                "severity": "high",
+                "url": owner_url,
+                "attacker_id": str(attacker_id),
+                "owner_id": str(owner_id),
+                "reproductions": matches,
+            })
+            verified = result(
+                "verified",
+                "Attacker session repeatedly returned the owner-bound resource while anonymous access was denied",
+                evidence,
+            )
+            verified["findings"] = list(self.findings)
+            return verified
+        if matches:
+            return result(
+                "likely",
+                "Owner-bound data was observed but did not satisfy the three-repeat verification gate",
+                evidence,
+            )
+        return result(
+            "refuted",
+            "Attacker session did not return the owner-bound resource",
+            evidence,
+        )
 
     def test_numeric_id(self, url_template: str, id_range: str = "1-5",
                         current_id: str = "1") -> dict:
@@ -284,9 +603,24 @@ class AutoIDOR:
         return {"tested": len(hidden_params), "results": results}
 
     def run_full_scan(self, url: str = "", url_template: str = "",
-                      id_range: str = "1-5", current_id: str = "1") -> dict:
+                      id_range: str = "1-5", current_id: str = "1",
+                      attacker_cookie: str = "", owner_cookie: str = "",
+                      attacker_id: str = "", owner_id: str = "",
+                      repetitions: int = 3) -> dict:
         """Run complete IDOR scan."""
+        differential_template = url_template or (url if "{id}" in url else "")
+        if differential_template and attacker_id and owner_id:
+            return self.test_authorization_differential(
+                url_template=differential_template,
+                attacker_id=attacker_id,
+                owner_id=owner_id,
+                attacker_cookie=attacker_cookie,
+                owner_cookie=owner_cookie,
+                repetitions=repetitions,
+            )
+
         start = time.time()
+        url = url or self.endpoint
         results = {"target": url or url_template, "steps": []}
 
         # Step 1: Numeric ID test
@@ -315,8 +649,22 @@ class AutoIDOR:
 
 
 def auto_idor_impl(url: str = "", url_template: str = "", id_range: str = "1-5",
-                    current_id: str = "1", method: str = "GET") -> dict:
+                   current_id: str = "1", method: str = "GET", cookie: str = "",
+                   owner_cookie: str = "", attacker_id: str = "",
+                   owner_id: str = "", repetitions: int = 3, session=None,
+                   owner_session=None, anonymous_session=None) -> dict:
     """Run automated IDOR scan. Entry point for MCP tool."""
-    engine = AutoIDOR(url, method)
+    engine = AutoIDOR(
+        url or url_template,
+        method,
+        session=session,
+        session2=owner_session,
+        anonymous_session=anonymous_session,
+    )
     return engine.run_full_scan(url=url, url_template=url_template,
-                                 id_range=id_range, current_id=current_id)
+                                id_range=id_range, current_id=current_id,
+                                attacker_cookie=cookie,
+                                owner_cookie=owner_cookie,
+                                attacker_id=attacker_id,
+                                owner_id=owner_id,
+                                repetitions=repetitions)
