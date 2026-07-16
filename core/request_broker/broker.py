@@ -14,6 +14,44 @@ from .identity import IdentityPool
 from .projection import block_cluster_similarity, build_response_projection
 
 
+@dataclass(frozen=True)
+class BrokerSettings:
+    """Runtime settings loaded from the repository's config.yaml."""
+
+    initial_cooldown_seconds: float = 30.0
+    max_cooldown_seconds: float = 600.0
+    hard_block_threshold: int = 5
+    artifact_quota_bytes: int = 500 * 1024 * 1024
+    target_artifact_quota_bytes: int = 100 * 1024 * 1024
+
+
+def load_broker_settings(config_path: str | Path | None = None) -> BrokerSettings:
+    """Load the small request_broker YAML section without adding a YAML dependency."""
+    path = Path(config_path) if config_path is not None else Path(__file__).resolve().parents[2] / "config.yaml"
+    if not path.is_file():
+        return BrokerSettings()
+    values: dict[str, str] = {}
+    in_section = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line.startswith((" ", "\t")):
+            in_section = line.strip() == "request_broker:"
+            continue
+        if not in_section or ":" not in line:
+            continue
+        key, value = line.strip().split(":", 1)
+        values[key.strip()] = value.strip().strip("\"'")
+    return BrokerSettings(
+        initial_cooldown_seconds=float(values.get("cooldown_initial_seconds", 30)),
+        max_cooldown_seconds=float(values.get("cooldown_max_seconds", 600)),
+        hard_block_threshold=int(values.get("hard_block_threshold", 5)),
+        artifact_quota_bytes=int(values.get("global_artifact_quota_mib", 500)) * 1024 * 1024,
+        target_artifact_quota_bytes=int(values.get("target_artifact_quota_mib", 100)) * 1024 * 1024,
+    )
+
+
 class Classification(str, Enum):
     ALLOWED_APP = "ALLOWED_APP"
     WAF_BLOCK = "WAF_BLOCK"
@@ -105,19 +143,30 @@ class RequestBroker:
         *,
         transport: BrokerTransport | None = None,
         now: Callable[[], float] = time.time,
-        max_cooldown_seconds: float = 600.0,
-        hard_block_threshold: int = 5,
-        artifact_quota_bytes: int = 500 * 1024 * 1024,
+        initial_cooldown_seconds: float | None = None,
+        max_cooldown_seconds: float | None = None,
+        hard_block_threshold: int | None = None,
+        artifact_quota_bytes: int | None = None,
+        target_artifact_quota_bytes: int | None = None,
         identity_pool: IdentityPool | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        settings = load_broker_settings()
         self.now = now
-        self.max_cooldown_seconds = max_cooldown_seconds
-        self.hard_block_threshold = max(1, int(hard_block_threshold))
+        self.initial_cooldown_seconds = float(initial_cooldown_seconds if initial_cooldown_seconds is not None else settings.initial_cooldown_seconds)
+        self.max_cooldown_seconds = float(max_cooldown_seconds if max_cooldown_seconds is not None else settings.max_cooldown_seconds)
+        threshold = hard_block_threshold if hard_block_threshold is not None else settings.hard_block_threshold
+        self.hard_block_threshold = max(1, int(threshold))
         self.transport = transport or self._default_transport()
         self.identity_pool = identity_pool or IdentityPool()
-        self.artifacts = ArtifactStore(self.state_dir / "artifacts", quota_bytes=artifact_quota_bytes)
+        quota = artifact_quota_bytes if artifact_quota_bytes is not None else settings.artifact_quota_bytes
+        target_quota = target_artifact_quota_bytes if target_artifact_quota_bytes is not None else settings.target_artifact_quota_bytes
+        self.artifacts = ArtifactStore(
+            self.state_dir / "artifacts",
+            quota_bytes=quota,
+            target_quota_bytes=target_quota,
+        )
         self.db = sqlite3.connect(self.state_dir / "state.sqlite")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute(
@@ -196,7 +245,10 @@ class RequestBroker:
         cooldown = 0.0
         state = "HEALTHY"
         if block:
-            cooldown = self.now() + min(30.0 * (2 ** max(0, block_count - 1)), self.max_cooldown_seconds)
+            cooldown = self.now() + min(
+                self.initial_cooldown_seconds * (2 ** max(0, block_count - 1)),
+                self.max_cooldown_seconds,
+            )
             state = "COOLING_DOWN"
             if block_count >= self.hard_block_threshold:
                 state = "HARD_BLOCKED"

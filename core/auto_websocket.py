@@ -6,7 +6,17 @@ import re
 import json
 import time
 from typing import Optional
-from core.probe import _get_session
+from core.request_broker import LegacyRequestsAdapter, RequestBroker
+
+
+_session: LegacyRequestsAdapter | None = None
+
+
+def _get_session() -> LegacyRequestsAdapter:
+    global _session
+    if _session is None:
+        _session = LegacyRequestsAdapter(RequestBroker("sessions/request_broker"))
+    return _session
 
 
 def discover_websockets(url: str) -> dict:

@@ -4,7 +4,17 @@ Hunter v4 — Target File Reader
 Read files from target via LFI, directory traversal, or source code disclosure.
 """
 
-from core.probe import _get_session
+from core.request_broker import LegacyRequestsAdapter, RequestBroker
+
+
+_session: LegacyRequestsAdapter | None = None
+
+
+def _get_session() -> LegacyRequestsAdapter:
+    global _session
+    if _session is None:
+        _session = LegacyRequestsAdapter(RequestBroker("sessions/request_broker"))
+    return _session
 
 # LFI payload templates
 LFI_PAYLOADS = {

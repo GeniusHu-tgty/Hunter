@@ -5,11 +5,27 @@ import json
 import re
 from collections import Counter
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, TypedDict
 
 
 _SENSITIVE_NAMES = {"token", "secret", "password", "passwd", "authorization", "cookie", "api_key", "apikey"}
 _WORD = re.compile(r"[A-Za-z0-9_]+")
+
+
+class ResponseProjection(TypedDict, total=False):
+    """Normalized response metadata persisted by the request broker."""
+
+    status_code: int
+    url: str
+    redirect_count: int
+    headers: dict[str, str]
+    cookies: list[str]
+    body_hash: str
+    body_length: int
+    body_sample: str
+    title: str
+    html: dict[str, Any]
+    json: dict[str, Any]
 
 
 class _HtmlFeatures(HTMLParser):
@@ -112,10 +128,10 @@ def block_cluster_similarity(left: dict[str, Any], right: dict[str, Any]) -> flo
     return round(title * 0.15 + dom * 0.25 + text * 0.30 + length * 0.10 + headers * 0.10 + route_form * 0.10, 4)
 
 
-def build_response_projection(response: Any) -> dict[str, Any]:
+def build_response_projection(response: Any) -> ResponseProjection:
     text = str(getattr(response, "text", "") or "")
     headers = {str(key).lower(): str(value) for key, value in dict(getattr(response, "headers", {}) or {}).items()}
-    result: dict[str, Any] = {
+    result: ResponseProjection = {
         "status_code": int(getattr(response, "status_code", 0) or 0),
         "url": str(getattr(response, "url", "") or ""),
         "redirect_count": len(getattr(response, "history", ()) or ()),

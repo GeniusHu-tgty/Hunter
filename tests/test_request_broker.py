@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.request_broker import ArtifactStore, Classification, IdentityPool, RequestBroker, RequestSpec
+from core.request_broker import (
+    ArtifactStore,
+    Classification,
+    DependentProcess,
+    IdentityPool,
+    RequestBroker,
+    RequestSpec,
+    ResponseProjection,
+    block_cluster_similarity,
+    build_response_projection,
+)
 from core.request_broker.projection import block_cluster_similarity, build_response_projection
 
 
@@ -259,3 +269,20 @@ def test_broker_applies_selected_identity_to_transport_request(tmp_path):
     assert headers["User-Agent"] == "Owner UA"
     assert headers["Cookie"] == "sid=cookie"
     assert headers["X-Request"] == "one"
+
+
+def test_broker_reads_repository_config_by_default(tmp_path):
+    broker = RequestBroker(tmp_path, transport=SequenceTransport())
+
+    assert broker.initial_cooldown_seconds == 30
+    assert broker.max_cooldown_seconds == 600
+    assert broker.hard_block_threshold == 5
+    assert broker.artifacts.quota_bytes == 500 * 1024 * 1024
+    assert broker.artifacts.target_quota_bytes == 100 * 1024 * 1024
+
+
+def test_request_broker_public_api_exposes_projection_and_mitm_protocol_types():
+    assert ResponseProjection.__name__ == "ResponseProjection"
+    assert callable(build_response_projection)
+    assert callable(block_cluster_similarity)
+    assert DependentProcess.__name__ == "DependentProcess"

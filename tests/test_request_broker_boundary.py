@@ -12,6 +12,25 @@ ADAPTED_SOURCES = [
     ROOT / "core" / "src_read.py",
 ]
 HTTP_MODULES = {"requests", "httpx", "aiohttp"}
+BROKER_ADAPTED_SOURCES = [
+    ROOT / "core" / name
+    for name in (
+        "auto_sqli.py",
+        "auto_xss.py",
+        "auto_ssrf.py",
+        "auto_ssti.py",
+        "auto_cmd.py",
+        "auto_cors.py",
+        "auto_csrf.py",
+        "auto_graphql.py",
+        "auto_jwt.py",
+        "auto_websocket.py",
+        "auto_xxe.py",
+        "auto_access_control.py",
+        "inject.py",
+        "src_read.py",
+    )
+]
 
 
 class DirectHttpVisitor(ast.NodeVisitor):
@@ -49,3 +68,13 @@ def test_legacy_scanners_have_no_direct_http_client_boundary_bypass():
         violations.extend(visitor.violations)
 
     assert not violations, "\n".join(violations)
+
+
+def test_named_legacy_scanners_depend_on_request_broker():
+    missing = [
+        path.name
+        for path in BROKER_ADAPTED_SOURCES
+        if "core.request_broker" not in path.read_text(encoding="utf-8")
+    ]
+
+    assert not missing, ", ".join(missing)
