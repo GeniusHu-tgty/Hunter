@@ -16,6 +16,7 @@ from .contracts import (
     EventKernelState,
     ExecutionAttemptRecord,
     FindingRecord,
+    FindingCandidate,
     LegacyCheckpointHint,
     LogicalActionRecord,
     OwnershipState,
@@ -23,6 +24,9 @@ from .contracts import (
     ProcessState,
     StageResultDigest,
     StageStatusRecord,
+    VerdictRecord,
+    VerdictStateRecord,
+    VerdictStatus,
     VerificationObservation,
     ReproductionObservation,
 )
@@ -76,6 +80,12 @@ def _find_record(records: tuple[Any, ...], identifier: str, value: str) -> Any |
 def _tuple_union(existing: tuple[str, ...], additions: Any) -> tuple[str, ...]:
     values = additions if isinstance(additions, (list, tuple)) else ()
     return existing + tuple(value for value in values if value not in existing)
+
+
+def _ordered_ids(value: Any, name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise EvidenceAttestationError(f"{name} must be an ordered collection")
+    return tuple(value)
 
 
 def _action_key(*, generation: int, tool: str, target: str, arguments: Any, kind: str) -> str:
@@ -493,7 +503,156 @@ def _schema2_evidence(state: EventKernelState, event: SemanticEvent) -> EventKer
         origin=EvidenceOrigin.SCHEMA_2,
         attestation=attestation,
     )
+    if attestation.generation != event.generation:
+        raise EvidenceAttestationError("evidence generation must match the event generation")
+    action = _find_record(state.actions, "action_id", attestation.action_id)
+    attempt = _find_record(state.attempts, "attempt_id", attestation.attempt_id)
+    if (
+        action is None
+        or attempt is None
+        or action.generation != attestation.generation
+        or attempt.action_id != attestation.action_id
+        or attempt.generation != attestation.generation
+        or attempt.state is AttemptState.STARTED
+    ):
+        raise IllegalTransitionError(
+            "evidence must bind to a matching action and terminal attempt"
+        )
+    existing = _find_record(state.evidence, "evidence_id", evidence_id)
+    if existing is not None:
+        if existing.attestation is not None and existing.attestation != attestation:
+            raise EvidenceAttestationError("evidence identity and attestation are immutable")
+        record = replace(existing, attestation=attestation)
     return replace(state, evidence=_replace_record(state.evidence, record, "evidence_id"))
+
+
+def _schema2_verdict(state: EventKernelState, event: SemanticEvent) -> EventKernelState:
+    raw_verdict = _payload(event).get("verdict")
+    if raw_verdict is None:
+        return state
+    if not isinstance(raw_verdict, Mapping):
+        raise EvidenceAttestationError("verdict must be an object")
+    item = raw_verdict
+    verdict_id = _first(item, "verdict_id", "id")
+    if _find_record(state.verdicts, "verdict_id", verdict_id) is not None:
+        raise IllegalTransitionError("verdict_id was already recorded")
+
+    raw_finding = item.get("finding")
+    if raw_finding is not None and not isinstance(raw_finding, Mapping):
+        raise EvidenceAttestationError("finding must be an object")
+    finding_data = raw_finding if raw_finding is not None else None
+    finding = None
+    if finding_data:
+        finding = FindingCandidate(
+            finding_id=_first(finding_data, "finding_id", "id"),
+            subject_id=_first(finding_data, "subject_id"),
+            action_id=_first(finding_data, "action_id"),
+            attempt_id=_first(finding_data, "attempt_id"),
+            generation=_first(finding_data, "generation"),
+            evidence_ids=_ordered_ids(_first(finding_data, "evidence_ids", default=()), "finding evidence_ids"),
+        )
+    verdict = VerdictRecord(
+        verdict_id=verdict_id,
+        subject_id=_first(item, "subject_id"),
+        action_id=_first(item, "action_id"),
+        attempt_id=_first(item, "attempt_id"),
+        status=_first(item, "status"),
+        generation=_first(item, "generation", default=event.generation),
+        evidence_ids=_ordered_ids(_first(item, "evidence_ids", default=()), "evidence_ids"),
+        supersedes_verdict_id=_first(item, "supersedes_verdict_id"),
+        finding=finding,
+    )
+    if verdict.generation != event.generation:
+        raise IllegalTransitionError("verdict generation must match the event generation")
+    action = _find_record(state.actions, "action_id", verdict.action_id)
+    attempt = _find_record(state.attempts, "attempt_id", verdict.attempt_id) if verdict.attempt_id else None
+    if action is None or action.generation != verdict.generation:
+        raise IllegalTransitionError("verdict must bind to an action in its generation")
+    if verdict.attempt_id is not None and (
+        attempt is None
+        or attempt.action_id != verdict.action_id
+        or attempt.generation != verdict.generation
+    ):
+        raise IllegalTransitionError("verdict attempt must bind to its action")
+    if verdict.status is VerdictStatus.VERIFIED:
+        for evidence_id in verdict.evidence_ids:
+            evidence = _find_record(state.evidence, "evidence_id", evidence_id)
+            attestation = evidence.attestation if evidence is not None else None
+            if (
+                attestation is None
+                or attestation.generation != verdict.generation
+                or attestation.action_id != verdict.action_id
+                or attestation.attempt_id != verdict.attempt_id
+            ):
+                raise EvidenceAttestationError(
+                    "VERIFIED verdict evidence must exactly match generation, action, and attempt"
+                )
+
+    active = next((record for record in state.verdicts if record.subject_id == verdict.subject_id and record.active), None)
+    if active is None and verdict.supersedes_verdict_id is not None:
+        raise IllegalTransitionError("a verdict may supersede only an active verdict")
+    if active is not None and verdict.supersedes_verdict_id != active.verdict_id:
+        raise IllegalTransitionError("active subject verdict must be explicitly superseded")
+    if verdict.supersedes_verdict_id is not None:
+        previous = _find_record(state.verdicts, "verdict_id", verdict.supersedes_verdict_id)
+        if previous is None or not previous.active or previous.subject_id != verdict.subject_id:
+            raise IllegalTransitionError("verdict supersession must name the active subject verdict")
+    if finding is not None:
+        if verdict.status is not VerdictStatus.VERIFIED:
+            raise EvidenceAttestationError("only VERIFIED verdicts may create findings")
+        if _find_record(state.findings, "finding_id", finding.finding_id) is not None:
+            raise IllegalTransitionError("finding_id was already recorded")
+        if any(record.verdict_id == verdict.verdict_id for record in state.findings):
+            raise EvidenceAttestationError("each verdict may create at most one finding")
+
+    previous_verdicts = list(state.verdicts)
+    previous_findings = list(state.findings)
+    if active is not None:
+        previous_verdicts = [
+            replace(record, active=False, superseded_by_verdict_id=verdict.verdict_id)
+            if record.verdict_id == active.verdict_id else record
+            for record in previous_verdicts
+        ]
+        previous_findings = [
+            replace(finding_record, active=False, superseded_by_verdict_id=verdict.verdict_id)
+            if finding_record.verdict_id == active.verdict_id and finding_record.active else finding_record
+            for finding_record in previous_findings
+        ]
+    recorded = VerdictStateRecord(
+        verdict_id=verdict.verdict_id,
+        subject_id=verdict.subject_id,
+        action_id=verdict.action_id,
+        attempt_id=verdict.attempt_id,
+        status=verdict.status,
+        generation=verdict.generation,
+        evidence_ids=verdict.evidence_ids,
+        active=True,
+        supersedes_verdict_id=verdict.supersedes_verdict_id,
+        superseded_by_verdict_id=None,
+        recorded_at=event.timestamp or "event",
+    )
+    if finding is not None:
+        previous_findings.append(
+            FindingRecord(
+                finding_id=finding.finding_id,
+                verdict_id=verdict.verdict_id,
+                subject_id=finding.subject_id,
+                action_id=finding.action_id,
+                attempt_id=finding.attempt_id,
+                generation=finding.generation,
+                evidence_ids=finding.evidence_ids,
+                active=True,
+                superseded_by_verdict_id=None,
+                legacy_unverified=False,
+            )
+        )
+    active_findings = tuple(record.finding_id for record in previous_findings if record.active)
+    return replace(
+        state,
+        verdicts=tuple(previous_verdicts) + (recorded,),
+        findings=tuple(previous_findings),
+        active_findings=active_findings,
+    )
 
 
 def reduce_event(state: EventKernelState, semantic_event: SemanticEvent) -> EventKernelState:
@@ -575,6 +734,8 @@ def reduce_event(state: EventKernelState, semantic_event: SemanticEvent) -> Even
         return _reduce_process(state, semantic_event)
     if semantic_event.event_type == "event_kernel.evidence.attested":
         return _schema2_evidence(state, semantic_event)
+    if semantic_event.event_type == "event_kernel.verdict.recorded":
+        return _schema2_verdict(state, semantic_event)
     return state
 
 

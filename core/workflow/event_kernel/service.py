@@ -16,10 +16,13 @@ from .contracts import (
     CommandMeta,
     CommandResult,
     CommandType,
+    EvidenceAttestation,
     EventKernelState,
+    FindingCandidate,
     HashMode,
     Head,
     OwnershipState,
+    VerdictRecord,
     WorkflowOwnershipClaim,
 )
 from .envelope import canonical_json_bytes, make_action_id
@@ -182,6 +185,71 @@ class EventKernel:
         self, slug: str, meta: CommandMeta, terminal: AttemptCancel
     ) -> CommandResult:
         return self._terminal(slug, meta, terminal, CommandType.CANCEL_ATTEMPT)
+
+    def attest_evidence(
+        self, slug: str, meta: CommandMeta, attestation: EvidenceAttestation
+    ) -> CommandResult:
+        self._require(meta, CommandMeta, "meta")
+        self._require(attestation, EvidenceAttestation, "attestation")
+        payload = {
+            "attestation": {
+                "evidence_id": attestation.evidence_id,
+                "evidence_sha256": attestation.evidence_sha256,
+                "source_ref_digest": attestation.source_ref_digest,
+                "action_id": attestation.action_id,
+                "attempt_id": attestation.attempt_id,
+                "generation": attestation.generation,
+                "verifier_id": attestation.verifier_id,
+                "verifier_version": attestation.verifier_version,
+                "verification_policy_digest": attestation.verification_policy_digest,
+                "baseline": {
+                    "result_code": attestation.baseline.result_code,
+                    "procedure_digest": attestation.baseline.procedure_digest,
+                    "observation_digest": attestation.baseline.observation_digest,
+                },
+                "control": {
+                    "result_code": attestation.control.result_code,
+                    "procedure_digest": attestation.control.procedure_digest,
+                    "observation_digest": attestation.control.observation_digest,
+                },
+                "reproduction": {
+                    "result_code": attestation.reproduction.result_code,
+                    "procedure_digest": attestation.reproduction.procedure_digest,
+                    "observation_digest": attestation.reproduction.observation_digest,
+                    "run_count": attestation.reproduction.run_count,
+                    "success_count": attestation.reproduction.success_count,
+                },
+            }
+        }
+        return self._store._commit_command(slug, meta, CommandType.ATTEST_EVIDENCE, payload)
+
+    def record_verdict(
+        self, slug: str, meta: CommandMeta, verdict: VerdictRecord
+    ) -> CommandResult:
+        self._require(meta, CommandMeta, "meta")
+        self._require(verdict, VerdictRecord, "verdict")
+        data: dict[str, Any] = {
+            "verdict_id": verdict.verdict_id,
+            "subject_id": verdict.subject_id,
+            "action_id": verdict.action_id,
+            "attempt_id": verdict.attempt_id,
+            "status": verdict.status.value,
+            "generation": verdict.generation,
+            "evidence_ids": list(verdict.evidence_ids),
+            "supersedes_verdict_id": verdict.supersedes_verdict_id,
+        }
+        finding = verdict.finding
+        if finding is not None:
+            self._require(finding, FindingCandidate, "finding")
+            data["finding"] = {
+                "finding_id": finding.finding_id,
+                "subject_id": finding.subject_id,
+                "action_id": finding.action_id,
+                "attempt_id": finding.attempt_id,
+                "generation": finding.generation,
+                "evidence_ids": list(finding.evidence_ids),
+            }
+        return self._store._commit_command(slug, meta, CommandType.RECORD_VERDICT, {"verdict": data})
 
     def _terminal(self, slug: str, meta: CommandMeta, terminal: Any, command: CommandType) -> CommandResult:
         self._require(meta, CommandMeta, "meta")
