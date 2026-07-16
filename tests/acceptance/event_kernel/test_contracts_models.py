@@ -1253,9 +1253,35 @@ def test_head_hash_mode_contract_rejects_ambiguous_shapes() -> None:
     assert contracts.Head(
         revision=1,
         event_hash="",
-        event_id="evt-0123456789abcdef",
+        event_id="evt-0123456789ab",
         hash_mode=contracts.HashMode.LEGACY_UNBOUND,
     ).hash_mode is contracts.HashMode.LEGACY_UNBOUND
+    legacy_entry = contracts.EventIndexEntry(
+        revision=1,
+        event_id="evt-0123456789ab",
+        event_type="workflow.created",
+        event_hash="",
+        previous_event_hash="",
+        schema_version="1.0",
+        generation=1,
+        byte_offset=0,
+        byte_length=128,
+        hash_mode=contracts.HashMode.LEGACY_UNBOUND,
+    )
+    claim_entry = contracts.EventIndexEntry(
+        revision=5,
+        event_id="evt-0123456789abcdef",
+        event_type="event_kernel.ownership.claimed",
+        event_hash=_sha("b"),
+        previous_event_hash="legacy-sha256:" + _sha("a"),
+        schema_version="2.0",
+        generation=1,
+        byte_offset=2045,
+        byte_length=512,
+        hash_mode=contracts.HashMode.HASHED,
+    )
+    assert legacy_entry.event_id == "evt-0123456789ab"
+    assert claim_entry.previous_event_hash.startswith("legacy-sha256:")
 
     for values in (
         {

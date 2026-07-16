@@ -29,7 +29,8 @@ _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 _ACTION_ID_RE = re.compile(r"act-g([0-9]{6})-([0-9a-f]{16})")
 _ATTEMPT_ID_RE = re.compile(r"att-g([0-9]{6})-([0-9a-f]{16})-([0-9]{6})")
 _WORKFLOW_ID_RE = re.compile(r"wf-[0-9a-f]{12}")
-_EVENT_ID_RE = re.compile(r"evt-[0-9a-f]{16}")
+_EVENT_ID_RE = re.compile(r"evt-(?:[0-9a-f]{12}|[0-9a-f]{16})")
+_LEGACY_HEAD_RE = re.compile(r"legacy-sha256:[0-9a-f]{64}")
 _PROCESS_ID_RE = re.compile(r"proc-[0-9a-f]{16}")
 _OUTBOX_ID_RE = re.compile(r"out-[0-9a-f]{64}")
 _CHECKPOINT_ID_RE = re.compile(r"cp-[0-9a-f]{16,64}")
@@ -1792,6 +1793,11 @@ class EventIndexEntry:
                 )
                 if self.previous_event_hash:
                     raise InvalidCommandError("first event previous_event_hash must be empty")
+            elif (
+                self.event_type == EventType.OWNERSHIP_CLAIMED.value
+                and _LEGACY_HEAD_RE.fullmatch(self.previous_event_hash) is not None
+            ):
+                pass
             else:
                 object.__setattr__(
                     self,
