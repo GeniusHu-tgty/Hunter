@@ -4,7 +4,7 @@ import mcp_server
 
 TOOLS = {
     "hunter_fast_scan", "hunter_scan_plan", "hunter_scan_benchmark",
-    "hunter_cache_status", "hunter_cache_clear",
+    "hunter_broker_benchmark", "hunter_cache_status", "hunter_cache_clear",
 }
 
 
@@ -24,3 +24,11 @@ def test_adaptive_plan_and_cache_smoke():
     assert status["status"] == "ok"
     caps = json.loads(asyncio.run(mcp_server.hunter_capabilities()))
     assert TOOLS <= set(caps["tools"])
+
+
+def test_broker_benchmark_uses_a_local_fixture():
+    result = json.loads(asyncio.run(mcp_server.hunter_broker_benchmark(samples=3)))
+
+    assert result["status"] == "ok"
+    assert result["data"]["direct"]["p95_ms"] >= 0
+    assert "broker_sdk" in result["data"]

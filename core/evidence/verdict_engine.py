@@ -30,6 +30,7 @@ class VulnType(Enum):
     SSTI = "ssti"
     UPLOAD = "upload"
     INFO_DISCLOSURE = "info_disclosure"
+    RACE = "race"
 
 
 @dataclass(frozen=True)
@@ -336,6 +337,15 @@ class VerdictEngine:
             signals.append("authenticated_page_marker")
         refuted = "Redirect target is an error, denial, or authentication page" if self._status(evidence) == 302 and location and not signals else ""
         return signals, refuted
+
+    def _assess_race(self, evidence: Evidence):
+        meta = evidence.metadata
+        fields = ("control_normal", "invariant_violated", "oracle_stable", "gate_verified")
+        if not any(field in meta for field in fields):
+            return [], ""
+        if all(meta.get(field) is True for field in fields):
+            return ["server_side_invariant_violation"], ""
+        return [], "Race proof controls, oracle stability, or dispatch gate were not satisfied"
 
     def _assess_open_redirect(self, evidence: Evidence):
         location = str(evidence.metadata.get("redirect_location") or evidence.response.get("headers", {}).get("Location") or "")

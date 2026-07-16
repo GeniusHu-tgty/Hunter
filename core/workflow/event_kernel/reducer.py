@@ -10,6 +10,7 @@ from .contracts import (
     ActionState,
     AttemptState,
     BudgetMetrics,
+    CheckpointRecord,
     EvidenceAttestation,
     EvidenceOrigin,
     EvidenceRecord,
@@ -31,6 +32,8 @@ from .contracts import (
     VerdictStatus,
     VerificationObservation,
     ReproductionObservation,
+    OutboxEntry,
+    OutboxState,
 )
 from .errors import (
     CorruptEventLogError,
@@ -756,6 +759,66 @@ def _schema2_verdict(state: EventKernelState, event: SemanticEvent) -> EventKern
     )
 
 
+def _reduce_outbox(state: EventKernelState, event: SemanticEvent) -> EventKernelState:
+    item = _mapping(_payload(event).get("outbox"))
+    event_type = event.event_type
+    if event_type == "event_kernel.memory.enqueued":
+        payload = _thaw(item.get("payload", {}))
+        digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+        from .envelope import make_outbox_id
+        outbox_id = make_outbox_id(workflow_id=state.workflow_id or event.workflow_id, generation=event.generation, projector=item.get("projector"), dedupe_key=item.get("dedupe_key"), payload=payload)
+        entry = OutboxEntry(outbox_id, state.workflow_id or event.workflow_id, event.generation, item.get("projector"), item.get("dedupe_key"), payload, digest, OutboxState.ENQUEUED, 0, event.revision)
+        return replace(state, outbox=_replace_record(state.outbox, entry, "outbox_id"))
+    existing = _find_record(state.outbox, "outbox_id", item.get("outbox_id"))
+    if existing is None or (
+        existing.status is not OutboxState.ENQUEUED
+        and not (existing.status is OutboxState.FAILED and existing.retryable is True)
+    ):
+        raise IllegalTransitionError("memory delivery requires an enqueued outbox entry")
+    if event_type == "event_kernel.memory.applied":
+        entry = replace(
+            existing,
+            status=OutboxState.APPLIED,
+            delivery_attempt=existing.delivery_attempt + 1,
+            receipt_digest=item.get("receipt_digest"),
+            error_code=None,
+            failure_digest=None,
+            retryable=None,
+        )
+    else:
+        entry = replace(
+            existing,
+            status=OutboxState.FAILED,
+            delivery_attempt=existing.delivery_attempt + 1,
+            error_code=item.get("error_code"),
+            failure_digest=item.get("failure_digest"),
+            retryable=item.get("retryable"),
+        )
+    return replace(state, outbox=_replace_record(state.outbox, entry, "outbox_id"))
+
+
+def _reduce_checkpoint(state: EventKernelState, event: SemanticEvent) -> EventKernelState:
+    item = _mapping(_payload(event).get("checkpoint"))
+    record = CheckpointRecord(
+        checkpoint_id=item.get("checkpoint_id"),
+        workflow_id=item.get("workflow_id"),
+        generation=item.get("generation"),
+        bound_revision=item.get("bound_revision"),
+        bound_event_hash=item.get("bound_event_hash"),
+        bound_event_id=item.get("bound_event_id"),
+        binding_mode=item.get("binding_mode"),
+        state_digest=item.get("state_digest"),
+        event_file_prefix_sha256=item.get("event_file_prefix_sha256"),
+        bound_prefix_bytes=item.get("bound_prefix_bytes"),
+        relative_path=item.get("relative_path"),
+        created_at=item.get("created_at"),
+        checkpoint_file_sha256=item.get("checkpoint_file_sha256"),
+        event_id=event.event_id,
+        event_end_offset=item.get("event_end_offset"),
+    )
+    return replace(state, checkpoints=_replace_record(state.checkpoints, record, "checkpoint_id"))
+
+
 def reduce_event(state: EventKernelState, semantic_event: SemanticEvent) -> EventKernelState:
     """Apply one immutable semantic event and return a new projection state."""
 
@@ -838,6 +901,10 @@ def reduce_event(state: EventKernelState, semantic_event: SemanticEvent) -> Even
         return _schema2_evidence(state, semantic_event)
     if semantic_event.event_type == "event_kernel.verdict.recorded":
         return _schema2_verdict(state, semantic_event)
+    if semantic_event.event_type in {"event_kernel.memory.enqueued", "event_kernel.memory.applied", "event_kernel.memory.failed"}:
+        return _reduce_outbox(state, semantic_event)
+    if semantic_event.event_type == "event_kernel.checkpoint.created":
+        return _reduce_checkpoint(state, semantic_event)
     return state
 
 

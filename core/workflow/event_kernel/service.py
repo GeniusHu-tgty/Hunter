@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +22,15 @@ from .contracts import (
     HashMode,
     Head,
     OwnershipState,
+    MemoryEnqueue,
+    MemoryApplied,
+    MemoryFailed,
+    OutboxEntry,
+    OutboxState,
     ProcessOutput,
     ProcessStart,
     ProcessTerminal,
+    RecoveryRequest,
     VerdictRecord,
     WorkflowOwnershipClaim,
 )
@@ -49,8 +55,18 @@ def _thaw(value: Any) -> Any:
 class EventKernel:
     """Typed action/attempt facade over the authoritative event store."""
 
-    def __init__(self, workspace_root: str | Path, *, lock_timeout: float = 10.0) -> None:
-        self._store = EventStore(workspace_root, lock_timeout=lock_timeout)
+    def __init__(
+        self,
+        workspace_root: str | Path,
+        *,
+        lock_timeout: float = 10.0,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        self._store = EventStore(
+            workspace_root,
+            lock_timeout=lock_timeout,
+            crash_hook=crash_hook,
+        )
 
     def inspect_prefix(self, slug: str):
         replay = inspect_event_log(self._store.event_log_path(slug), slug=slug)
@@ -67,6 +83,15 @@ class EventKernel:
         if not self._store.event_log_path(slug).exists():
             return EventKernelState(None, 1, OwnershipState.UNCLAIMED_LEGACY)
         return self.inspect_prefix(slug).state
+
+    def recover_memory_outbox(self, slug: str) -> tuple[OutboxEntry, ...]:
+        """Return persisted memory work that remains eligible for dispatch."""
+        return tuple(
+            entry
+            for entry in self.materialize(slug).outbox
+            if entry.status is OutboxState.ENQUEUED
+            or (entry.status is OutboxState.FAILED and entry.retryable is True)
+        )
 
     def _workflow_id(self, slug: str) -> str:
         workflow_id = self.materialize(slug).workflow_id
@@ -337,6 +362,38 @@ class EventKernel:
         else:
             data["reason"] = terminal.reason
         return self._store._commit_command(slug, meta, command, {"attempt": data})
+
+    def enqueue_memory(self, slug: str, meta: CommandMeta, memory: MemoryEnqueue) -> CommandResult:
+        self._require(meta, CommandMeta, "meta")
+        self._require(memory, MemoryEnqueue, "memory")
+        return self._store._commit_command(slug, meta, CommandType.ENQUEUE_MEMORY, {"outbox": {
+            "projector": memory.projector, "dedupe_key": memory.dedupe_key,
+            "payload": _thaw(memory.payload),
+        }}, workflow_id=self._workflow_id(slug))
+
+    def mark_memory_applied(self, slug: str, meta: CommandMeta, applied: MemoryApplied) -> CommandResult:
+        self._require(applied, MemoryApplied, "applied")
+        return self._store._commit_command(slug, meta, CommandType.MARK_MEMORY_APPLIED, {"outbox": {
+            "outbox_id": applied.outbox_id, "receipt_digest": applied.receipt_digest,
+        }})
+
+    def mark_memory_failed(self, slug: str, meta: CommandMeta, failed: MemoryFailed) -> CommandResult:
+        self._require(failed, MemoryFailed, "failed")
+        return self._store._commit_command(slug, meta, CommandType.MARK_MEMORY_FAILED, {"outbox": {
+            "outbox_id": failed.outbox_id, "error_code": failed.error_code,
+            "failure_digest": failed.failure_digest, "retryable": failed.retryable,
+        }})
+
+    def create_checkpoint(self, slug: str, meta: CommandMeta) -> CommandResult:
+        self._require(meta, CommandMeta, "meta")
+        return self._store.create_checkpoint(slug, meta)
+
+    def recover_checkpoint(
+        self, slug: str, meta: CommandMeta, recovery: RecoveryRequest
+    ) -> CommandResult:
+        self._require(meta, CommandMeta, "meta")
+        self._require(recovery, RecoveryRequest, "recovery")
+        return self._store.recover_checkpoint(slug, meta, recovery)
 
 
 __all__ = ["EventKernel"]

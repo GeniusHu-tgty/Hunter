@@ -1,8 +1,19 @@
 import asyncio
 import json
+from pathlib import Path
+import tomllib
 
 import mcp_server
 from core.browser.browser_controller import BrowserController, ExecutionAdapter
+
+
+def test_browser_pool_is_exposed_as_an_optional_package_extra():
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+
+    dependencies = pyproject["project"]["optional-dependencies"]["browser"]
+
+    assert any(dependency.startswith("playwright>=") for dependency in dependencies)
 
 
 def test_execution_adapter_forwards_calls_and_converts_failures_to_errors():
@@ -64,6 +75,10 @@ def test_execute_true_without_adapter_keeps_deferred_behavior():
     assert plan["status"] == "proposed"
     assert plan["execution"] == "deferred"
     assert plan["calls"][0]["tool"] == "browser_navigate"
+
+
+def test_browser_controller_reports_optional_pool_unavailable_without_adapter():
+    assert BrowserController().availability() == {"available": False, "missing_inputs": ["browser_pool_available"]}
 
 
 def test_navigation_execute_merges_page_summary_and_classifies_timeout():

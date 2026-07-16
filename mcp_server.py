@@ -27,6 +27,7 @@ import shutil
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -85,6 +86,7 @@ from core.memory import (
     TargetMemory,
     TechniqueMemory,
 )
+from core.request_broker.benchmark import measure_broker_modes
 
 INTEGRATION_CONTRACT_PATH = HUNTER_DIR / CONTRACT_FILENAME
 _EXTENSION_TOOL_SOURCES: Dict[str, set[str]] = {}
@@ -1577,6 +1579,32 @@ async def hunter_scan_benchmark(agent_delay_ms: int = 50, payload_bytes: int = 1
 
 
 @mcp.tool()
+async def hunter_broker_benchmark(samples: int = 20) -> str:
+    """Benchmark direct and Broker SDK paths against a deterministic local fixture."""
+    class FixtureResponse:
+        status_code = 200
+        text = "<title>Hunter fixture</title><main>healthy local response</main>"
+        headers = {"Content-Type": "text/html"}
+        url = "https://broker-fixture.invalid/"
+        history = []
+        cookies = {}
+
+    class FixtureTransport:
+        def request(self, *_args: Any, **_kwargs: Any) -> FixtureResponse:
+            return FixtureResponse()
+
+    with tempfile.TemporaryDirectory(prefix="hunter-broker-benchmark-") as directory:
+        result = measure_broker_modes(
+            state_root=directory,
+            url="https://broker-fixture.invalid/",
+            samples=max(2, min(int(samples), 200)),
+            direct_transport=FixtureTransport(),
+            broker_transport_factory=FixtureTransport,
+        )
+    return _json_dumps({"tool": "hunter_broker_benchmark", "status": "ok", "data": result})
+
+
+@mcp.tool()
 async def hunter_cache_status() -> str:
     """Inspect target/profile adaptive recon cache entries and size."""
     return _json_dumps({"tool": "hunter_cache_status", "status": "ok", "data": _adaptive_cache.status()})
@@ -2420,6 +2448,7 @@ _AUTO_VERDICT_TYPES = {
     "hunter_auto_cmd": "rce",
     "hunter_auto_idor": "idor",
     "hunter_auto_access_control": "auth_bypass",
+    "hunter_auto_race": "race",
 }
 
 
@@ -2691,8 +2720,11 @@ async def hunter_auto_idor(target: str, endpoint: str = "", cookie: str = "",
 
 @mcp.tool()
 async def hunter_auto_race(target: str, cookie: str = "",
-                           session_id: Optional[str] = None) -> str:
-    """Automated race-condition scanner."""
+                           session_id: Optional[str] = None,
+                           request_spec: str = "", oracle_spec: str = "",
+                           reset_spec: str = "", copies: int = 10,
+                           rounds: int = 3) -> str:
+    """Discover race candidates or execute a control/race/oracle experiment."""
     from core import auto_race
     return await _safe_auto_json_tool(
         "hunter_auto_race",
@@ -2701,6 +2733,11 @@ async def hunter_auto_race(target: str, cookie: str = "",
         target,
         session_cookie=cookie,
         cookie=cookie,
+        request_spec=request_spec,
+        oracle_spec=oracle_spec,
+        reset_spec=reset_spec,
+        copies=copies,
+        rounds=rounds,
         session_id=session_id,
     )
 
@@ -2943,7 +2980,7 @@ async def hunter_healthcheck() -> str:
         "hunter_auto_cors", "hunter_auto_jwt", "hunter_auto_graphql", "hunter_auto_websocket",
         "hunter_auto_race", "hunter_auto_access_control", "hunter_unified_scan",
         "hunter_healthcheck", "hunter_capabilities", "hunter_recommend_next",
-        "hunter_fast_scan", "hunter_fast_recon", "hunter_scan_plan", "hunter_scan_benchmark", "hunter_cache_status", "hunter_cache_clear",
+        "hunter_fast_scan", "hunter_fast_recon", "hunter_scan_plan", "hunter_scan_benchmark", "hunter_broker_benchmark", "hunter_cache_status", "hunter_cache_clear",
         "hunter_kb_list", "hunter_kb_search", "hunter_kb_read", "hunter_kb_recommend",
         "hunter_burp_bridge", "hunter_burp_repeater", "hunter_burp_proxy_search",
         "hunter_burp_scanner_issues", "hunter_burp_collaborator_workflow",
@@ -3058,6 +3095,7 @@ async def hunter_capabilities() -> str:
         "hunter_fast_recon": ("recon", "30-second passive stealth reconnaissance"),
         "hunter_scan_plan": ("adaptive", "Preview adaptive DAG and budget"),
         "hunter_scan_benchmark": ("adaptive", "Benchmark parallelism, cache and compaction"),
+        "hunter_broker_benchmark": ("broker", "Benchmark local direct and Broker SDK fixture paths"),
         "hunter_cache_status": ("adaptive", "Inspect target/profile recon cache"),
         "hunter_cache_clear": ("adaptive", "Clear adaptive recon cache"),
         "hunter_subdomain": ("recon", "Subdomain enumeration"),

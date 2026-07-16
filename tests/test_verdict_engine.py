@@ -148,6 +148,30 @@ def test_idor_requires_cross_user_data_proof():
     assert inconclusive.verdict is Verdict.INCONCLUSIVE
 
 
+def test_race_requires_normal_control_stable_oracle_and_verified_gate():
+    strong = evidence(
+        metadata={
+            "control_normal": True,
+            "invariant_violated": True,
+            "oracle_stable": True,
+            "gate_verified": True,
+        },
+        reproduction_count=3,
+    )
+    weak = evidence(
+        metadata={
+            "control_normal": False,
+            "invariant_violated": True,
+            "oracle_stable": True,
+            "gate_verified": True,
+        },
+        reproduction_count=3,
+    )
+
+    assert VerdictEngine().assess(VulnType.RACE, strong).verdict is Verdict.VERIFIED
+    assert VerdictEngine().assess(VulnType.RACE, weak).verdict is Verdict.REFUTED
+
+
 def test_upload_requires_executable_upload_and_reachable_non_404_url():
     result = VerdictEngine().assess(
         VulnType.UPLOAD,

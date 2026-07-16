@@ -1,0 +1,12 @@
+request_broker:
+  proxy_max_connections: 8
+  per_origin_concurrency: 2
+  classifier_workers: 4
+  artifact_writers: 2
+  cooldown_initial_seconds: 30
+  cooldown_max_seconds: 600
+  hard_block_threshold: 5
+  global_artifact_quota_mib: 500
+  target_artifact_quota_mib: 100
+  browser_pool_optional: true
+  mitm_enabled: true

@@ -560,6 +560,11 @@ class BrowserController:
             ExecutionAdapter(call_mcp_tool) if call_mcp_tool is not None else None
         )
 
+    def availability(self) -> Dict[str, Any]:
+        if self.execution_adapter is None:
+            return {"available": False, "missing_inputs": ["browser_pool_available"]}
+        return {"available": True, "missing_inputs": []}
+
     @staticmethod
     def _absolute_url(url: str, schemes: Iterable[str] = ("http", "https")) -> str:
         parsed = urlparse(str(url or "").strip())

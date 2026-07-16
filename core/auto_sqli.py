@@ -23,16 +23,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from core.sqli_detect import SqliDetector
-
-try:
-    from tools.probe import _get_session
-except (ImportError, ModuleNotFoundError):
-    import requests
-    def _get_session():
-        s = requests.Session()
-        s.verify = False
-        s.headers.update({'User-Agent': 'Mozilla/5.0'})
-        return s
+from core.probe import _get_session
 
 
 class AutoSQLi:
@@ -641,8 +632,7 @@ def test_xml_sqli(url: str, param: str = "productId",
     Returns dict with keys: vulnerable, raw_status, encoded_status,
     raw_length, encoded_length, technique.
     """
-    import requests as _req
-    s = session or _req.Session()
+    s = session or _get_session()
     h = {"Content-Type": "application/xml", **(headers or {})}
 
     raw_payload = "1 UNION SELECT username, password FROM users--"

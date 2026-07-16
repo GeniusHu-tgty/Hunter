@@ -8,12 +8,10 @@ Returns complete response + auto-detected interesting content.
 import re
 import threading
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
-try:
-    import requests
-except ImportError:
-    pass
+from core.request_broker import LegacyRequestsAdapter, RequestBroker, RequestSpec
 
 try:
     from core.config import USER_AGENTS
@@ -53,18 +51,19 @@ HEADER_LEAKS = {
 }
 
 # Global session (reused across calls, UA rotated)
-_session: Optional[requests.Session] = None
+_session: Optional[LegacyRequestsAdapter] = None
 _ua_index = 0
 _session_lock = threading.Lock()
 
 
-def _get_session() -> requests.Session:
+def _get_session() -> LegacyRequestsAdapter:
     """Get or create HTTP session with anti-detection defaults."""
     global _session, _ua_index
     with _session_lock:
         if _session is None:
-            _session = requests.Session()
-            _session.verify = False  # Pentest: allow self-signed certs
+            _session = LegacyRequestsAdapter(
+                RequestBroker(Path("sessions") / "request_broker")
+            )
         # Rotate UA
         _session.headers["User-Agent"] = USER_AGENTS[_ua_index % len(USER_AGENTS)]
         _ua_index += 1
@@ -127,6 +126,9 @@ def probe_impl(url: str, method: str = "GET", headers: Optional[dict] = None,
             timeout=timeout,
         )
         elapsed_ms = int((time.time() - start) * 1000)
+        broker_outcome = session.broker.classify_response(
+            RequestSpec(method=method, url=url, headers=headers or {}), resp
+        )
 
         resp_headers = dict(resp.headers)
         resp_body = resp.text
@@ -174,6 +176,13 @@ def probe_impl(url: str, method: str = "GET", headers: Optional[dict] = None,
                 "has_credentials": analysis.has_credentials,
                 "detected_tech": analysis.detected_tech,
                 "suggested_actions": analysis.suggested_actions,
+            },
+            "broker": {
+                "classification": broker_outcome.classification.value,
+                "confidence": broker_outcome.confidence,
+                "evidence_ids": broker_outcome.evidence_ids,
+                "missing_inputs": broker_outcome.missing_inputs,
+                "next_actions": broker_outcome.next_actions,
             },
         }
 

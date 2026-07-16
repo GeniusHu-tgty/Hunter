@@ -6,6 +6,7 @@ import re
 import json
 import time
 from typing import Optional
+from core.probe import _get_session
 
 
 def discover_websockets(url: str) -> dict:
@@ -83,19 +84,6 @@ def _classify_ws_url(url: str) -> str:
     elif 'ws' in url.lower() or 'websocket' in url.lower():
         return 'generic'
     return 'unknown'
-
-
-def _get_session():
-    """Get HTTP session with fallback."""
-    try:
-        from tools.probe import _get_session as _gs
-        return _gs()
-    except (ImportError, ModuleNotFoundError):
-        import requests
-        s = requests.Session()
-        s.verify = False
-        s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-        return s
 
 
 def test_xss_injection(ws_url: str, origin: str = "") -> dict:

@@ -9,6 +9,7 @@ dependencies = ["dnspython>=2.4"]
 
 [project.optional-dependencies]
 stealth = ["curl_cffi>=0.6.0"]
+browser = ["playwright>=1.40"]
 
 [tool.setuptools]
 py-modules = ["mcp_server", "hunter_tools_mcp"]
@@ -21,3 +22,6 @@ exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 wordlists = ["*.txt"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

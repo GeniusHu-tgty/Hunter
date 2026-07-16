@@ -12,26 +12,17 @@ import hashlib
 import json
 import re
 import time
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Mapping
 from urllib.parse import quote, urljoin
-try:
-    from tools.probe import _get_session
-except (ImportError, ModuleNotFoundError):
-    import requests
-    def _get_session():
-        s = requests.Session()
-        s.verify = False
-        s.headers.update({'User-Agent': 'Mozilla/5.0'})
-        return s
+from core.probe import _get_session
+from core.request_broker import LegacyRequestsAdapter, RequestBroker
 
 
 def _new_isolated_session():
     """Create a cookie-isolated control session even under MCP session injection."""
-    import requests
-
-    session = requests.Session()
-    session.verify = False
-    session.headers.update({'User-Agent': 'Mozilla/5.0'})
-    return session
+    return LegacyRequestsAdapter(RequestBroker("sessions/request_broker/isolated"))
 
 
 class AutoIDOR:
@@ -668,3 +659,166 @@ def auto_idor_impl(url: str = "", url_template: str = "", id_range: str = "1-5",
                                 attacker_id=attacker_id,
                                 owner_id=owner_id,
                                 repetitions=repetitions)
+
+
+@dataclass(frozen=True)
+class Identity:
+    """An isolated authorization principal for a differential proof."""
+
+    name: str
+    cookie: str = ""
+    bearer_token: str = ""
+    resource_id: str = ""
+
+
+@dataclass(frozen=True)
+class AuthorizationProofPlan:
+    """Declarative BOLA/BFLA proof inputs, without changing legacy scans."""
+
+    request_template: Mapping[str, Any]
+    oracle_template: Mapping[str, Any]
+    attacker: Identity
+    owner: Identity
+    anonymous: Identity
+    cleanup_template: Mapping[str, Any] | None = None
+    repetitions: int = 3
+    operation: str = "read"
+    vulnerability_type: str = "bola"
+
+
+_PROOF_SENSITIVE_HEADERS = {
+    "authorization", "cookie", "proxy-authorization", "set-cookie", "x-api-key",
+}
+
+
+def _render_proof_template(value: Any, resource_id: str) -> Any:
+    if isinstance(value, str):
+        return value.replace("{{resource_id}}", resource_id)
+    if isinstance(value, list):
+        return [_render_proof_template(item, resource_id) for item in value]
+    if isinstance(value, Mapping):
+        return {key: _render_proof_template(item, resource_id) for key, item in value.items()}
+    return value
+
+
+def _proof_request(session, template: Mapping[str, Any], identity: Identity, resource_id: str) -> dict:
+    spec = _render_proof_template(deepcopy(dict(template)), resource_id)
+    headers = dict(spec.pop("headers", {}) or {})
+    if identity.bearer_token:
+        headers["Authorization"] = f"Bearer {identity.bearer_token}"
+    if identity.cookie:
+        headers.setdefault("Cookie", identity.cookie)
+    method = str(spec.pop("method", "GET")).upper()
+    url = str(spec.pop("url"))
+    response = session.request(method, url, headers=headers, timeout=10, allow_redirects=False, **spec)
+    return {
+        "status": int(response.status_code),
+        "body": str(response.text or ""),
+        "headers": dict(getattr(response, "headers", {}) or {}),
+        "request": {"method": method, "url": url, "headers": headers, **spec},
+    }
+
+
+def _proof_json_pointer(body: str, pointer: str) -> Any:
+    value: Any = json.loads(body)
+    for part in pointer.lstrip("/").split("/"):
+        if not part:
+            continue
+        value = value[int(part)] if isinstance(value, list) else value[part]
+    return value
+
+
+def _redact_proof(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: "REDACTED" if str(key).casefold() in _PROOF_SENSITIVE_HEADERS else _redact_proof(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_proof(item) for item in value]
+    return value
+
+
+def _proof_allowed(result: Mapping[str, Any]) -> bool:
+    if not 200 <= int(result.get("status", 0)) < 300:
+        return False
+    try:
+        parsed = json.loads(str(result.get("body", "")))
+    except json.JSONDecodeError:
+        return True
+    return not bool(parsed.get("errors")) if isinstance(parsed, Mapping) else True
+
+
+def verify_authorization_plan(plan: AuthorizationProofPlan, sessions: Mapping[str, Any]) -> dict:
+    """Verify BOLA/BFLA only with controls, an effect oracle, and cleanup."""
+
+    if plan.operation != "write" or not plan.cleanup_template:
+        return {"classification": "inconclusive", "vulnerable": False,
+                "reason": "write authorization proofs require an explicit cleanup template", "rounds": []}
+    if plan.vulnerability_type not in {"bola", "bfla"}:
+        raise ValueError("vulnerability_type must be 'bola' or 'bfla'")
+    if not 1 <= int(plan.repetitions) <= 5:
+        raise ValueError("repetitions must be between 1 and 5")
+    missing = [name for name in ("attacker", "owner", "anonymous") if name not in sessions]
+    if missing:
+        raise ValueError(f"missing identity sessions: {', '.join(missing)}")
+    if not plan.owner.resource_id or plan.owner.resource_id == plan.attacker.resource_id:
+        return {"classification": "inconclusive", "vulnerable": False,
+                "reason": "attacker and owner resources must be distinct", "rounds": []}
+
+    owner_id = plan.owner.resource_id
+    oracle_pointer = str(plan.oracle_template.get("json_pointer", ""))
+    expected_after = plan.oracle_template.get("expected_after")
+    if not oracle_pointer or expected_after is None:
+        return {"classification": "inconclusive", "vulnerable": False,
+                "reason": "write authorization proofs require an oracle pointer and expected_after", "rounds": []}
+
+    owner_action = _proof_request(sessions["owner"], plan.request_template, plan.owner, owner_id)
+    owner_cleanup = _proof_request(sessions["owner"], plan.cleanup_template, plan.owner, owner_id)
+    anonymous_action = _proof_request(sessions["anonymous"], plan.request_template, plan.anonymous, owner_id)
+    owner_allowed = _proof_allowed(owner_action) and _proof_allowed(owner_cleanup)
+    anonymous_denied = not _proof_allowed(anonymous_action)
+    rounds = []
+    for index in range(int(plan.repetitions)):
+        before = _proof_request(sessions["attacker"], plan.oracle_template, plan.attacker, owner_id)
+        action = _proof_request(sessions["attacker"], plan.request_template, plan.attacker, owner_id)
+        after = _proof_request(sessions["attacker"], plan.oracle_template, plan.attacker, owner_id)
+        cleanup = _proof_request(sessions["owner"], plan.cleanup_template, plan.owner, owner_id)
+        try:
+            before_value = _proof_json_pointer(before["body"], oracle_pointer)
+            after_value = _proof_json_pointer(after["body"], oracle_pointer)
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+            before_value = after_value = None
+        rounds.append({
+            "round": index + 1,
+            "attacker_allowed": _proof_allowed(action),
+            "cleanup_allowed": _proof_allowed(cleanup),
+            "oracle_before": before_value,
+            "oracle_after": after_value,
+            "effect_confirmed": before_value != expected_after and after_value == expected_after,
+        })
+    reproduced = sum(item["attacker_allowed"] and item["cleanup_allowed"] and item["effect_confirmed"] for item in rounds)
+    verified = owner_allowed and anonymous_denied and reproduced == len(rounds) and len(rounds) >= 3
+    classification = "verified" if verified else "likely" if reproduced else "refuted"
+    if not owner_allowed or not anonymous_denied:
+        classification = "inconclusive"
+    evidence = {
+        "request": _redact_proof({"template": dict(plan.request_template)}),
+        "response": {"rounds": len(rounds)},
+        "baseline_response": {},
+        "payload": "authorization-proof",
+        "reproduction_count": reproduced,
+        "metadata": {
+            "owner_control": owner_allowed,
+            "anonymous_control": anonymous_denied,
+            "write_effect_oracle": bool(reproduced),
+            "operation": plan.operation,
+            "request_user": plan.attacker.name,
+            "resource_owner": plan.owner.name,
+            "owner_data_returned": bool(reproduced),
+        },
+    }
+    return {"classification": classification, "vulnerable": verified,
+            "vulnerability_type": plan.vulnerability_type,
+            "controls": {"owner": {"allowed": owner_allowed}, "anonymous": {"denied": anonymous_denied}},
+            "rounds": rounds, "evidence": evidence}

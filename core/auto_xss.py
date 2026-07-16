@@ -18,16 +18,7 @@ import re
 import time
 from typing import Mapping, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-try:
-    from tools.probe import _get_session
-except (ImportError, ModuleNotFoundError):
-    import requests
-    def _get_session():
-        s = requests.Session()
-        s.verify = False
-        s.headers.update({'User-Agent': 'Mozilla/5.0'})
-        return s
+from core.probe import _get_session
 
 
 def _get_browser_controller():

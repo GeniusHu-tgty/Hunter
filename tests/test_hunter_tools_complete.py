@@ -773,7 +773,7 @@ def test_fastmcp_registry_matches_hunter_tool_functions():
     assert extensions.isdisjoint(unknown)
     assert core | extensions | unknown == registry
     assert inventory["counts"]["total"] == len(registry)
-    assert len(functions) == 113
+    assert len(functions) == 114
     reverse_lab_source = set(
         mcp_server._EXTENSION_TOOL_SOURCES.get(
             "reverse_lab_tools",
@@ -1029,9 +1029,9 @@ def test_integration_contract_exactly_matches_core_tools():
     functions = registered_functions(mcp_server)
 
     assert set(contract["required_tools"]) == functions
-    assert len(contract["required_tools"]) == 113
-    assert contract["minimum_tool_count"] == 113
-    assert contract["exact_core_tool_count"] == 113
+    assert len(contract["required_tools"]) == 114
+    assert contract["minimum_tool_count"] == 114
+    assert contract["exact_core_tool_count"] == 114
     assert contract["optional_extension_namespaces"] == ["re_"]
     assert "hunter_auto_attack" in contract["required_tools"]
     assert "hunter_fast_recon" in contract["required_tools"]

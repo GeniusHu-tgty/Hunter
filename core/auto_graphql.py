@@ -5,19 +5,7 @@ auto_graphql.py - Automated GraphQL vulnerability detection and exploitation
 import re
 import json
 from typing import Optional
-
-
-def _get_session():
-    """Get HTTP session with fallback."""
-    try:
-        from tools.probe import _get_session as _gs
-        return _gs()
-    except (ImportError, ModuleNotFoundError):
-        import requests
-        s = requests.Session()
-        s.verify = False
-        s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-        return s
+from core.probe import _get_session
 
 
 def discover_endpoint(base_url: str) -> dict:

@@ -496,6 +496,8 @@ def _validate_generated_result_ids(
         EventType.ATTEMPT_STARTED: "attempt_id",
         EventType.PROCESS_STARTED: "process_id",
         EventType.MEMORY_ENQUEUED: "outbox_id",
+        EventType.MEMORY_APPLIED: "outbox_id",
+        EventType.MEMORY_FAILED: "outbox_id",
         EventType.CHECKPOINT_CREATED: "checkpoint_id",
     }
     expected = expected_by_event.get(event_type)

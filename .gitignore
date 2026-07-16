@@ -14,3 +14,6 @@ evidence/adaptive_raw/
 evidence/js_analysis/
 sessions/stealth/
 sessions/attack/
+sessions/request_broker/
+sessions/browser/
+sessions/scans/

@@ -17,16 +17,7 @@ import re
 import time
 import concurrent.futures
 from typing import Optional
-
-try:
-    from tools.probe import _get_session
-except (ImportError, ModuleNotFoundError):
-    import requests
-    def _get_session():
-        s = requests.Session()
-        s.verify = False
-        s.headers.update({'User-Agent': 'Mozilla/5.0'})
-        return s
+from core.probe import _get_session
 
 
 class AutoSSRF:

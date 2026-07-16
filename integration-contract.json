@@ -1,8 +1,8 @@
 {
   "contract_version": "1.0",
   "server_name": "hunter_tools",
-  "minimum_tool_count": 113,
-  "exact_core_tool_count": 113,
+  "minimum_tool_count": 114,
+  "exact_core_tool_count": 114,
   "optional_extension_namespaces": [
     "re_"
   ],
@@ -79,6 +79,7 @@
     "hunter_fast_recon",
     "hunter_scan_plan",
     "hunter_scan_benchmark",
+    "hunter_broker_benchmark",
     "hunter_cache_status",
     "hunter_cache_clear",
     "hunter_workflow_create",
