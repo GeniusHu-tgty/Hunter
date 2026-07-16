@@ -20,8 +20,10 @@ from .contracts import (
     LegacyCheckpointHint,
     LogicalActionRecord,
     OwnershipState,
+    ProcessOutput,
     ProcessRecord,
     ProcessState,
+    ProcessTerminal,
     StageResultDigest,
     StageStatusRecord,
     VerdictRecord,
@@ -302,13 +304,13 @@ def _reduce_attempt(state: EventKernelState, event: SemanticEvent) -> EventKerne
 
 
 def _reduce_process(state: EventKernelState, event: SemanticEvent) -> EventKernelState:
-    item = _mapping(_payload(event).get("process"))
-    process_id = _first(item, "process_id")
-    attempt_id = _first(item, "attempt_id")
-    attempt = _find_record(state.attempts, "attempt_id", attempt_id)
-    if attempt is None:
-        raise IllegalTransitionError("process must bind to an existing attempt")
     if event.event_type == "event_kernel.process.started":
+        item = _mapping(_payload(event).get("process"))
+        process_id = _first(item, "process_id")
+        attempt_id = _first(item, "attempt_id")
+        attempt = _find_record(state.attempts, "attempt_id", attempt_id)
+        if attempt is None:
+            raise IllegalTransitionError("process must bind to an existing attempt")
         if attempt.state is not AttemptState.STARTED or _find_record(state.processes, "process_id", process_id):
             raise IllegalTransitionError("process cannot be started for this attempt")
         process = ProcessRecord(
@@ -335,22 +337,121 @@ def _reduce_process(state: EventKernelState, event: SemanticEvent) -> EventKerne
             processes=state.processes + (process,),
         )
 
+    if event.event_type == "event_kernel.process.output_recorded":
+        item = _mapping(_payload(event).get("process_output"))
+        allowed = {
+            "process_id",
+            "attempt_id",
+            "stream",
+            "redacted_excerpt",
+            "redaction_applied",
+            "truncated",
+            "stdout_bytes_total",
+            "stderr_bytes_total",
+            "combined_bytes_total",
+            "stdout_omitted_bytes_total",
+            "stderr_omitted_bytes_total",
+            "combined_omitted_bytes_total",
+            "sequence",
+            "excerpt_digest",
+        }
+        if set(item).difference(allowed):
+            raise IllegalTransitionError("process output contains unsupported fields")
+        process_id = _first(item, "process_id")
+        attempt_id = _first(item, "attempt_id")
+        process = _find_record(state.processes, "process_id", process_id)
+        if process is None or process.attempt_id != attempt_id:
+            raise IllegalTransitionError("process output has an invalid attempt binding")
+        if process.state is ProcessState.TERMINATED:
+            raise IllegalTransitionError("process output cannot follow process termination")
+        output = ProcessOutput(
+            process_id=process_id,
+            attempt_id=attempt_id,
+            stream=_first(item, "stream"),
+            redacted_excerpt=_first(item, "redacted_excerpt"),
+            redaction_applied=_first(item, "redaction_applied"),
+            truncated=_first(item, "truncated"),
+            stdout_bytes_total=_first(item, "stdout_bytes_total"),
+            stderr_bytes_total=_first(item, "stderr_bytes_total"),
+            combined_bytes_total=_first(item, "combined_bytes_total"),
+            stdout_omitted_bytes_total=_first(item, "stdout_omitted_bytes_total"),
+            stderr_omitted_bytes_total=_first(item, "stderr_omitted_bytes_total"),
+            combined_omitted_bytes_total=_first(item, "combined_omitted_bytes_total"),
+        )
+        sequence = _first(item, "sequence")
+        if sequence != process.last_sequence + 1:
+            raise IllegalTransitionError("process output sequence is not contiguous")
+        if _first(item, "excerpt_digest") != hashlib.sha256(
+            output.redacted_excerpt.encode("utf-8")
+        ).hexdigest():
+            raise IllegalTransitionError("process output excerpt digest is invalid")
+        counters = (
+            "stdout_bytes_total",
+            "stderr_bytes_total",
+            "combined_bytes_total",
+            "stdout_omitted_bytes_total",
+            "stderr_omitted_bytes_total",
+            "combined_omitted_bytes_total",
+        )
+        if any(getattr(output, name) < getattr(process, name) for name in counters):
+            raise IllegalTransitionError("process output counters must be monotonic")
+        updated = replace(
+            process,
+            last_sequence=sequence,
+            stdout_bytes_total=output.stdout_bytes_total,
+            stderr_bytes_total=output.stderr_bytes_total,
+            combined_bytes_total=output.combined_bytes_total,
+            stdout_omitted_bytes_total=output.stdout_omitted_bytes_total,
+            stderr_omitted_bytes_total=output.stderr_omitted_bytes_total,
+            combined_omitted_bytes_total=output.combined_omitted_bytes_total,
+            redacted_head_excerpt=(
+                process.redacted_head_excerpt or output.redacted_excerpt
+            ),
+            redacted_tail_excerpt=output.redacted_excerpt,
+        )
+        return replace(state, processes=_replace_record(state.processes, updated, "process_id"))
+
+    item = _mapping(_payload(event).get("process_terminal"))
+    process_id = _first(item, "process_id")
+    attempt_id = _first(item, "attempt_id")
     process = _find_record(state.processes, "process_id", process_id)
     if process is None or process.attempt_id != attempt_id or process.state is ProcessState.TERMINATED:
         raise IllegalTransitionError("process cannot be terminated in its current state")
-    process = replace(
-        process,
-        state=ProcessState.TERMINATED,
+    terminal = ProcessTerminal(
+        process_id=process_id,
+        attempt_id=attempt_id,
         exit_code=_first(item, "exit_code"),
         termination_reason=_first(item, "termination_reason"),
-        stdout_bytes_total=_first(item, "stdout_bytes_total", default=0),
-        stderr_bytes_total=_first(item, "stderr_bytes_total", default=0),
-        combined_bytes_total=_first(item, "combined_bytes_total", default=0),
-        stdout_omitted_bytes_total=_first(item, "stdout_omitted_bytes_total", default=0),
-        stderr_omitted_bytes_total=_first(item, "stderr_omitted_bytes_total", default=0),
-        combined_omitted_bytes_total=_first(item, "combined_omitted_bytes_total", default=0),
+        stdout_bytes_total=_first(item, "stdout_bytes_total"),
+        stderr_bytes_total=_first(item, "stderr_bytes_total"),
+        combined_bytes_total=_first(item, "combined_bytes_total"),
+        stdout_omitted_bytes_total=_first(item, "stdout_omitted_bytes_total"),
+        stderr_omitted_bytes_total=_first(item, "stderr_omitted_bytes_total"),
+        combined_omitted_bytes_total=_first(item, "combined_omitted_bytes_total"),
     )
-    return replace(state, processes=_replace_record(state.processes, process, "process_id"))
+    counters = (
+        "stdout_bytes_total",
+        "stderr_bytes_total",
+        "combined_bytes_total",
+        "stdout_omitted_bytes_total",
+        "stderr_omitted_bytes_total",
+        "combined_omitted_bytes_total",
+    )
+    if any(getattr(terminal, name) < getattr(process, name) for name in counters):
+        raise IllegalTransitionError("process terminal counters cannot shrink")
+    updated = replace(
+        process,
+        state=ProcessState.TERMINATED,
+        exit_code=terminal.exit_code,
+        termination_reason=terminal.termination_reason,
+        stdout_bytes_total=terminal.stdout_bytes_total,
+        stderr_bytes_total=terminal.stderr_bytes_total,
+        combined_bytes_total=terminal.combined_bytes_total,
+        stdout_omitted_bytes_total=terminal.stdout_omitted_bytes_total,
+        stderr_omitted_bytes_total=terminal.stderr_omitted_bytes_total,
+        combined_omitted_bytes_total=terminal.combined_omitted_bytes_total,
+    )
+    return replace(state, processes=_replace_record(state.processes, updated, "process_id"))
 
 
 def _workflow_id(state: EventKernelState, event: SemanticEvent) -> str | None:
@@ -729,6 +830,7 @@ def reduce_event(state: EventKernelState, semantic_event: SemanticEvent) -> Even
         return _reduce_attempt(state, semantic_event)
     if semantic_event.event_type in {
         "event_kernel.process.started",
+        "event_kernel.process.output_recorded",
         "event_kernel.process.terminated",
     }:
         return _reduce_process(state, semantic_event)

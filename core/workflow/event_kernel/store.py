@@ -21,7 +21,7 @@ from .contracts import (
     HashMode,
 )
 from .envelope import build_event, canonical_event_line, command_digest
-from .envelope import make_attempt_id
+from .envelope import make_attempt_id, make_process_id
 from .errors import (
     CommandConflictError,
     ConcurrencyConflictError,
@@ -194,6 +194,45 @@ class EventStore:
                 generated_attempt["attempt_id"] = make_attempt_id(action_id, attempt_no)
                 payload = dict(payload)
                 payload["attempt"] = generated_attempt
+
+            if command_type is CommandType.START_PROCESS:
+                process_data = payload.get("process")
+                if not isinstance(process_data, dict):
+                    raise InvalidCommandError(
+                        "start_process payload requires a process object", slug=slug
+                    )
+                generated_process = dict(process_data)
+                generated_process["process_id"] = make_process_id()
+                payload = dict(payload)
+                payload["process"] = generated_process
+
+            if command_type is CommandType.RECORD_PROCESS_OUTPUT:
+                output_data = payload.get("process_output")
+                if not isinstance(output_data, dict):
+                    raise InvalidCommandError(
+                        "record_process_output payload requires a process_output object",
+                        slug=slug,
+                    )
+                process_id = output_data.get("process_id")
+                process = next(
+                    (
+                        record
+                        for record in replay.state.processes
+                        if record.process_id == process_id
+                    ),
+                    None,
+                )
+                generated_output = dict(output_data)
+                generated_output["sequence"] = (
+                    process.last_sequence + 1 if process is not None else 1
+                )
+                excerpt = generated_output.get("redacted_excerpt")
+                if isinstance(excerpt, str):
+                    generated_output["excerpt_digest"] = hashlib.sha256(
+                        excerpt.encode("utf-8")
+                    ).hexdigest()
+                payload = dict(payload)
+                payload["process_output"] = generated_output
 
             if command_type is CommandType.CLAIM_WORKFLOW:
                 if replay.command_index or replay.ownership.value != "unclaimed_legacy":

@@ -22,6 +22,9 @@ from .contracts import (
     HashMode,
     Head,
     OwnershipState,
+    ProcessOutput,
+    ProcessStart,
+    ProcessTerminal,
     VerdictRecord,
     WorkflowOwnershipClaim,
 )
@@ -250,6 +253,75 @@ class EventKernel:
                 "evidence_ids": list(finding.evidence_ids),
             }
         return self._store._commit_command(slug, meta, CommandType.RECORD_VERDICT, {"verdict": data})
+
+    def start_process(
+        self, slug: str, meta: CommandMeta, process: ProcessStart
+    ) -> CommandResult:
+        self._require(meta, CommandMeta, "meta")
+        self._require(process, ProcessStart, "process")
+        return self._store._commit_command(
+            slug,
+            meta,
+            CommandType.START_PROCESS,
+            {
+                "process": {
+                    "attempt_id": process.attempt_id,
+                    "process_name": process.process_name,
+                }
+            },
+        )
+
+    def record_process_output(
+        self, slug: str, meta: CommandMeta, output: ProcessOutput
+    ) -> CommandResult:
+        self._require(meta, CommandMeta, "meta")
+        self._require(output, ProcessOutput, "output")
+        return self._store._commit_command(
+            slug,
+            meta,
+            CommandType.RECORD_PROCESS_OUTPUT,
+            {
+                "process_output": {
+                    "process_id": output.process_id,
+                    "attempt_id": output.attempt_id,
+                    "stream": output.stream.value,
+                    "redacted_excerpt": output.redacted_excerpt,
+                    "redaction_applied": output.redaction_applied,
+                    "truncated": output.truncated,
+                    "stdout_bytes_total": output.stdout_bytes_total,
+                    "stderr_bytes_total": output.stderr_bytes_total,
+                    "combined_bytes_total": output.combined_bytes_total,
+                    "stdout_omitted_bytes_total": output.stdout_omitted_bytes_total,
+                    "stderr_omitted_bytes_total": output.stderr_omitted_bytes_total,
+                    "combined_omitted_bytes_total": output.combined_omitted_bytes_total,
+                }
+            },
+        )
+
+    def terminate_process(
+        self, slug: str, meta: CommandMeta, terminal: ProcessTerminal
+    ) -> CommandResult:
+        self._require(meta, CommandMeta, "meta")
+        self._require(terminal, ProcessTerminal, "terminal")
+        return self._store._commit_command(
+            slug,
+            meta,
+            CommandType.TERMINATE_PROCESS,
+            {
+                "process_terminal": {
+                    "process_id": terminal.process_id,
+                    "attempt_id": terminal.attempt_id,
+                    "exit_code": terminal.exit_code,
+                    "termination_reason": terminal.termination_reason,
+                    "stdout_bytes_total": terminal.stdout_bytes_total,
+                    "stderr_bytes_total": terminal.stderr_bytes_total,
+                    "combined_bytes_total": terminal.combined_bytes_total,
+                    "stdout_omitted_bytes_total": terminal.stdout_omitted_bytes_total,
+                    "stderr_omitted_bytes_total": terminal.stderr_omitted_bytes_total,
+                    "combined_omitted_bytes_total": terminal.combined_omitted_bytes_total,
+                }
+            },
+        )
 
     def _terminal(self, slug: str, meta: CommandMeta, terminal: Any, command: CommandType) -> CommandResult:
         self._require(meta, CommandMeta, "meta")
